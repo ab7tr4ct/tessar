@@ -1,0 +1,16 @@
+[package]
+name = "tessar-embed"
+description = "Embedders for tessar: OpenAI-compatible HTTP endpoints such as llama-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+tessar-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ureq = { workspace = true }
+
+[lints]
+workspace = true
