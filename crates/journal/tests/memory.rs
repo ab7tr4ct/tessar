@@ -320,4 +320,53 @@ fn throughput_limits() {
             t.as_secs_f64() * 1e6 * threads as f64 / reads as f64
         );
     }
+
+    // 4. Recall latency over 10k statements of synthetic words.
+    let memory = Memory::open(MemLog::<Op>::new(), Arc::new(SystemClock)).unwrap();
+    let (space, person, _) = setup(&memory);
+    for c in 0..100 {
+        let facts = (0..100)
+            .map(|i| {
+                let n = c * 100 + i;
+                FactDraft {
+                    mentions: vec![EntityRef::Key {
+                        kind: person,
+                        key: key(&format!("person {}", n % 50)),
+                    }],
+                    ..FactDraft::new(BodyDraft::Statement {
+                        text: format!(
+                            "w{} w{} w{} w{} common words here",
+                            n % 997,
+                            n % 389,
+                            n % 101,
+                            n % 13
+                        ),
+                        when: None,
+                    })
+                }
+            })
+            .collect();
+        memory
+            .remember(Remember {
+                space,
+                origin: origin(),
+                episode: None,
+                facts,
+            })
+            .unwrap();
+    }
+    for text in ["w5 w7", "person 3 w42 common", "words here"] {
+        let query = tessar_core::store::Recall::new(text);
+        let runs = 200;
+        let start = Instant::now();
+        let mut found = 0;
+        for _ in 0..runs {
+            found = memory.recall(&query).hits.len();
+        }
+        let t = start.elapsed();
+        println!(
+            "recall over 10k facts, {text:?}: {:.0} µs/query ({found} hits)",
+            t.as_secs_f64() * 1e6 / runs as f64
+        );
+    }
 }

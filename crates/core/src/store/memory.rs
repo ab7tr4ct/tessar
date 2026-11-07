@@ -6,6 +6,7 @@ use super::draft::{Recorded, Remember, Remembered, Update, View};
 use super::error::StoreError;
 use super::op::Op;
 use super::plan::Planner;
+use super::recall::{Recall, Recalled, recall};
 use super::state::State;
 use crate::clock::Clock;
 use crate::log::{Commit, Log};
@@ -210,6 +211,12 @@ impl Memory {
             .filter(|f| view.includes(f))
             .cloned()
             .collect()
+    }
+
+    /// Finds facts for a query: by entities named in it and by its words,
+    /// fused, best first, each with an explanation.
+    pub fn recall(&self, query: &Recall) -> Recalled {
+        recall(&self.state(), query)
     }
 
     /// The current values of a (subject, predicate) pair.

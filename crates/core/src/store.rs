@@ -10,7 +10,9 @@ mod error;
 mod memory;
 mod op;
 mod plan;
+mod recall;
 mod state;
+mod text;
 
 pub use draft::{
     BodyDraft, EntityRef, EpisodeDraft, FactDraft, ObjectDraft, Outcome, Reason, Recorded,
@@ -19,3 +21,4 @@ pub use draft::{
 pub use error::StoreError;
 pub use memory::Memory;
 pub use op::Op;
+pub use recall::{Hit, Recall, Recalled, Why};

@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::num::NonZeroU32;
 
 use super::op::Op;
+use super::text::{TextIndex, fact_text};
 use crate::model::{
     Entity, EntityId, EntityKindDef, EntityKindId, Episode, Fact, FactBody, FactId, Lineage, Name,
     PredicateDef, PredicateId, Space, SpaceId, ValueType,
@@ -33,6 +34,11 @@ pub(crate) struct State {
     heads: HashMap<Lineage, FactId>,
     /// (subject, predicate) → lineages of triples with that pair.
     pairs: HashMap<(EntityId, PredicateId), Vec<Lineage>>,
+    /// Normalized key or alias → entities with that name, in any space or
+    /// kind. For finding entities named in a query.
+    names: HashMap<String, Vec<EntityId>>,
+    /// Keyword index over every fact version.
+    text: TextIndex,
 }
 
 impl State {
@@ -101,6 +107,15 @@ impl State {
             .map_or(&[], Vec::as_slice)
     }
 
+    /// Entities whose normalized key or alias is `normalized`.
+    pub(crate) fn entities_named(&self, normalized: &str) -> &[EntityId] {
+        self.names.get(normalized).map_or(&[], Vec::as_slice)
+    }
+
+    pub(crate) fn text(&self) -> &TextIndex {
+        &self.text
+    }
+
     pub(crate) fn facts_of(&self, entity: EntityId) -> &[FactId] {
         self.facts_by_entity
             .get(entity.index())
@@ -160,6 +175,7 @@ impl State {
                     }
                 }
                 for name in names {
+                    self.names.entry(name.clone()).or_default().push(entity.id);
                     self.entity_by_name
                         .insert((entity.space, entity.kind, name), entity.id);
                 }
@@ -175,6 +191,7 @@ impl State {
                 if self.entity_by_name.contains_key(&slot) {
                     return Err(format!("entity name {:?} is taken", slot.2));
                 }
+                self.names.entry(slot.2.clone()).or_default().push(entity);
                 self.entity_by_name.insert(slot, entity);
                 e.aliases.push(alias);
             }
@@ -250,6 +267,8 @@ impl State {
             }
         }
 
+        let text = fact_text(self, &fact);
+        self.text.add(fact.id, &text)?;
         for e in entities {
             self.facts_by_entity[e.index()].push(fact.id);
         }
