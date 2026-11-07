@@ -1,16 +1,13 @@
-//! Library errors.
+//! Errors of the data model.
 
 use thiserror::Error;
 
-/// Library errors.
-///
-/// Model errors are returned when a value would break an invariant: an
-/// empty interval, a NaN, a confidence outside `[0, 1]`. Such a value
-/// cannot be created at all — neither by a constructor nor by reading the
-/// journal.
+/// A value would break a model invariant: an empty interval, a NaN, a
+/// confidence outside `[0, 1]`. Such a value cannot be created at all —
+/// neither by a constructor nor by reading the log.
 #[derive(Debug, Clone, PartialEq, Error)]
 #[non_exhaustive]
-pub enum Error {
+pub enum ModelError {
     /// The interval `[start, end)` is empty: start is not before end.
     #[error("empty interval: start {start} ms is not before end {end} ms")]
     EmptyInterval {

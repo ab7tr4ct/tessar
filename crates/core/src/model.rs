@@ -6,12 +6,19 @@
 //! versioning, indexes) live elsewhere.
 //!
 //! Ids are minted only by the store, so code outside the crate cannot make
-//! one up:
+//! one up. The type is public:
+//!
+//! ```
+//! use tessar_core::model::FactId;
+//! ```
+//!
+//! but its constructor is not:
 //!
 //! ```compile_fail
-//! let id = tessar::model::FactId::new(1);
+//! let id = tessar_core::model::FactId::new(1);
 //! ```
 
+mod error;
 mod heat;
 mod ids;
 mod origin;
@@ -21,6 +28,7 @@ mod text;
 mod time;
 mod value;
 
+pub use error::ModelError;
 pub use heat::{Heat, Usefulness};
 pub use ids::{EntityId, EntityKindId, EpisodeId, FactId, Lineage, PredicateId, SpaceId};
 pub use origin::{Confidence, Origin};

@@ -11,8 +11,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::ModelError;
 use super::time::{TimeDelta, Timestamp};
-use crate::Error;
 
 /// Heat of one fact lineage: a non-negative value that halves every
 /// half-life since `updated_at`.
@@ -33,14 +33,14 @@ struct RawHeat {
 impl Heat {
     /// Heat `value` as of `at`; fails if the value is negative, NaN or
     /// infinite.
-    pub fn new(value: f32, at: Timestamp) -> Result<Self, Error> {
+    pub fn new(value: f32, at: Timestamp) -> Result<Self, ModelError> {
         if value.is_finite() && value >= 0.0 {
             Ok(Self {
                 value,
                 updated_at: at,
             })
         } else {
-            Err(Error::InvalidHeat(value))
+            Err(ModelError::InvalidHeat(value))
         }
     }
 
@@ -74,16 +74,21 @@ impl Heat {
     }
 
     /// Decays to `now` and then adds `gain`.
-    pub fn warmed(self, gain: f32, now: Timestamp, half_life: TimeDelta) -> Result<Self, Error> {
+    pub fn warmed(
+        self,
+        gain: f32,
+        now: Timestamp,
+        half_life: TimeDelta,
+    ) -> Result<Self, ModelError> {
         let at = now.max(self.updated_at);
         Self::new(self.at(at, half_life) + gain, at)
     }
 }
 
 impl TryFrom<RawHeat> for Heat {
-    type Error = Error;
+    type Error = ModelError;
 
-    fn try_from(raw: RawHeat) -> Result<Self, Error> {
+    fn try_from(raw: RawHeat) -> Result<Self, ModelError> {
         Self::new(raw.value, raw.updated_at)
     }
 }
@@ -139,15 +144,15 @@ impl Usefulness {
 }
 
 impl TryFrom<i8> for Usefulness {
-    type Error = Error;
+    type Error = ModelError;
 
-    fn try_from(score: i8) -> Result<Self, Error> {
+    fn try_from(score: i8) -> Result<Self, ModelError> {
         match score {
             -1 => Ok(Self::Miss),
             0 => Ok(Self::Neutral),
             1 => Ok(Self::Useful),
             2 => Ok(Self::Bingo),
-            _ => Err(Error::InvalidUsefulness(score)),
+            _ => Err(ModelError::InvalidUsefulness(score)),
         }
     }
 }
@@ -175,7 +180,7 @@ mod tests {
     #[test]
     fn heat_must_be_finite_and_non_negative() {
         assert!(Heat::new(0.0, ts(0)).is_ok());
-        assert_eq!(Heat::new(-1.0, ts(0)), Err(Error::InvalidHeat(-1.0)));
+        assert_eq!(Heat::new(-1.0, ts(0)), Err(ModelError::InvalidHeat(-1.0)));
         assert!(Heat::new(f32::NAN, ts(0)).is_err());
         assert!(Heat::new(f32::INFINITY, ts(0)).is_err());
     }

@@ -2,9 +2,9 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::ModelError;
 use super::ids::{EntityId, EntityKindId};
 use super::time::{TimeSpan, Timestamp};
-use crate::Error;
 
 /// A finite float: neither NaN nor infinite.
 ///
@@ -16,11 +16,11 @@ pub struct Finite(f64);
 
 impl Finite {
     /// The number `x`; fails if it is NaN or infinite.
-    pub const fn new(x: f64) -> Result<Self, Error> {
+    pub const fn new(x: f64) -> Result<Self, ModelError> {
         if x.is_finite() {
             Ok(Self(x))
         } else {
-            Err(Error::NonFiniteFloat(x))
+            Err(ModelError::NonFiniteFloat(x))
         }
     }
 
@@ -31,9 +31,9 @@ impl Finite {
 }
 
 impl TryFrom<f64> for Finite {
-    type Error = Error;
+    type Error = ModelError;
 
-    fn try_from(x: f64) -> Result<Self, Error> {
+    fn try_from(x: f64) -> Result<Self, ModelError> {
         Self::new(x)
     }
 }

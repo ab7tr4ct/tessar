@@ -4,7 +4,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::Error;
+use super::ModelError;
 
 /// A key: `tessar`, `src/main.rs`, `Anna`.
 ///
@@ -20,13 +20,13 @@ impl Key {
     pub const MAX_CHARS: usize = 256;
 
     /// A key from text; surrounding whitespace is trimmed.
-    pub fn new(raw: &str) -> Result<Self, Error> {
+    pub fn new(raw: &str) -> Result<Self, ModelError> {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
-            return Err(Error::EmptyKey);
+            return Err(ModelError::EmptyKey);
         }
         if trimmed.chars().count() > Self::MAX_CHARS {
-            return Err(Error::KeyTooLong {
+            return Err(ModelError::KeyTooLong {
                 max: Self::MAX_CHARS,
             });
         }
@@ -50,9 +50,9 @@ impl Key {
 }
 
 impl TryFrom<String> for Key {
-    type Error = Error;
+    type Error = ModelError;
 
-    fn try_from(raw: String) -> Result<Self, Error> {
+    fn try_from(raw: String) -> Result<Self, ModelError> {
         Self::new(&raw)
     }
 }
@@ -82,14 +82,14 @@ impl Name {
     pub const MAX_CHARS: usize = 64;
 
     /// A name from text; fails if the text breaks the naming rules.
-    pub fn new(raw: &str) -> Result<Self, Error> {
+    pub fn new(raw: &str) -> Result<Self, ModelError> {
         let allowed =
             |c: char| c == '_' || c.is_numeric() || (c.is_alphabetic() && !c.is_uppercase());
         let len = raw.chars().count();
         if (1..=Self::MAX_CHARS).contains(&len) && raw.chars().all(allowed) {
             Ok(Self(raw.to_owned()))
         } else {
-            Err(Error::InvalidName(raw.to_owned()))
+            Err(ModelError::InvalidName(raw.to_owned()))
         }
     }
 
@@ -100,9 +100,9 @@ impl Name {
 }
 
 impl TryFrom<String> for Name {
-    type Error = Error;
+    type Error = ModelError;
 
-    fn try_from(raw: String) -> Result<Self, Error> {
+    fn try_from(raw: String) -> Result<Self, ModelError> {
         Self::new(&raw)
     }
 }
@@ -126,8 +126,8 @@ mod tests {
     #[test]
     fn key_is_trimmed_and_not_empty() {
         assert_eq!(Key::new("  tessar ").unwrap().as_str(), "tessar");
-        assert_eq!(Key::new("   "), Err(Error::EmptyKey));
-        assert_eq!(Key::new(""), Err(Error::EmptyKey));
+        assert_eq!(Key::new("   "), Err(ModelError::EmptyKey));
+        assert_eq!(Key::new(""), Err(ModelError::EmptyKey));
     }
 
     #[test]
@@ -137,7 +137,7 @@ mod tests {
         let over = "я".repeat(Key::MAX_CHARS + 1);
         assert_eq!(
             Key::new(&over),
-            Err(Error::KeyTooLong {
+            Err(ModelError::KeyTooLong {
                 max: Key::MAX_CHARS
             })
         );

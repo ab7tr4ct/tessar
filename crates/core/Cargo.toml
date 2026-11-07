@@ -1,0 +1,21 @@
+[package]
+name = "tessar-core"
+description = "Core of tessar: data model, memory rules and ports"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+# Contract tests that every `Log` implementation must pass.
+testing = []
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

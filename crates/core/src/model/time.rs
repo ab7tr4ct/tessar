@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::Error;
+use super::ModelError;
 
 /// An instant: milliseconds since the Unix epoch, UTC.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -39,11 +39,11 @@ pub struct TimeDelta(i64);
 
 impl TimeDelta {
     /// A duration of `ms` milliseconds; fails if `ms <= 0`.
-    pub const fn from_millis(ms: i64) -> Result<Self, Error> {
+    pub const fn from_millis(ms: i64) -> Result<Self, ModelError> {
         if ms > 0 {
             Ok(Self(ms))
         } else {
-            Err(Error::NonPositiveDuration(ms))
+            Err(ModelError::NonPositiveDuration(ms))
         }
     }
 
@@ -54,9 +54,9 @@ impl TimeDelta {
 }
 
 impl TryFrom<i64> for TimeDelta {
-    type Error = Error;
+    type Error = ModelError;
 
-    fn try_from(ms: i64) -> Result<Self, Error> {
+    fn try_from(ms: i64) -> Result<Self, ModelError> {
         Self::from_millis(ms)
     }
 }
@@ -87,11 +87,11 @@ struct RawInterval {
 
 impl Interval {
     /// The interval `[start, end)`; fails if it is empty.
-    pub const fn new(start: Timestamp, end: Timestamp) -> Result<Self, Error> {
+    pub const fn new(start: Timestamp, end: Timestamp) -> Result<Self, ModelError> {
         if start.0 < end.0 {
             Ok(Self { start, end })
         } else {
-            Err(Error::EmptyInterval {
+            Err(ModelError::EmptyInterval {
                 start: start.0,
                 end: end.0,
             })
@@ -120,9 +120,9 @@ impl Interval {
 }
 
 impl TryFrom<RawInterval> for Interval {
-    type Error = Error;
+    type Error = ModelError;
 
-    fn try_from(raw: RawInterval) -> Result<Self, Error> {
+    fn try_from(raw: RawInterval) -> Result<Self, ModelError> {
         Self::new(raw.start, raw.end)
     }
 }
@@ -184,7 +184,7 @@ mod tests {
     fn interval_rejects_empty() {
         assert_eq!(
             Interval::new(ts(5), ts(5)),
-            Err(Error::EmptyInterval { start: 5, end: 5 })
+            Err(ModelError::EmptyInterval { start: 5, end: 5 })
         );
         assert!(Interval::new(ts(6), ts(5)).is_err());
     }
@@ -210,7 +210,7 @@ mod tests {
     fn delta_must_be_positive() {
         assert_eq!(
             TimeDelta::from_millis(0),
-            Err(Error::NonPositiveDuration(0))
+            Err(ModelError::NonPositiveDuration(0))
         );
         assert!(TimeDelta::from_millis(-1).is_err());
         assert_eq!(TimeDelta::from_millis(1).unwrap().as_millis(), 1);

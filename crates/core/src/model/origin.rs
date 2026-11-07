@@ -2,8 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::ModelError;
 use super::text::Key;
-use crate::Error;
 
 /// Confidence in an inferred fact, from 0 to 1 inclusive.
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -12,11 +12,11 @@ pub struct Confidence(f32);
 
 impl Confidence {
     /// The confidence `x`; fails if it is outside `[0, 1]` or NaN.
-    pub fn new(x: f32) -> Result<Self, Error> {
+    pub fn new(x: f32) -> Result<Self, ModelError> {
         if (0.0..=1.0).contains(&x) {
             Ok(Self(x))
         } else {
-            Err(Error::ConfidenceOutOfRange(x))
+            Err(ModelError::ConfidenceOutOfRange(x))
         }
     }
 
@@ -27,9 +27,9 @@ impl Confidence {
 }
 
 impl TryFrom<f32> for Confidence {
-    type Error = Error;
+    type Error = ModelError;
 
-    fn try_from(x: f32) -> Result<Self, Error> {
+    fn try_from(x: f32) -> Result<Self, ModelError> {
         Self::new(x)
     }
 }
