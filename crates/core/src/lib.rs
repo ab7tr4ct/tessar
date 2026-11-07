@@ -9,5 +9,7 @@
 //! Adapters (the file journal, the MCP server) live in other crates and
 //! depend on this one, never the other way round.
 
+pub mod clock;
 pub mod log;
 pub mod model;
+pub mod store;
