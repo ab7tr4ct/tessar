@@ -301,16 +301,16 @@ fn channels_can_be_turned_off() {
         ..Recall::new("journal Аня")
     };
     let lexical = w.memory.recall(&only(Channels {
-        meaning: false,
+        meaning: 0.0,
         ..Channels::default()
     }));
     assert_eq!(lexical.hits.len(), 1);
     assert!(lexical.hits.iter().all(|h| h.why.meaning_rank.is_none()));
 
     let meaning = w.memory.recall(&only(Channels {
-        entities: false,
-        keywords: false,
-        meaning: true,
+        entities: 0.0,
+        keywords: 0.0,
+        meaning: 1.0,
     }));
     assert_eq!(meaning.hits.len(), 2);
     assert!(meaning.hits.iter().all(|h| h.why.keyword_rank.is_none()));
