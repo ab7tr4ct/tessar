@@ -4,6 +4,13 @@
 //! them; links between records are ids too, never pointers. This module
 //! holds only the types and their invariants. Store rules (transactions,
 //! versioning, indexes) live elsewhere.
+//!
+//! Ids are minted only by the store, so code outside the crate cannot make
+//! one up:
+//!
+//! ```compile_fail
+//! let id = tessar::model::FactId::new(1);
+//! ```
 
 mod ids;
 mod origin;

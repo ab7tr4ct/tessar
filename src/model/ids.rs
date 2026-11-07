@@ -3,6 +3,13 @@
 //! Every id is the index of a record in a store vector, so lookup by id is
 //! O(1). A separate type per record kind means a fact id cannot be passed
 //! where an entity id is expected: such a mistake does not compile.
+//!
+//! Only the store mints ids: a new record gets the length of its vector at
+//! the moment it is pushed, under the single writer, so ids are unique and
+//! dense without any atomic counter. The same rule reproduces the same ids
+//! when the journal is replayed. An id that comes from outside (an API
+//! call, a deserialized request) is only a reference: the store checks that
+//! the record exists and belongs to the right space before using it.
 
 use std::fmt;
 
@@ -15,9 +22,10 @@ macro_rules! id {
         #[serde(transparent)]
         pub struct $name(u32);
 
+        #[allow(dead_code, reason = "minting and indexing are used by the store")]
         impl $name {
-            /// The id of record number `raw`.
-            pub const fn new(raw: u32) -> Self {
+            /// The id of record number `raw`. Only the store mints ids.
+            pub(crate) const fn new(raw: u32) -> Self {
                 Self(raw)
             }
 
@@ -27,7 +35,7 @@ macro_rules! id {
             }
 
             /// The record number as an index into a store vector.
-            pub const fn index(self) -> usize {
+            pub(crate) const fn index(self) -> usize {
                 self.0 as usize
             }
         }
@@ -81,8 +89,10 @@ id!(
 pub struct Lineage(FactId);
 
 impl Lineage {
-    /// The chain that starts with version `first`.
-    pub const fn starting_at(first: FactId) -> Self {
+    /// The chain that starts with version `first`. Only the store starts
+    /// chains.
+    #[allow(dead_code, reason = "used by the store")]
+    pub(crate) const fn starting_at(first: FactId) -> Self {
         Self(first)
     }
 
