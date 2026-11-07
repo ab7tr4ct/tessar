@@ -22,6 +22,37 @@ pub trait Embedder: Send + Sync {
     fn embed_query(&self, text: &str) -> Result<Vec<f32>, EmbedError>;
 }
 
+/// Instructions a model expects before queries and documents.
+///
+/// Adapters put [`Prompts::query`] before every query and
+/// [`Prompts::document`] before every document.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Prompts {
+    /// Put before every query.
+    pub query: String,
+    /// Put before every document.
+    pub document: String,
+}
+
+impl Prompts {
+    /// No instructions.
+    pub fn none() -> Self {
+        Self {
+            query: String::new(),
+            document: String::new(),
+        }
+    }
+
+    /// The Voyage 4 series (`voyage-4-nano`, `-lite`, `voyage-4`,
+    /// `-large`): what their API adds for `input_type`.
+    pub fn voyage() -> Self {
+        Self {
+            query: "Represent the query for retrieving supporting documents: ".into(),
+            document: "Represent the document for retrieval: ".into(),
+        }
+    }
+}
+
 /// An embedder failure, or a vector the store cannot use.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[error("{0}")]

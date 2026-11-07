@@ -1,9 +1,11 @@
 //! Embedders for tessar.
 //!
 //! [`HttpEmbedder`] talks to any OpenAI-compatible `/v1/embeddings`
-//! endpoint: a local `llama-server --embedding` — the default, a GPU
-//! through Metal or CUDA, ~15 ms per query — or an API such as OpenRouter,
-//! which is good for bulk indexing but too slow for queries (300–700 ms).
+//! endpoint: a `llama-server --embedding` — on this machine or another
+//! one with a GPU, ~15 ms per query locally — or an API such as
+//! OpenRouter, which is good for bulk indexing but too slow for queries
+//! (300–700 ms). The default embedder runs the model inside the process
+//! instead: `tessar-embed-llama`.
 //!
 //! Running `llama-server` for the default model:
 //!
@@ -18,35 +20,8 @@
 use std::time::Duration;
 
 use serde::Deserialize;
+pub use tessar_core::embed::Prompts;
 use tessar_core::embed::{EmbedError, Embedder};
-
-/// Instructions the model expects before queries and documents.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Prompts {
-    /// Put before every query.
-    pub query: String,
-    /// Put before every document.
-    pub document: String,
-}
-
-impl Prompts {
-    /// No instructions.
-    pub fn none() -> Self {
-        Self {
-            query: String::new(),
-            document: String::new(),
-        }
-    }
-
-    /// The Voyage 4 series (`voyage-4-nano`, `-lite`, `voyage-4`,
-    /// `-large`): what their API adds for `input_type`.
-    pub fn voyage() -> Self {
-        Self {
-            query: "Represent the query for retrieving supporting documents: ".into(),
-            document: "Represent the document for retrieval: ".into(),
-        }
-    }
-}
 
 /// An embedder behind an OpenAI-compatible `/v1/embeddings` endpoint.
 #[derive(Debug, Clone)]

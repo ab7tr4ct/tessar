@@ -1,0 +1,29 @@
+[package]
+name = "tessar-embed-llama"
+description = "In-process embedder for tessar: llama.cpp behind a small C++ shim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+links = "llama"
+
+[dependencies]
+tessar-core.workspace = true
+cxx.workspace = true
+
+[build-dependencies]
+cmake.workspace = true
+cxx-build.workspace = true
+
+[dev-dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+ureq.workspace = true
+
+# The workspace forbids unsafe code, and `forbid` cannot be lifted locally.
+# The cxx bridge expands to `unsafe` items and the handle needs one
+# `unsafe impl Send`, so this crate denies unsafe code instead and allows
+# it on exactly those two items in `src/lib.rs`.
+[lints.rust]
+unsafe_code = "deny"
