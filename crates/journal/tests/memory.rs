@@ -173,3 +173,151 @@ fn write_throughput_and_read_latency() {
     );
     println!("reader meanwhile: {reads} reads, worst {worst_read:?}");
 }
+
+/// Where the limits are: the write path without a disk, facts per second
+/// when a commit carries many facts, and how reads scale with threads.
+#[test]
+#[ignore = "measures the machine; run with --release --ignored --nocapture"]
+fn throughput_limits() {
+    use tessar_core::log::MemLog;
+
+    fn setup(
+        memory: &Memory,
+    ) -> (
+        tessar_core::model::SpaceId,
+        tessar_core::model::EntityKindId,
+        tessar_core::model::PredicateId,
+    ) {
+        let space = memory
+            .create_space(key("bench"), SpaceKind::LongTerm, None)
+            .unwrap();
+        let person = memory.define_kind(space, name("person")).unwrap();
+        let knows = memory
+            .define_predicate(space, name("knows"), ValueType::Text, Cardinality::Many)
+            .unwrap();
+        (space, person, knows)
+    }
+    fn fact(
+        person: tessar_core::model::EntityKindId,
+        knows: tessar_core::model::PredicateId,
+        who: usize,
+        i: usize,
+    ) -> FactDraft {
+        FactDraft::new(BodyDraft::Triple {
+            subject: EntityRef::Key {
+                kind: person,
+                key: key(&format!("person {who}")),
+            },
+            predicate: knows,
+            object: ObjectDraft::Value(Value::Text(format!("skill {i}"))),
+        })
+    }
+    let origin = || Origin::Asserted { by: key("bench") };
+
+    // 1. The write path alone: planning, checks, indexes — no disk.
+    let memory = Memory::open(MemLog::<Op>::new(), Arc::new(SystemClock)).unwrap();
+    let (space, person, knows) = setup(&memory);
+    let n = 50_000;
+    let start = Instant::now();
+    for i in 0..n {
+        memory
+            .remember(Remember {
+                space,
+                origin: origin(),
+                episode: None,
+                facts: vec![fact(person, knows, i % 100, i)],
+            })
+            .unwrap();
+    }
+    let t = start.elapsed();
+    println!(
+        "in-memory log: {n} commits in {t:?} = {:.0} commits/s",
+        n as f64 / t.as_secs_f64()
+    );
+
+    // 2. Real disk, many facts per commit.
+    let dir = tempfile::tempdir().unwrap();
+    let memory = Memory::open(
+        FileJournal::<Op>::open(dir.path().join("journal.log")).unwrap(),
+        Arc::new(SystemClock),
+    )
+    .unwrap();
+    let (space, person, knows) = setup(&memory);
+    for batch in [1, 10, 100, 1000] {
+        let commits = 20;
+        let start = Instant::now();
+        for c in 0..commits {
+            let facts = (0..batch)
+                .map(|i| fact(person, knows, i % 100, c * batch + i + batch * 1_000_000))
+                .collect();
+            memory
+                .remember(Remember {
+                    space,
+                    origin: origin(),
+                    episode: None,
+                    facts,
+                })
+                .unwrap();
+        }
+        let t = start.elapsed();
+        println!(
+            "disk, {batch:>4} facts/commit: {:.0} commits/s, {:.0} facts/s",
+            commits as f64 / t.as_secs_f64(),
+            (commits * batch) as f64 / t.as_secs_f64()
+        );
+    }
+
+    // 3. Reads: how they scale with threads (no writers).
+    let memory = Memory::open(MemLog::<Op>::new(), Arc::new(SystemClock)).unwrap();
+    let (space, person, knows) = setup(&memory);
+    for c in 0..100 {
+        let facts = (0..50)
+            .map(|i| fact(person, knows, c, c * 50 + i))
+            .collect();
+        memory
+            .remember(Remember {
+                space,
+                origin: origin(),
+                episode: None,
+                facts,
+            })
+            .unwrap();
+    }
+    let people: Vec<_> = (0..100)
+        .map(|c| {
+            memory
+                .find_entity(space, person, &format!("person {c}"))
+                .unwrap()
+                .id
+        })
+        .collect();
+    let people = Arc::new(people);
+    for threads in [1, 2, 4, 8, 16] {
+        let per_thread = 200_000 / threads;
+        let start = Instant::now();
+        let workers: Vec<_> = (0..threads)
+            .map(|t| {
+                let memory = memory.clone();
+                let people = Arc::clone(&people);
+                thread::spawn(move || {
+                    let mut seen = 0;
+                    for i in 0..per_thread {
+                        seen += memory
+                            .facts_about(people[(i + t) % people.len()], View::Current)
+                            .len();
+                    }
+                    seen
+                })
+            })
+            .collect();
+        let seen: usize = workers.into_iter().map(|w| w.join().unwrap()).sum();
+        let t = start.elapsed();
+        let reads = per_thread * threads;
+        println!(
+            "reads, {threads:>2} threads: {:.0} reads/s ({} facts each, {:.1} µs/read per thread)",
+            reads as f64 / t.as_secs_f64(),
+            seen / reads,
+            t.as_secs_f64() * 1e6 * threads as f64 / reads as f64
+        );
+    }
+}
