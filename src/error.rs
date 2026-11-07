@@ -46,4 +46,12 @@ pub enum Error {
     /// A kind or predicate name breaks the naming rules.
     #[error("invalid name {0:?}: use 1 to 64 lowercase letters, digits or `_`")]
     InvalidName(String),
+
+    /// Heat is negative, NaN or infinite.
+    #[error("heat must be finite and non-negative, got {0}")]
+    InvalidHeat(f32),
+
+    /// A usefulness score is outside `-1..=2`.
+    #[error("usefulness score must be in -1..=2, got {0}")]
+    InvalidUsefulness(i8),
 }

@@ -12,6 +12,7 @@
 //! let id = tessar::model::FactId::new(1);
 //! ```
 
+mod heat;
 mod ids;
 mod origin;
 mod record;
@@ -20,6 +21,7 @@ mod text;
 mod time;
 mod value;
 
+pub use heat::{Heat, Usefulness};
 pub use ids::{EntityId, EntityKindId, EpisodeId, FactId, Lineage, PredicateId, SpaceId};
 pub use origin::{Confidence, Origin};
 pub use record::{Ending, Entity, Episode, Fact, FactBody, FactEnd, Space, SpaceKind, SpaceState};
