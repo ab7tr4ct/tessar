@@ -13,12 +13,13 @@ mod plan;
 mod recall;
 mod state;
 mod text;
+mod vector;
 
 pub use draft::{
     BodyDraft, EntityRef, EpisodeDraft, FactDraft, ObjectDraft, Outcome, Reason, Recorded,
     Remember, Remembered, Replacement, Update, View,
 };
 pub use error::StoreError;
-pub use memory::Memory;
+pub use memory::{Memory, Semantic};
 pub use op::Op;
 pub use recall::{Hit, Recall, Recalled, Why};

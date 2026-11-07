@@ -8,12 +8,32 @@ use super::op::Op;
 use super::plan::Planner;
 use super::recall::{Recall, Recalled, recall};
 use super::state::State;
+use super::text::{fact_text, fact_text_with};
+use super::vector::Quantized;
 use crate::clock::Clock;
+use crate::embed::{EmbedError, Embedder};
 use crate::log::{Commit, Log};
 use crate::model::{
     Cardinality, Entity, EntityId, EntityKindId, Fact, FactId, Key, Lineage, Name, PredicateDef,
     PredicateId, Space, SpaceId, SpaceKind, Timestamp, ValueType,
 };
+
+/// How many texts go to the embedder in one call when the memory opens.
+const EMBED_BATCH: usize = 64;
+
+/// The meaning channel: how facts and queries become vectors.
+#[derive(Clone)]
+pub struct Semantic {
+    /// Computes the vectors.
+    pub embedder: Arc<dyn Embedder>,
+    /// Length of vectors in the index. Longer ones are cut and
+    /// renormalized, which suits Matryoshka models.
+    pub dims: usize,
+    /// Added to the cosine similarity of facts in the query's near spaces
+    /// ([`Recall::near`]). In the model's cosine units, so it is tuned per
+    /// model; 0.05 suits voyage-4-nano.
+    pub near_bonus: f32,
+}
 
 /// The memory store. Cheap to clone; every clone is the same store, safe
 /// to use from any number of threads.
@@ -35,6 +55,11 @@ use crate::model::{
 /// A write becomes visible only after it is durable, so nobody ever reads
 /// something a crash could take back.
 ///
+/// With the meaning channel on ([`Memory::open_with`]), the writer embeds
+/// the new facts after planning and before the log: under the writer lock,
+/// not the state lock, so readers go on meanwhile. A fact becomes visible
+/// in every channel at once.
+///
 /// Lost updates are caught by version checks: a writer passes the version
 /// it saw, and if someone changed the fact in between the write fails with
 /// [`StoreError::Conflict`].
@@ -47,6 +72,7 @@ struct Inner {
     writer: Mutex<Writer>,
     state: RwLock<State>,
     clock: Arc<dyn Clock>,
+    semantic: Option<Semantic>,
 }
 
 struct Writer {
@@ -57,10 +83,30 @@ struct Writer {
 }
 
 impl Memory {
-    /// Opens the memory: replays `log` to rebuild the state.
+    /// Opens the memory without the meaning channel: replays `log` to
+    /// rebuild the state.
     pub fn open(
+        log: impl Log<Op> + Send + 'static,
+        clock: Arc<dyn Clock>,
+    ) -> Result<Self, StoreError> {
+        Self::open_inner(log, clock, None)
+    }
+
+    /// Opens the memory with the meaning channel. Vectors are not in the
+    /// log, so every fact version is embedded again here; put a cache in
+    /// front of a slow embedder.
+    pub fn open_with(
+        log: impl Log<Op> + Send + 'static,
+        clock: Arc<dyn Clock>,
+        semantic: Semantic,
+    ) -> Result<Self, StoreError> {
+        Self::open_inner(log, clock, Some(semantic))
+    }
+
+    fn open_inner(
         mut log: impl Log<Op> + Send + 'static,
         clock: Arc<dyn Clock>,
+        semantic: Option<Semantic>,
     ) -> Result<Self, StoreError> {
         let mut state = State::default();
         let mut last_at = Timestamp::from_millis(i64::MIN);
@@ -73,6 +119,21 @@ impl Memory {
             }
             last_at = commit.at;
         }
+        if let Some(semantic) = &semantic {
+            state.enable_vectors(semantic.dims);
+            let texts: Vec<(FactId, String)> = state
+                .facts()
+                .iter()
+                .map(|f| (f.id, fact_text(&state, f)))
+                .collect();
+            for batch in texts.chunks(EMBED_BATCH) {
+                for (fact, vector) in embed(semantic, batch)? {
+                    state
+                        .push_vector(fact, vector)
+                        .map_err(StoreError::Internal)?;
+                }
+            }
+        }
         Ok(Self {
             inner: Arc::new(Inner {
                 writer: Mutex::new(Writer {
@@ -81,6 +142,7 @@ impl Memory {
                 }),
                 state: RwLock::new(state),
                 clock,
+                semantic,
             }),
         })
     }
@@ -213,10 +275,31 @@ impl Memory {
             .collect()
     }
 
-    /// Finds facts for a query: by entities named in it and by its words,
-    /// fused, best first, each with an explanation.
+    /// Finds facts for a query: by entities named in it, by its words and,
+    /// with the meaning channel on, by meaning; fused, best first, each
+    /// with an explanation.
+    ///
+    /// If the embedder fails, the query runs without the meaning channel
+    /// and [`Recalled::degraded`] says why.
     pub fn recall(&self, query: &Recall) -> Recalled {
-        recall(&self.state(), query)
+        let mut degraded = None;
+        let mut vector = None;
+        if let Some(semantic) = &self.inner.semantic
+            && !query.text.trim().is_empty()
+        {
+            match semantic
+                .embedder
+                .embed_query(&query.text)
+                .and_then(|v| Quantized::new(&v, semantic.dims))
+            {
+                Ok(v) => vector = Some(v),
+                Err(e) => degraded = Some(format!("meaning channel skipped: {e}")),
+            }
+        }
+        let near_bonus = self.inner.semantic.as_ref().map_or(0.0, |s| s.near_bonus);
+        let mut recalled = recall(&self.state(), query, vector.as_ref(), near_bonus);
+        recalled.degraded = degraded;
+        recalled
     }
 
     /// The current values of a (subject, predicate) pair.
@@ -239,16 +322,27 @@ impl Memory {
         let mut writer = self.inner.writer.lock().map_err(|_| StoreError::Poisoned)?;
         let at = self.inner.clock.now().max(writer.last_at);
 
-        let (ops, result) = {
+        let (ops, result, texts) = {
             let state = self.state();
             let mut planner = Planner::new(&state, at);
             let result = plan(&mut planner)?;
-            (planner.into_ops(), result)
+            let ops = planner.into_ops();
+            let texts = match self.inner.semantic {
+                Some(_) => new_fact_texts(&state, &ops),
+                None => Vec::new(),
+            };
+            (ops, result, texts)
         };
         if ops.is_empty() {
             // Nothing to change, for example a value that is already current.
             return Ok(result);
         }
+        // Embedding is slow; it runs before the log, so a failure writes
+        // nothing, and without the state lock, so readers go on.
+        let vectors = match &self.inner.semantic {
+            Some(semantic) if !texts.is_empty() => embed(semantic, &texts)?,
+            _ => Vec::new(),
+        };
 
         let commit = Commit {
             seq: writer.log.next_seq(),
@@ -268,6 +362,11 @@ impl Memory {
         for op in commit.ops {
             state.apply(op).map_err(StoreError::Internal)?;
         }
+        for (fact, vector) in vectors {
+            state
+                .push_vector(fact, vector)
+                .map_err(StoreError::Internal)?;
+        }
         Ok(result)
     }
 
@@ -282,4 +381,42 @@ impl Memory {
             .read()
             .unwrap_or_else(PoisonError::into_inner)
     }
+}
+
+/// Texts of the facts a commit adds, as the indexes will see them.
+fn new_fact_texts(state: &State, ops: &[Op]) -> Vec<(FactId, String)> {
+    let new_entities: Vec<&Entity> = ops
+        .iter()
+        .filter_map(|op| match op {
+            Op::CreateEntity(e) => Some(e),
+            _ => None,
+        })
+        .collect();
+    ops.iter()
+        .filter_map(|op| match op {
+            Op::AddFact(f) => Some((f.id, fact_text_with(state, f, &new_entities))),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Embeds fact texts and prepares the vectors for the index.
+fn embed(
+    semantic: &Semantic,
+    texts: &[(FactId, String)],
+) -> Result<Vec<(FactId, Quantized)>, EmbedError> {
+    let strings: Vec<String> = texts.iter().map(|(_, t)| t.clone()).collect();
+    let vectors = semantic.embedder.embed_documents(&strings)?;
+    if vectors.len() != texts.len() {
+        return Err(EmbedError(format!(
+            "{} vectors for {} texts",
+            vectors.len(),
+            texts.len()
+        )));
+    }
+    texts
+        .iter()
+        .zip(vectors)
+        .map(|((fact, _), v)| Ok((*fact, Quantized::new(&v, semantic.dims)?)))
+        .collect()
 }

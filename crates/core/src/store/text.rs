@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use super::state::State;
-use crate::model::{Fact, FactBody, FactId, Value};
+use crate::model::{Entity, Fact, FactBody, FactId, Value};
 
 /// BM25 term-frequency saturation.
 const K1: f32 = 1.2;
@@ -75,7 +75,18 @@ fn is_sentence_punctuation(c: char) -> bool {
 /// statement or event, or the subject, predicate and value of a triple,
 /// plus the keys of the entities in the content.
 pub(crate) fn fact_text(state: &State, fact: &Fact) -> String {
-    let key = |id| state.entity(id).map_or("", |e| e.key.as_str());
+    fact_text_with(state, fact, &[])
+}
+
+/// [`fact_text`] for a fact that is not applied yet: its entities may be
+/// among `new`, created in the same commit.
+pub(crate) fn fact_text_with(state: &State, fact: &Fact, new: &[&Entity]) -> String {
+    let key = |id| {
+        state
+            .entity(id)
+            .or_else(|| new.iter().copied().find(|e| e.id == id))
+            .map_or("", |e| e.key.as_str())
+    };
     let mut parts: Vec<String> = Vec::new();
     match &fact.body {
         FactBody::Statement { text, .. } => parts.push(text.clone()),

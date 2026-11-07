@@ -8,6 +8,7 @@ use std::num::NonZeroU32;
 
 use super::op::Op;
 use super::text::{TextIndex, fact_text};
+use super::vector::{Quantized, VectorIndex};
 use crate::model::{
     Entity, EntityId, EntityKindDef, EntityKindId, Episode, Fact, FactBody, FactId, Lineage, Name,
     PredicateDef, PredicateId, Space, SpaceId, ValueType,
@@ -39,6 +40,10 @@ pub(crate) struct State {
     names: HashMap<String, Vec<EntityId>>,
     /// Keyword index over every fact version.
     text: TextIndex,
+    /// Vectors of every fact version, if the meaning channel is on. Not
+    /// built by [`State::apply`]: vectors are not in the log, the writer
+    /// adds them right after applying a commit.
+    vectors: Option<VectorIndex>,
 }
 
 impl State {
@@ -114,6 +119,30 @@ impl State {
 
     pub(crate) fn text(&self) -> &TextIndex {
         &self.text
+    }
+
+    /// Every fact version, by index.
+    pub(crate) fn facts(&self) -> &[Fact] {
+        &self.facts
+    }
+
+    pub(crate) fn vectors(&self) -> Option<&VectorIndex> {
+        self.vectors.as_ref()
+    }
+
+    /// Turns the meaning channel on. Vectors of the facts already here
+    /// must be pushed next, in order.
+    pub(crate) fn enable_vectors(&mut self, dims: usize) {
+        self.vectors = Some(VectorIndex::new(dims));
+    }
+
+    /// Adds the vector of the next fact that has none.
+    pub(crate) fn push_vector(&mut self, fact: FactId, vector: Quantized) -> Result<(), String> {
+        let index = self.vectors.as_mut().ok_or("the meaning channel is off")?;
+        if fact.index() >= self.facts.len() {
+            return Err(format!("vector for unknown fact {fact}"));
+        }
+        index.push(fact, vector)
     }
 
     pub(crate) fn facts_of(&self, entity: EntityId) -> &[FactId] {

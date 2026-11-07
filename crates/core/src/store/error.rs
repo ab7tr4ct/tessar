@@ -4,6 +4,7 @@ use std::num::NonZeroU32;
 
 use thiserror::Error;
 
+use crate::embed::EmbedError;
 use crate::log::{LogError, Seq};
 use crate::model::{
     EntityId, EntityKindId, Lineage, ModelError, PredicateId, SpaceId, Timestamp, ValueType,
@@ -23,6 +24,11 @@ pub enum StoreError {
     /// The log failed.
     #[error(transparent)]
     Log(#[from] LogError),
+
+    /// The embedder failed or returned a vector the index cannot hold.
+    /// A write that needs vectors fails whole: nothing is written.
+    #[error("embedder failed: {0}")]
+    Embed(#[from] EmbedError),
 
     /// No such space.
     #[error("unknown space {0}")]

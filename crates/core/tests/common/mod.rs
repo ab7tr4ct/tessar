@@ -12,7 +12,7 @@ use tessar_core::model::{
 };
 use tessar_core::store::{
     BodyDraft, EntityRef, FactDraft, Memory, ObjectDraft, Op, Recorded, Remember, Remembered,
-    StoreError,
+    Semantic, StoreError,
 };
 
 /// A log shared between several `Memory` instances, to test reopening.
@@ -57,6 +57,7 @@ pub fn v(n: u32) -> NonZeroU32 {
 
 pub struct World {
     pub memory: Memory,
+    pub semantic: Option<Semantic>,
     pub log: SharedLog,
     pub clock: Arc<ManualClock>,
     pub space: SpaceId,
@@ -75,9 +76,14 @@ pub struct World {
 
 impl World {
     pub fn new() -> Self {
+        Self::with(None)
+    }
+
+    /// A world whose memory has the meaning channel, if given.
+    pub fn with(semantic: Option<Semantic>) -> Self {
         let log = SharedLog::default();
         let clock = Arc::new(ManualClock::new(ts(100)));
-        let memory = Memory::open(log.clone(), clock.clone()).unwrap();
+        let memory = open(log.clone(), clock.clone(), semantic.clone()).unwrap();
         let space = memory
             .create_space(key("tessar"), SpaceKind::LongTerm, None)
             .unwrap();
@@ -103,6 +109,7 @@ impl World {
             .unwrap();
         Self {
             memory,
+            semantic,
             log,
             clock,
             space,
@@ -117,7 +124,7 @@ impl World {
     }
 
     pub fn reopen(&self) -> Memory {
-        Memory::open(self.log.clone(), self.clock.clone()).unwrap()
+        open(self.log.clone(), self.clock.clone(), self.semantic.clone()).unwrap()
     }
 
     pub fn person(&self, k: &str) -> EntityRef {
@@ -188,6 +195,17 @@ impl World {
 
     pub fn fact(&self, recorded: Recorded) -> Fact {
         self.memory.fact(recorded.fact).unwrap()
+    }
+}
+
+fn open(
+    log: SharedLog,
+    clock: Arc<ManualClock>,
+    semantic: Option<Semantic>,
+) -> Result<Memory, StoreError> {
+    match semantic {
+        Some(semantic) => Memory::open_with(log, clock, semantic),
+        None => Memory::open(log, clock),
     }
 }
 
