@@ -22,4 +22,4 @@ pub use draft::{
 pub use error::StoreError;
 pub use memory::{Memory, Semantic};
 pub use op::Op;
-pub use recall::{Hit, Recall, Recalled, Why};
+pub use recall::{Channels, Hit, Recall, Recalled, Why};

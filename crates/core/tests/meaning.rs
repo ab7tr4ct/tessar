@@ -9,7 +9,9 @@ use std::sync::{Arc, Mutex};
 use common::*;
 use tessar_core::embed::{EmbedError, Embedder};
 use tessar_core::model::{FactBody, SpaceKind};
-use tessar_core::store::{BodyDraft, FactDraft, Hit, Recall, Remember, Semantic, StoreError};
+use tessar_core::store::{
+    BodyDraft, Channels, FactDraft, Hit, Recall, Remember, Semantic, StoreError,
+};
 
 /// Index length in these tests.
 const DIMS: usize = 8;
@@ -285,4 +287,31 @@ fn opening_fails_if_the_embedder_fails() {
         .err()
         .unwrap();
     assert!(matches!(err, StoreError::Embed(_)), "{err:?}");
+}
+
+#[test]
+fn channels_can_be_turned_off() {
+    let (w, _) = world();
+    w.remember(vec![
+        statement("Anna moved to Berlin"),
+        statement("The journal is append-only"),
+    ]);
+    let only = |channels| Recall {
+        channels,
+        ..Recall::new("journal Аня")
+    };
+    let lexical = w.memory.recall(&only(Channels {
+        meaning: false,
+        ..Channels::default()
+    }));
+    assert_eq!(lexical.hits.len(), 1);
+    assert!(lexical.hits.iter().all(|h| h.why.meaning_rank.is_none()));
+
+    let meaning = w.memory.recall(&only(Channels {
+        entities: false,
+        keywords: false,
+        meaning: true,
+    }));
+    assert_eq!(meaning.hits.len(), 2);
+    assert!(meaning.hits.iter().all(|h| h.why.keyword_rank.is_none()));
 }

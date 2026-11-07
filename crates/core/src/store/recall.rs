@@ -56,6 +56,30 @@ pub struct Recall {
     pub window: Option<Interval>,
     /// How many facts to return at most.
     pub limit: usize,
+    /// Which channels to use; all by default.
+    pub channels: Channels,
+}
+
+/// Which channels a query uses. Turning one off answers "what does this
+/// channel add" — the measurement every channel has to pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Channels {
+    /// Entities named in the query.
+    pub entities: bool,
+    /// BM25 over words.
+    pub keywords: bool,
+    /// Meaning, if the memory has an embedder.
+    pub meaning: bool,
+}
+
+impl Default for Channels {
+    fn default() -> Self {
+        Self {
+            entities: true,
+            keywords: true,
+            meaning: true,
+        }
+    }
 }
 
 impl Recall {
@@ -69,6 +93,7 @@ impl Recall {
             view: View::Current,
             window: None,
             limit: 10,
+            channels: Channels::default(),
         }
     }
 }
@@ -267,27 +292,21 @@ pub(crate) fn recall(
     let prepared = prepare(state, query, vector, near_bonus);
     let rrf = |i: usize| 1.0 / (RRF_K + (i + 1) as f32);
 
+    let on = query.channels;
     let mut fused: HashMap<FactId, Ranks> = HashMap::new();
-    for (i, fact) in EntityChannel
-        .search(state, &prepared)
-        .into_iter()
-        .enumerate()
-    {
-        fused.entry(fact).or_default().entity = Some(i + 1);
+    let mut run = |channel: &dyn Channel, place: fn(&mut Ranks) -> &mut Option<usize>| {
+        for (i, fact) in channel.search(state, &prepared).into_iter().enumerate() {
+            *place(fused.entry(fact).or_default()) = Some(i + 1);
+        }
+    };
+    if on.entities {
+        run(&EntityChannel, |r| &mut r.entity);
     }
-    for (i, fact) in KeywordChannel
-        .search(state, &prepared)
-        .into_iter()
-        .enumerate()
-    {
-        fused.entry(fact).or_default().keyword = Some(i + 1);
+    if on.keywords {
+        run(&KeywordChannel, |r| &mut r.keyword);
     }
-    for (i, fact) in MeaningChannel
-        .search(state, &prepared)
-        .into_iter()
-        .enumerate()
-    {
-        fused.entry(fact).or_default().meaning = Some(i + 1);
+    if on.meaning {
+        run(&MeaningChannel, |r| &mut r.meaning);
     }
 
     let concepts = prepared.concepts();

@@ -285,6 +285,7 @@ impl Memory {
         let mut degraded = None;
         let mut vector = None;
         if let Some(semantic) = &self.inner.semantic
+            && query.channels.meaning
             && !query.text.trim().is_empty()
         {
             match semantic
