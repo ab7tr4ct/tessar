@@ -10,6 +10,8 @@ use candle_core::quantized::gguf_file::{Content, Value};
 use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
 use candle_core::{D, DType, Device, Result, Tensor};
 use candle_nn::rotary_emb::rope_thd;
+
+use crate::ops;
 use candle_nn::{Embedding, Linear, Module, RmsNorm, VarBuilder};
 use serde::Deserialize;
 
@@ -377,12 +379,42 @@ impl Layer {
         })
     }
 
-    fn forward(&self, x: &Tensor, cos: &Tensor, sin: &Tensor, mask: &Tensor) -> Result<Tensor> {
-        let x = (x + self.attn.forward(&self.ln1.forward(x)?, cos, sin, mask)?)?;
-        let h = self.ln2.forward(&x)?;
-        let m = (candle_nn::ops::silu(&self.gate.forward(&h)?)? * self.up.forward(&h)?)?;
-        x + self.down.forward(&m)?
+    /// One layer. `h` is `ln1(x)`, already computed; `next` is the norm the
+    /// following layer (or the model) applies to this layer's output, so the
+    /// last residual add and that norm can run as one kernel.
+    /// Returns the new residual stream and `next(residual)`.
+    fn forward(
+        &self,
+        x: &Tensor,
+        h: &Tensor,
+        next: &RmsNorm,
+        rope: (&Tensor, &Tensor, &Tensor),
+        kernels: bool,
+    ) -> Result<(Tensor, Tensor)> {
+        let (cos, sin, mask) = rope;
+        let a = self.attn.forward(h, cos, sin, mask)?;
+        let (x, h) = add_norm(kernels, x, &a, &self.ln2)?;
+        let (g, u) = (self.gate.forward(&h)?, self.up.forward(&h)?);
+        let m = if kernels {
+            ops::swiglu(&g, &u)?
+        } else {
+            ops::swiglu_composed(&g, &u)?
+        };
+        let d = self.down.forward(&m)?;
+        add_norm(kernels, &x, &d, next)
     }
+}
+
+/// `(x + delta, norm(x + delta))`, as one kernel or as two candle ops.
+fn add_norm(kernels: bool, x: &Tensor, delta: &Tensor, norm: &RmsNorm) -> Result<(Tensor, Tensor)> {
+    let eps = norm.eps() as f32;
+    let both = if kernels {
+        ops::add_rmsnorm(x, delta, norm.weight(), eps)?
+    } else {
+        ops::add_rmsnorm_composed(x, delta, norm.weight(), eps)?
+    };
+    // Two views of the stacked result, no copies.
+    Ok((both.get(1)?, both.get(0)?))
 }
 
 pub struct Model {
@@ -391,17 +423,18 @@ pub struct Model {
     norm: RmsNorm,
     proj: Lin,
     inv_freq: Vec<f32>,
+    kernels: bool,
     dtype: DType,
     device: Device,
     pub dims: usize,
 }
 
 impl Model {
-    pub fn load(c: &Config, vb: VarBuilder<'static>, fused: bool) -> Result<Self> {
-        Self::build(c, &mut Source::Safetensors(vb), fused)
+    pub fn load(c: &Config, vb: VarBuilder<'static>, fused: bool, kernels: bool) -> Result<Self> {
+        Self::build(c, &mut Source::Safetensors(vb), fused, kernels)
     }
 
-    pub fn load_gguf(mut file: File, device: &Device, fused: bool) -> Result<Self> {
+    pub fn load_gguf(mut file: File, device: &Device, fused: bool, kernels: bool) -> Result<Self> {
         let content = Content::read(&mut file)?;
         let c = Config::from_gguf(&content)?;
         let mut src = Source::Gguf {
@@ -409,10 +442,10 @@ impl Model {
             file,
             device: device.clone(),
         };
-        Self::build(&c, &mut src, fused)
+        Self::build(&c, &mut src, fused, kernels)
     }
 
-    fn build(c: &Config, src: &mut Source, fused: bool) -> Result<Self> {
+    fn build(c: &Config, src: &mut Source, fused: bool, kernels: bool) -> Result<Self> {
         let device = src.device();
         let fused = device.is_metal() && fused;
         let layers = (0..c.num_hidden_layers)
@@ -427,6 +460,7 @@ impl Model {
             norm: src.norm("model.norm", "output_norm", c.hidden_size, c.rms_norm_eps)?,
             proj: src.linear("linear", "dense_2", c.num_labels, c.hidden_size)?,
             inv_freq,
+            kernels,
             dtype: src.dtype(),
             device,
             dims: c.num_labels,
@@ -451,13 +485,18 @@ impl Model {
             .embed
             .forward(ids, b, l, &self.device)?
             .to_dtype(self.dtype)?;
-        for layer in &self.layers {
-            x = layer.forward(&x, &cos, &sin, &mask)?;
+        // `h` always holds the normalized input of the next block: the first
+        // norm is a plain op, every later one rides on a residual-add kernel.
+        let mut h = match self.layers.first() {
+            Some(layer) => layer.ln1.forward(&x)?,
+            None => self.norm.forward(&x)?,
+        };
+        let rope = (&cos, &sin, &mask);
+        for (i, layer) in self.layers.iter().enumerate() {
+            let next = self.layers.get(i + 1).map_or(&self.norm, |n| &n.ln1);
+            (x, h) = layer.forward(&x, &h, next, rope, self.kernels)?;
         }
-        let x = self
-            .proj
-            .forward(&self.norm.forward(&x)?)?
-            .to_dtype(DType::F32)?;
+        let x = self.proj.forward(&h)?.to_dtype(DType::F32)?;
         let w = valid.unsqueeze(D::Minus1)?;
         let sum = x.broadcast_mul(&w)?.sum(1)?;
         let n = w.sum(1)?.clamp(1e-9, f64::MAX)?;
