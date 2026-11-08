@@ -7,7 +7,7 @@
 use std::fs::File;
 
 use candle_core::quantized::gguf_file::{Content, Value};
-use candle_core::quantized::{GgmlDType, QMatMul, QStorage, QTensor};
+use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
 use candle_core::{D, DType, Device, Result, Tensor};
 use candle_nn::rotary_emb::rope_thd;
 use candle_nn::{Embedding, Linear, Module, RmsNorm, VarBuilder};
@@ -100,15 +100,7 @@ impl Lin {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         match self {
             Self::Dense(l) => l.forward(x),
-            Self::Quant(q) => {
-                // `QMatMul` on Metal only takes and returns f32.
-                let dtype = x.dtype();
-                if dtype == DType::F32 {
-                    q.forward(x)
-                } else {
-                    q.forward(&x.to_dtype(DType::F32)?)?.to_dtype(dtype)
-                }
-            }
+            Self::Quant(q) => q.forward(x),
         }
     }
 }
@@ -156,68 +148,25 @@ enum Source {
         content: Content,
         file: File,
         device: Device,
-        /// Dtype of the activations between the quantized matmuls.
-        act: DType,
     },
 }
 
 impl Source {
     fn linear(&mut self, st: &str, gg: &str, out: usize, inp: usize) -> Result<Lin> {
-        self.linear_cat(&[(st.to_owned(), gg.to_owned(), out)], inp)
-    }
-
-    /// One layer whose output rows are the given layers' rows one after
-    /// another (`(safetensors name, GGUF name, out)` per part). Rows of a
-    /// row-major `[out, in]` matrix are independent, and for Q8_0 so are
-    /// their 32-value blocks, so the raw blocks can simply be joined.
-    fn linear_cat(&mut self, parts: &[(String, String, usize)], inp: usize) -> Result<Lin> {
-        let total: usize = parts.iter().map(|p| p.2).sum();
         match self {
-            Self::Safetensors(vb) => {
-                let ws = parts
-                    .iter()
-                    .map(|(st, _, out)| vb.pp(st).get((*out, inp), "weight"))
-                    .collect::<Result<Vec<_>>>()?;
-                let w = if ws.len() == 1 {
-                    ws.into_iter().next().unwrap()
-                } else {
-                    Tensor::cat(&ws, 0)?
-                };
-                Ok(Lin::Dense(Linear::new(w, None)))
-            }
+            Self::Safetensors(vb) => Ok(Lin::Dense(Linear::new(
+                vb.pp(st).get((out, inp), "weight")?,
+                None,
+            ))),
             Self::Gguf {
                 content,
                 file,
                 device,
-                ..
             } => {
-                let join = parts.len() > 1;
-                let mut bytes = Vec::new();
-                let mut single = None;
-                for (_, gg, out) in parts {
-                    let name = format!("{gg}.weight");
-                    // Joined parts are read on the CPU, as raw blocks.
-                    let at = if join { &Device::Cpu } else { &*device };
-                    let q = content.tensor(file, &name, at)?;
-                    if q.shape().dims() != [*out, inp] {
-                        candle_core::bail!("{gg}: shape {:?}, want [{out}, {inp}]", q.shape());
-                    }
-                    if join {
-                        if q.dtype() != GgmlDType::Q8_0 {
-                            candle_core::bail!("{gg}: only Q8_0 weights can be joined");
-                        }
-                        bytes.extend_from_slice(&q.data()?);
-                    } else {
-                        single = Some(q);
-                    }
+                let q = content.tensor(file, &format!("{gg}.weight"), device)?;
+                if q.shape().dims() != [out, inp] {
+                    candle_core::bail!("{gg}: shape {:?}, want [{out}, {inp}]", q.shape());
                 }
-                let q = match single {
-                    Some(q) => q,
-                    None => QTensor::new(
-                        QStorage::from_data(bytes.into(), device, GgmlDType::Q8_0)?,
-                        (total, inp),
-                    )?,
-                };
                 Ok(Lin::Quant(QMatMul::from_qtensor(q)?))
             }
         }
@@ -230,11 +179,9 @@ impl Source {
                 content,
                 file,
                 device,
-                act,
             } => content
                 .tensor(file, &format!("{gg}.weight"), device)?
-                .dequantize(device)?
-                .to_dtype(*act)?,
+                .dequantize(device)?,
         };
         Ok(RmsNorm::new(w, eps))
     }
@@ -272,31 +219,16 @@ impl Source {
     fn dtype(&self) -> DType {
         match self {
             Self::Safetensors(vb) => vb.dtype(),
-            Self::Gguf { act, .. } => *act,
+            // QMatMul takes and returns f32.
+            Self::Gguf { .. } => DType::F32,
         }
     }
 }
 
-/// Which projections are joined into one layer. Joining is exact (rows of
-/// the weight matrices are concatenated) but measured slower on Metal, see
-/// `EXPERIMENT.md`, so both are off by default.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Joins {
-    /// One layer for `[q | k | v]`.
-    pub qkv: bool,
-    /// One layer for `[gate | up]`.
-    pub gate_up: bool,
-}
-
-/// The query, key and value projections: three layers, or one whose output
-/// rows are `[q | k | v]`.
-enum Qkv {
-    Split(Box<[Lin; 3]>),
-    Fused(Lin),
-}
-
 struct Attention {
-    qkv: Qkv,
+    q: Lin,
+    k: Lin,
+    v: Lin,
     o: Lin,
     q_norm: RmsNorm,
     k_norm: RmsNorm,
@@ -308,33 +240,26 @@ struct Attention {
 }
 
 impl Attention {
-    fn load(c: &Config, src: &mut Source, i: usize, fused: bool, joins: Joins) -> Result<Self> {
+    fn load(c: &Config, src: &mut Source, i: usize, fused: bool) -> Result<Self> {
         let (h, d) = (c.num_attention_heads, c.head_dim);
         let kv = c.num_key_value_heads;
         let hid = c.hidden_size;
         let st = format!("model.layers.{i}.self_attn");
         let gg = format!("blk.{i}");
-        let part =
-            |n: &str, g: &str, out: usize| (format!("{st}.{n}_proj"), format!("{gg}.{g}"), out);
-        let parts = [
-            part("q", "attn_q", h * d),
-            part("k", "attn_k", kv * d),
-            part("v", "attn_v", kv * d),
-        ];
-        let qkv = if joins.qkv {
-            Qkv::Fused(src.linear_cat(&parts, hid)?)
-        } else {
-            let mut l = parts
-                .iter()
-                .map(|(st, gg, out)| src.linear(st, gg, *out, hid));
-            Qkv::Split(Box::new([
-                l.next().unwrap()?,
-                l.next().unwrap()?,
-                l.next().unwrap()?,
-            ]))
-        };
         Ok(Self {
-            qkv,
+            q: src.linear(&format!("{st}.q_proj"), &format!("{gg}.attn_q"), h * d, hid)?,
+            k: src.linear(
+                &format!("{st}.k_proj"),
+                &format!("{gg}.attn_k"),
+                kv * d,
+                hid,
+            )?,
+            v: src.linear(
+                &format!("{st}.v_proj"),
+                &format!("{gg}.attn_v"),
+                kv * d,
+                hid,
+            )?,
             o: src.linear(
                 &format!("{st}.o_proj"),
                 &format!("{gg}.attn_output"),
@@ -367,23 +292,9 @@ impl Attention {
         // Everything up to attention stays in the (b, l, heads, d) layout the
         // projections produce: contiguous, so the fused rms_norm and
         // rope_thd kernels apply without copies.
-        let (q, k, v) = match &self.qkv {
-            Qkv::Split(p) => (
-                p[0].forward(x)?.reshape((b, l, h, d))?,
-                p[1].forward(x)?.reshape((b, l, kv, d))?,
-                p[2].forward(x)?.reshape((b, l, kv, d))?,
-            ),
-            Qkv::Fused(p) => {
-                // Heads are the rows' unit: [q heads | k heads | v heads]. The
-                // norms need contiguous q and k; v goes to sdpa as a view.
-                let y = p.forward(x)?.reshape((b, l, h + 2 * kv, d))?;
-                (
-                    y.narrow(2, 0, h)?.contiguous()?,
-                    y.narrow(2, h, kv)?.contiguous()?,
-                    y.narrow(2, h + kv, kv)?,
-                )
-            }
-        };
+        let q = self.q.forward(x)?.reshape((b, l, h, d))?;
+        let k = self.k.forward(x)?.reshape((b, l, kv, d))?;
+        let v = self.v.forward(x)?.reshape((b, l, kv, d))?;
         let q = rope_thd(&self.q_norm.forward(&q)?, cos, sin)?;
         let k = rope_thd(&self.k_norm.forward(&k)?, cos, sin)?;
         let out = if self.fused {
@@ -422,39 +333,29 @@ impl Attention {
     }
 }
 
-/// Gate and up projections: two layers, or one with rows `[gate | up]`.
-enum GateUp {
-    Split(Box<[Lin; 2]>),
-    Fused(Lin),
-}
-
 struct Layer {
     attn: Attention,
-    gate_up: GateUp,
+    gate: Lin,
+    up: Lin,
     down: Lin,
     ln1: RmsNorm,
     ln2: RmsNorm,
 }
 
 impl Layer {
-    fn load(c: &Config, src: &mut Source, i: usize, fused: bool, joins: Joins) -> Result<Self> {
+    fn load(c: &Config, src: &mut Source, i: usize, fused: bool) -> Result<Self> {
         let (h, f) = (c.hidden_size, c.intermediate_size);
         let st = format!("model.layers.{i}");
         let gg = format!("blk.{i}");
         Ok(Self {
-            attn: Attention::load(c, src, i, fused, joins)?,
-            gate_up: {
-                let g = (format!("{st}.mlp.gate_proj"), format!("{gg}.ffn_gate"), f);
-                let u = (format!("{st}.mlp.up_proj"), format!("{gg}.ffn_up"), f);
-                if joins.gate_up {
-                    GateUp::Fused(src.linear_cat(&[g, u], h)?)
-                } else {
-                    GateUp::Split(Box::new([
-                        src.linear(&g.0, &g.1, f, h)?,
-                        src.linear(&u.0, &u.1, f, h)?,
-                    ]))
-                }
-            },
+            attn: Attention::load(c, src, i, fused)?,
+            gate: src.linear(
+                &format!("{st}.mlp.gate_proj"),
+                &format!("{gg}.ffn_gate"),
+                f,
+                h,
+            )?,
+            up: src.linear(&format!("{st}.mlp.up_proj"), &format!("{gg}.ffn_up"), f, h)?,
             down: src.linear(
                 &format!("{st}.mlp.down_proj"),
                 &format!("{gg}.ffn_down"),
@@ -479,14 +380,7 @@ impl Layer {
     fn forward(&self, x: &Tensor, cos: &Tensor, sin: &Tensor, mask: &Tensor) -> Result<Tensor> {
         let x = (x + self.attn.forward(&self.ln1.forward(x)?, cos, sin, mask)?)?;
         let h = self.ln2.forward(&x)?;
-        let m = match &self.gate_up {
-            GateUp::Split(p) => (candle_nn::ops::silu(&p[0].forward(&h)?)? * p[1].forward(&h)?)?,
-            GateUp::Fused(p) => {
-                let y = p.forward(&h)?;
-                let f = y.dim(D::Minus1)? / 2;
-                (candle_nn::ops::silu(&y.narrow(D::Minus1, 0, f)?)? * y.narrow(D::Minus1, f, f)?)?
-            }
-        };
+        let m = (candle_nn::ops::silu(&self.gate.forward(&h)?)? * self.up.forward(&h)?)?;
         x + self.down.forward(&m)?
     }
 }
@@ -503,33 +397,26 @@ pub struct Model {
 }
 
 impl Model {
-    pub fn load(c: &Config, vb: VarBuilder<'static>, fused: bool, joins: Joins) -> Result<Self> {
-        Self::build(c, &mut Source::Safetensors(vb), fused, joins)
+    pub fn load(c: &Config, vb: VarBuilder<'static>, fused: bool) -> Result<Self> {
+        Self::build(c, &mut Source::Safetensors(vb), fused)
     }
 
-    pub fn load_gguf(
-        mut file: File,
-        device: &Device,
-        fused: bool,
-        joins: Joins,
-        act: DType,
-    ) -> Result<Self> {
+    pub fn load_gguf(mut file: File, device: &Device, fused: bool) -> Result<Self> {
         let content = Content::read(&mut file)?;
         let c = Config::from_gguf(&content)?;
         let mut src = Source::Gguf {
             content,
             file,
             device: device.clone(),
-            act,
         };
-        Self::build(&c, &mut src, fused, joins)
+        Self::build(&c, &mut src, fused)
     }
 
-    fn build(c: &Config, src: &mut Source, fused: bool, joins: Joins) -> Result<Self> {
+    fn build(c: &Config, src: &mut Source, fused: bool) -> Result<Self> {
         let device = src.device();
         let fused = device.is_metal() && fused;
         let layers = (0..c.num_hidden_layers)
-            .map(|i| Layer::load(c, src, i, fused, joins))
+            .map(|i| Layer::load(c, src, i, fused))
             .collect::<Result<Vec<_>>>()?;
         let inv_freq = (0..c.head_dim / 2)
             .map(|i| (1.0 / c.rope_theta.powf(2.0 * i as f64 / c.head_dim as f64)) as f32)

@@ -2408,6 +2408,7 @@ version = "0.1.0"
 dependencies = [
  "candle-core",
  "candle-nn",
+ "half",
  "serde",
  "serde_json",
  "tessar-core",

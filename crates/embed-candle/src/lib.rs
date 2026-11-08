@@ -3,8 +3,6 @@
 
 mod model;
 
-pub use model::Joins;
-
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -45,12 +43,6 @@ pub struct Options {
     pub append_eos: bool,
     /// Use the fused Metal attention kernel (no effect on the CPU).
     pub fused: bool,
-    /// `load_gguf` only: keep the activations between the quantized matmuls
-    /// in f16 instead of f32 (casts happen around each matmul).
-    pub f16_activations: bool,
-    /// Join the q/k/v and gate/up projections into single layers. Exact,
-    /// but slower on Metal in candle 0.11 (see `EXPERIMENT.md`).
-    pub joins: Joins,
 }
 
 impl Default for Options {
@@ -62,8 +54,6 @@ impl Default for Options {
             dtype: DType::F16,
             append_eos: false,
             fused: true,
-            f16_activations: false,
-            joins: Joins::default(),
         }
     }
 }
@@ -156,7 +146,7 @@ impl CandleEmbedder {
         let bytes = std::fs::read(dir.join("model.safetensors")).map_err(err)?;
         let vb =
             VarBuilder::from_buffered_safetensors(bytes, options.dtype, &device).map_err(err)?;
-        let model = model::Model::load(&cfg, vb, options.fused, options.joins).map_err(err)?;
+        let model = model::Model::load(&cfg, vb, options.fused).map_err(err)?;
         Self::assemble(model, tokenizer, device, options)
     }
 
@@ -171,13 +161,7 @@ impl CandleEmbedder {
         let tokenizer = Tokenizer::from_file(tokenizer_json.as_ref()).map_err(err)?;
         let device = pick_device(options.device)?;
         let file = std::fs::File::open(gguf.as_ref()).map_err(err)?;
-        let act = if options.f16_activations {
-            DType::F16
-        } else {
-            DType::F32
-        };
-        let model = model::Model::load_gguf(file, &device, options.fused, options.joins, act)
-            .map_err(err)?;
+        let model = model::Model::load_gguf(file, &device, options.fused).map_err(err)?;
         Self::assemble(model, tokenizer, device, options)
     }
 

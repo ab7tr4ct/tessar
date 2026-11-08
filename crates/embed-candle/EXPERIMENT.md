@@ -55,7 +55,7 @@ normalization in f64, vectors of 2048 floats. `tokenizers` is built with
 read, not mmap, to keep `unsafe` out. Texts are length-sorted inside a call to
 cut padding. Features: `metal` (`candle-core/metal`), `accelerate`.
 
-Comparison harness: `crates/embed-llama/tests/candle_compare.rs` (ignored, GPU). generated
+Comparison harness: `crates/embed-llama/tests/candle_compare.rs` (ignored, GPU). It generates
 bilingual texts (100 for E15a, 200 for E15b; half en, half ru, about 15-25 words), same Voyage prompts for both
 adapters, llama.cpp with context 2048 and batch 64, `n_gpu_layers` all. 5 warm-up
 calls before timing, 100 timed single queries, 10 timed batches of 64 documents
@@ -300,12 +300,15 @@ Raw rows: `evals/runs/e15b/step2-fusion.md`. Setup as in step 1 (200 texts).
 - 2c+2d: exact (Q8_0 blocks are joined byte for byte, cosine unchanged) and
   slower. After 2b the model is not launch-bound; the `narrow` copies and
   strided kernels cost more than the saved launches. Kept as
-  `Options.joins`, off.
+  `Options.joins` (since removed, see below).
 - 2e: `QMatMul` on Metal asserts f32 input, so casts are required; they cost
   as much as the f16 element-wise work saves. Kept as
-  `Options.f16_activations`, off.
+  `Options.f16_activations` (since removed, see below).
 
 Verdict against the fixed criteria (GGUF Q8, 2b): cosine 1.00000 (pass), RSS
 676 MB (pass), query p95 1.31x (pass), bulk 1.96x slower (pass, barely).
+The joined-projection and f16-activation code (`Options.joins`, `Options.f16_activations`) was
+removed from the tree; it lives in commits `2d441b8` and `abec331` if anyone wants it back.
+
 Remaining ideas, none cheap: a fused SwiGLU or residual+norm custom op; sdpa
 that accepts a strided q; a single command buffer per forward pass.
