@@ -126,3 +126,34 @@ pub struct AboutArgs {
     #[serde(default)]
     pub history: Option<bool>,
 }
+
+/// Why a fact is updated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum UpdateReason {
+    /// It stopped being true, or has a new value now. The old version stays in history as true until `since`.
+    Changed,
+    /// It was never true (a mistake). The old version is hidden from "what was true" but stays in the record of what memory knew.
+    Wrong,
+}
+
+/// Input of `update`.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct UpdateArgs {
+    /// The handle of the fact, the leading `fNN` of a line from `recall` or `about`, for example "f12". It must be a current version.
+    pub fact: String,
+    /// "changed": it stopped being true or has a new value. "wrong": it was never true.
+    pub reason: UpdateReason,
+    /// reason "changed" only: the day it stopped being true, "YYYY-MM-DD" (it was not true on that day). Default now.
+    #[serde(default)]
+    pub since: Option<String>,
+    /// The replacement sentence. Statement and event: the new text. Attribute: the new sentence ("User lives in Berlin"). Leave out `text`, `value` and `when` to only close the fact.
+    #[serde(default)]
+    pub text: Option<String>,
+    /// Attribute only: the new value as text ("Berlin"). The subject and predicate stay.
+    #[serde(default)]
+    pub value: Option<String>,
+    /// The replacement's `when`, same formats as in `remember`: "YYYY-MM-DD", "YYYY-MM", "YYYY" or "YYYY-MM-DD/YYYY-MM-DD". Kept from the old version when left out.
+    #[serde(default)]
+    pub when: Option<String>,
+}

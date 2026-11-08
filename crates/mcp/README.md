@@ -51,9 +51,18 @@ exits with status 1.
 | Tool         | What it does |
 |--------------|--------------|
 | `remember`   | Writes facts in one transaction: `statement` (a sentence), `attribute` (subject, predicate, value; a single-valued predicate replaces the old value and keeps it in history) or `event` (needs `when`). Reports `created`, `unchanged` or `superseded` per fact. Checks new predicates: snake_case, at most four words, universal, and not a near-duplicate of an existing one; on a problem it writes no facts and says what to do (`synonym_of`, `force_new_predicate`). |
-| `recall`     | Natural-language search over both spaces (or one), best first, each hit with the channels that found it. `as_of` (`YYYY-MM-DD`) shows what was true on that day. |
+| `recall`     | Natural-language search over both spaces (or one), best first, each hit starting with its handle `fNN` and the channels that found it. `as_of` (`YYYY-MM-DD`) shows what was true on that day. |
 | `vocabulary` | Lists the predicates with `single` or `many` cardinality, descriptions and synonyms. |
-| `about`      | Lists the facts about one entity, oldest first; `history: true` includes replaced versions. |
+| `about`      | Lists the facts about one entity, oldest first, each starting with its handle `fNN`; `history: true` includes replaced, closed and corrected versions. |
+| `update`     | Says a fact is outdated or wrong, by its handle `fNN` from `recall` or `about`. `reason: changed` closes it as true until `since` (default now), `wrong` marks it as never true. With `text`, `value` or `when` it also writes the replacement, keeping the kind (and for an attribute the subject and predicate) and the fields not given. Reports `closed`, `superseded`, `corrected` or `unchanged`. Only a current version can be updated; a closed one is refused and the current version is named. |
+
+Nothing is ever deleted. `update` closes a version or replaces it with a new
+one, and the old version stays in the journal: `about` with `history: true`
+lists it, and `recall` with `as_of` finds a changed fact on the days it was
+true. A fact marked `wrong` is hidden from what was true on any day, since it
+never was. For a single-valued attribute with a new value, `remember` with the
+same subject and predicate already supersedes the old one; `update` is for the
+rest.
 
 Every fact also mentions the person (`user` space) or the project entity
 (project space), unless it is already its subject or mentioned, so `about`

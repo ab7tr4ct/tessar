@@ -12,17 +12,18 @@ use std::sync::Arc;
 
 use tessar_core::clock::Clock;
 use tessar_core::model::{
-    Cardinality, EntityId, EntityKindId, Fact, FactBody, Key, Name, Origin, PredicateDef,
-    PredicateId, SpaceId, SpaceKind, TimeSpan, Timestamp, Value, ValueType,
+    Cardinality, Ending, EntityId, EntityKindId, Fact, FactBody, FactId, Key, Name, Origin,
+    PredicateDef, PredicateId, SpaceId, SpaceKind, TimeSpan, Timestamp, Value, ValueType,
 };
 use tessar_core::store::{
     BodyDraft, EntityRef, EpisodeDraft, FactDraft, Memory, ObjectDraft, Outcome, PredicateDraft,
-    Recall, Remember, StoreError, View, Why,
+    Reason, Recall, Remember, Replacement, StoreError, Update, View, Why,
 };
 use tessar_core::vocab;
 
 use crate::args::{
     AboutArgs, Entity, Fact as FactArgs, FactKind, RecallArgs, RecallSpace, RememberArgs, Space,
+    UpdateArgs, UpdateReason,
 };
 use crate::when::{self, Tense};
 
@@ -559,6 +560,19 @@ impl Tessar {
                 "the fact was changed by someone else meanwhile; recall it again and decide again"
                     .to_owned()
             }
+            StoreError::NotCurrent(_) => {
+                "the fact is already closed; `recall` or `about` shows its current version"
+                    .to_owned()
+            }
+            StoreError::ShapeMismatch(_) => "a replacement must keep the kind of the fact, and \
+                 for an attribute its subject and predicate. To change those, close this fact \
+                 with `update` (no `text`, `value` or `when`) and `remember` a new one"
+                .to_owned(),
+            StoreError::ChangeBeforeValid { at, valid_from } => format!(
+                "`since` {} is before the fact became true ({}); use a later date or leave `since` out",
+                when::ymd(*at),
+                when::ymd(*valid_from)
+            ),
             StoreError::EmptyText => "a text field is empty".to_owned(),
             StoreError::Embed(e) => format!("the embedder failed ({e}); try again"),
             StoreError::SpaceArchived(_) => "the space is archived and read-only".to_owned(),
@@ -685,10 +699,12 @@ impl Tessar {
         }
     }
 
-    /// `[recorded] [space] sentence [current; earlier: v (date)] (tense)`.
+    /// `fNN [recorded] [space] sentence [current; earlier: v (date)] (tense)`.
+    /// `fNN` is the handle `update` takes.
     fn line(&self, fact: &Fact, now: Timestamp, with_earlier: bool, as_of: Option<&str>) -> String {
         let mut line = format!(
-            "[{}] [{}] {}",
+            "{} [{}] [{}] {}",
+            fact.id,
             when::ymd(fact.recorded_at),
             self.space_name(fact.space),
             self.sentence(fact)
@@ -747,6 +763,165 @@ impl Tessar {
         }
     }
 
+    // ---- update ----------------------------------------------------
+
+    /// The `update` tool.
+    pub fn update(&self, args: UpdateArgs) -> Result<String, String> {
+        let handle = args.fact.trim();
+        let id = parse_handle(handle)
+            .ok_or_else(|| format!("`fact` {handle:?} is not a handle: use the leading `fNN` of a line from `recall` or `about`, for example \"f12\""))?;
+        let fact = self.mem.fact(id).ok_or_else(|| format!("no fact {id}"))?;
+        if fact.end.is_some() {
+            return Err(match self.mem.current(fact.lineage) {
+                Some(current) => format!(
+                    "{id} is already closed; the current version is {}. Update that one",
+                    current.id
+                ),
+                None => format!(
+                    "{id} is already closed and has no current version; nothing to update. \
+                     `remember` the fact again if it holds"
+                ),
+            });
+        }
+
+        let clean = |s: &Option<String>| {
+            s.as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+        };
+        let (text, value, when_arg) = (clean(&args.text), clean(&args.value), clean(&args.when));
+        let since = clean(&args.since);
+        let reason = match (args.reason, since) {
+            (UpdateReason::Changed, None) => Reason::Change { at: None },
+            (UpdateReason::Changed, Some(day)) => {
+                let end = when::parse_as_of(&day).map_err(|e| format!("`since`: {e}"))?;
+                Reason::Change {
+                    at: Some(when::day_start(end)),
+                }
+            }
+            (UpdateReason::Wrong, None) => Reason::Correction,
+            (UpdateReason::Wrong, Some(_)) => {
+                return Err(
+                    "`since` goes with reason \"changed\"; a \"wrong\" fact was never true, \
+                     so it has no end date"
+                        .to_owned(),
+                );
+            }
+        };
+        let when_new = when_arg
+            .as_deref()
+            .map(|w| when::parse_when(w).map_err(|e| format!("`when`: {e}")))
+            .transpose()?;
+
+        let replacement = if text.is_none() && value.is_none() && when_new.is_none() {
+            None
+        } else {
+            Some(Replacement {
+                body: self.replacement_body(&fact, text, value, when_new)?,
+                mentions: fact.mentions.iter().map(|&e| EntityRef::Id(e)).collect(),
+            })
+        };
+        let had_replacement = replacement.is_some();
+        let recorded = self
+            .mem
+            .update(Update {
+                lineage: fact.lineage,
+                expected_version: fact.version,
+                reason,
+                replacement,
+                origin: Origin::Asserted { by: agent_key() },
+            })
+            .map_err(|e| format!("Nothing was changed. {}", self.store_message(&e)))?;
+
+        let now = self.clock.now();
+        let new_line = |id: FactId| {
+            self.mem
+                .fact(id)
+                .map_or_else(|| id.to_string(), |f| self.line(&f, now, true, None))
+        };
+        let wrong = args.reason == UpdateReason::Wrong;
+        Ok(match recorded.outcome {
+            Outcome::Superseded { previous } if wrong => format!(
+                "corrected: {previous} was never true. Replaced by: {}",
+                new_line(recorded.fact)
+            ),
+            Outcome::Superseded { previous } => {
+                let until = self
+                    .valid_to(previous)
+                    .map_or_else(String::new, |d| format!(" ({previous} was true until {d})"));
+                format!("superseded: {}{until}", new_line(recorded.fact))
+            }
+            Outcome::Closed if wrong => format!("corrected: {id} (was never true)"),
+            Outcome::Closed => format!(
+                "closed: {id} (true until {})",
+                self.valid_to(id).unwrap_or_else(|| when::ymd(now))
+            ),
+            Outcome::Unchanged => {
+                let hint = if matches!(fact.body, FactBody::Triple { .. }) && had_replacement {
+                    " An attribute changes with a new `value` (or `when`); a new `text` alone is not a new version."
+                } else {
+                    ""
+                };
+                format!("unchanged: {id} already says that; nothing was written.{hint}")
+            }
+            Outcome::Created => format!("created: {}", new_line(recorded.fact)),
+        })
+    }
+
+    /// The day a version stopped being true, if it was closed as changed.
+    fn valid_to(&self, id: FactId) -> Option<String> {
+        match self.mem.fact(id)?.end?.ending {
+            Ending::Changed { valid_to } => Some(when::ymd(valid_to)),
+            Ending::Corrected => None,
+        }
+    }
+
+    /// The body of an update's replacement: the old one with the given
+    /// fields swapped.
+    fn replacement_body(
+        &self,
+        fact: &Fact,
+        text: Option<String>,
+        value: Option<String>,
+        when_new: Option<TimeSpan>,
+    ) -> Result<BodyDraft, String> {
+        let handle = fact.id;
+        if value.is_some() && !matches!(fact.body, FactBody::Triple { .. }) {
+            return Err(format!(
+                "`value` is for attributes, and {handle} is not one; put the new sentence in `text`"
+            ));
+        }
+        Ok(match &fact.body {
+            FactBody::Statement { text: old, when } => BodyDraft::Statement {
+                text: text.unwrap_or_else(|| old.clone()),
+                when: when_new.or(*when),
+            },
+            FactBody::Event {
+                text: old,
+                participants,
+                when,
+            } => BodyDraft::Event {
+                text: text.unwrap_or_else(|| old.clone()),
+                participants: participants.iter().map(|&e| EntityRef::Id(e)).collect(),
+                when: when_new.unwrap_or(*when),
+            },
+            FactBody::Triple {
+                subject,
+                predicate,
+                object,
+                text: old,
+                when,
+            } => BodyDraft::Triple {
+                subject: EntityRef::Id(*subject),
+                predicate: *predicate,
+                object: ObjectDraft::Value(value.map_or_else(|| object.clone(), Value::Text)),
+                text: text.or_else(|| old.clone()),
+                when: when_new.or(*when),
+            },
+        })
+    }
+
     // ---- recall and about ------------------------------------------
 
     /// The `recall` tool.
@@ -803,6 +978,16 @@ impl Tessar {
         Ok(out)
     }
 
+    /// Every version of every fact about an entity, closed and corrected
+    /// ones included. The store has no such read, so this walks the dense
+    /// fact ids.
+    fn all_facts_about(&self, entity: EntityId) -> Vec<Fact> {
+        (0..)
+            .map_while(|n| parse_handle(&format!("f{n}")).and_then(|id| self.mem.fact(id)))
+            .filter(|f| f.entities().contains(&entity))
+            .collect()
+    }
+
     /// The `about` tool.
     pub fn about(&self, args: AboutArgs) -> Result<String, String> {
         let e = &args.entity;
@@ -829,20 +1014,12 @@ impl Tessar {
             ));
         };
         let now = self.clock.now();
-        let mut facts = self.mem.facts_about(entity.id, View::Current);
         let history = args.history.unwrap_or(false);
-        if history {
-            let mut lineages = Vec::new();
-            for f in &facts {
-                if !lineages.contains(&f.lineage) {
-                    lineages.push(f.lineage);
-                }
-            }
-            facts = lineages
-                .into_iter()
-                .flat_map(|l| self.mem.history(l))
-                .collect();
-        }
+        let mut facts = if history {
+            self.all_facts_about(entity.id)
+        } else {
+            self.mem.facts_about(entity.id, View::Current)
+        };
         facts.sort_by_key(|f| (f.recorded_at, f.id));
 
         let mut out = format!(
@@ -854,7 +1031,7 @@ impl Tessar {
         );
         for f in &facts {
             let mut line = self.line(f, now, !history, None);
-            if history && matches!(f.body, FactBody::Triple { .. }) {
+            if history {
                 let _ = match f.end.map(|end| end.ending) {
                     None => write!(line, " [version {}, current]", f.version),
                     Some(tessar_core::model::Ending::Changed { valid_to }) => {
@@ -949,6 +1126,18 @@ impl Pending {
             expected_version: None,
         }
     }
+}
+
+/// The id in a handle like `f12`.
+fn parse_handle(s: &str) -> Option<FactId> {
+    use serde::Deserialize as _;
+    use serde::de::value::{Error, U32Deserializer};
+    let digits = s.strip_prefix(['f', 'F'])?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    // Ids are plain numbers on the wire; the store checks the fact exists.
+    FactId::deserialize(U32Deserializer::<Error>::new(digits.parse().ok()?)).ok()
 }
 
 /// Whether the entity is `user`, the person: it always lives in the user

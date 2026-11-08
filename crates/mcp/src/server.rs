@@ -9,7 +9,7 @@ use rmcp::model::{Implementation, ServerCapabilities, ServerConfig};
 use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 
 use crate::api::Tessar;
-use crate::args::{AboutArgs, RecallArgs, RememberArgs};
+use crate::args::{AboutArgs, RecallArgs, RememberArgs, UpdateArgs};
 
 const INSTRUCTIONS: &str = "\
 tessar is the user's long-term memory, shared across conversations and projects. \
@@ -58,7 +58,7 @@ CURRENT VOCABULARY, name (single|many): description. Call `vocabulary` for the l
 ";
 
 const RECALL: &str = "\
-Search memory in natural language and get the best matching facts, best first. Each line reads `[date recorded] [space] fact`, followed by `[current; earlier: \
+Search memory in natural language and get the best matching facts, best first. Each line reads `fNN [date recorded] [space] fact`, where the leading `fNN` is the fact's handle for `update`, followed by `[current; earlier: \
 value (date), ...]` when a property changed over time, a `(past|now|future: date)` tag for \
 facts about a date, and `found by:` saying why the fact matched (entity, words, meaning). \
 Searches all spaces by default (this repository, the user, and other repositories); each hit shows its space, and `space` narrows it to `project` or `user`. Set `as_of` (YYYY-MM-DD) to see what was true on that day \
@@ -73,7 +73,29 @@ const ABOUT: &str = "\
 List everything memory holds about one entity (a person, project, place, thing), oldest \
 first: every fact in which it is the subject, the value, a participant or a mention. The \
 person you work for is {key: \"user\", kind: \"person\"}. With `history: true` every version \
-of a changed fact is listed, not only the current one.";
+of a changed fact is listed, not only the current one. Each line starts with `fNN`, the fact's handle for `update`.";
+
+const UPDATE: &str = "\
+Say that a fact in memory is outdated or wrong. Nothing is ever deleted: the old version stays \
+in the record, so history and `as_of` keep working. Take the handle `fNN` from the start of a \
+line of `recall` or `about`; it must be a current version (a closed one is refused and the \
+current version is named).
+
+`reason: \"changed\"`: it stopped being true, or has a new value now. The old version is kept as \
+true until `since` (YYYY-MM-DD, the first day it was not true; default now). `reason: \"wrong\"`: \
+it was never true; it disappears from \"what was true\" but memory still shows it knew it.
+
+Without `text`, `value` and `when` the fact is only closed (\"closed\" / \"corrected\"). With them \
+it is replaced by a new version (\"superseded\" / \"corrected\"), which keeps the old fields you do \
+not give: statement and event take a new `text` and/or `when`; an attribute keeps its subject and \
+predicate and takes a new `value` and/or `text` and/or `when`. The kind never changes: to turn a \
+statement into an attribute, close it and `remember` the new one.
+
+Use `update` when something already in memory is wrong or outdated. Use `remember` for new \
+facts. For an attribute whose predicate is single-valued (`lives_in`, `job_title`), `remember` \
+with the same subject and predicate and the new value already replaces the old one; `update` is \
+for statements, events, many-valued attributes, and facts that are only to be closed or \
+declared wrong.";
 
 /// The MCP server: tools over one [`Tessar`].
 #[derive(Clone)]
@@ -126,6 +148,11 @@ impl TessarServer {
     #[tool(description = VOCABULARY)]
     async fn vocabulary(&self) -> Result<String, String> {
         self.blocking(|api| Ok(api.vocabulary())).await
+    }
+
+    #[tool(description = UPDATE)]
+    async fn update(&self, Parameters(args): Parameters<UpdateArgs>) -> Result<String, String> {
+        self.blocking(move |api| api.update(args)).await
     }
 
     #[tool(description = ABOUT)]

@@ -81,7 +81,7 @@ fn stdout_carries_only_json_rpc() {
         .iter()
         .map(|t| t["name"].as_str().unwrap())
         .collect();
-    for want in ["remember", "recall", "vocabulary", "about"] {
+    for want in ["remember", "recall", "vocabulary", "about", "update"] {
         assert!(names.contains(&want), "{names:?}");
     }
     let remember = tools["result"]["tools"]

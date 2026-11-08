@@ -12,7 +12,7 @@ use tessar_core::log::MemLog;
 use tessar_core::model::Timestamp;
 use tessar_core::store::{Memory, Semantic};
 use tessar_mcp::api::Tessar;
-use tessar_mcp::args::{AboutArgs, RecallArgs, RememberArgs};
+use tessar_mcp::args::{AboutArgs, RecallArgs, RememberArgs, UpdateArgs};
 use tessar_mcp::when::{DAY_MS, days_from_civil};
 
 const DIMS: usize = 64;
@@ -85,6 +85,19 @@ fn recall(f: &Fixture, v: serde_json::Value) -> Result<String, String> {
 
 fn about(f: &Fixture, v: serde_json::Value) -> Result<String, String> {
     f.api.about(serde_json::from_value::<AboutArgs>(v).unwrap())
+}
+
+fn update(f: &Fixture, v: serde_json::Value) -> Result<String, String> {
+    f.api
+        .update(serde_json::from_value::<UpdateArgs>(v).unwrap())
+}
+
+/// The first fact handle (`f12`) in a tool's output.
+fn handle(out: &str) -> String {
+    out.split(|c: char| !c.is_alphanumeric())
+        .find(|w| w.len() > 1 && w.starts_with('f') && w[1..].bytes().all(|b| b.is_ascii_digit()))
+        .unwrap_or_else(|| panic!("no handle in {out}"))
+        .to_owned()
 }
 
 fn user() -> serde_json::Value {
@@ -486,7 +499,7 @@ fn bad_input_is_a_tool_error() {
 fn tools_carry_descriptions_and_schemas() {
     use rmcp::ServerHandler;
     let server = tessar_mcp::server::TessarServer::new(fixture().api);
-    for name in ["remember", "recall", "vocabulary", "about"] {
+    for name in ["remember", "recall", "vocabulary", "about", "update"] {
         let tool = server
             .get_tool(name)
             .unwrap_or_else(|| panic!("no tool {name}"));
@@ -686,4 +699,260 @@ fn an_explicit_mention_is_not_duplicated() {
         .facts_about(entity.id, tessar_core::store::View::Current);
     assert_eq!(facts.len(), 1);
     assert_eq!(facts[0].mentions, vec![entity.id]);
+}
+
+fn statement(f: &Fixture, text: &str) -> String {
+    handle(&remember(f, json!({"facts": [{"kind": "statement", "text": text}]})).unwrap())
+}
+
+fn project() -> serde_json::Value {
+    json!({"key": "tessar", "kind": "project"})
+}
+
+#[test]
+fn handles_start_recall_and_about_lines() {
+    let f = fixture();
+    let h = statement(&f, "The journal is append only");
+    let found = recall(&f, json!({"query": "journal"})).unwrap();
+    assert!(
+        found.starts_with(&format!("1. {h} [2026-11-08] [tessar]")),
+        "{found}"
+    );
+    let listed = about(&f, json!({"entity": project()})).unwrap();
+    assert!(
+        listed.contains(&format!("\n- {h} [2026-11-08] [tessar] The journal")),
+        "{listed}"
+    );
+}
+
+#[test]
+fn closing_a_statement_keeps_it_in_history_and_as_of() {
+    let f = fixture();
+    let h = statement(&f, "The team uses Postgres for storage");
+    f.clock.advance(2 * DAY_MS);
+    let out = update(&f, json!({"fact": h, "reason": "changed"})).unwrap();
+    assert_eq!(out, format!("closed: {h} (true until 2026-11-10)"));
+
+    let listed = about(&f, json!({"entity": project()})).unwrap();
+    assert!(!listed.contains("Postgres"), "{listed}");
+    let hist = about(&f, json!({"entity": project(), "history": true})).unwrap();
+    assert!(
+        hist.contains("Postgres") && hist.contains("until 2026-11-10"),
+        "{hist}"
+    );
+    assert!(
+        recall(&f, json!({"query": "Postgres"}))
+            .unwrap()
+            .contains("Nothing found")
+    );
+    let then = recall(&f, json!({"query": "Postgres", "as_of": "2026-11-09"})).unwrap();
+    assert!(then.contains("Postgres"), "{then}");
+}
+
+#[test]
+fn since_dates_the_end() {
+    let f = fixture();
+    let h = statement(&f, "The team uses Postgres for storage");
+    f.clock.advance(5 * DAY_MS);
+    let out = update(
+        &f,
+        json!({"fact": h, "reason": "changed", "since": "2026-11-10"}),
+    )
+    .unwrap();
+    assert!(out.contains("true until 2026-11-10"), "{out}");
+    // Not true on the day it ended, true the day before.
+    let on = recall(&f, json!({"query": "Postgres", "as_of": "2026-11-10"})).unwrap();
+    assert!(on.contains("Nothing found"), "{on}");
+    let before = recall(&f, json!({"query": "Postgres", "as_of": "2026-11-09"})).unwrap();
+    assert!(before.contains("Postgres"), "{before}");
+}
+
+#[test]
+fn correcting_an_attribute_with_a_new_value() {
+    let f = fixture();
+    let out = remember(
+        &f,
+        json!({"space": "user", "facts": [{
+            "kind": "attribute", "subject": user(), "predicate": "lives_in",
+            "value": "Lisbon", "text": "User lives in Lisbon"}]}),
+    )
+    .unwrap();
+    let h = handle(&out);
+    f.clock.advance(DAY_MS);
+    let out = update(
+        &f,
+        json!({"fact": h, "reason": "wrong", "value": "Porto", "text": "User lives in Porto"}),
+    )
+    .unwrap();
+    assert!(
+        out.starts_with(&format!("corrected: {h} was never true. Replaced by: ")),
+        "{out}"
+    );
+    assert!(out.contains("User lives in Porto"), "{out}");
+
+    let now = recall(
+        &f,
+        json!({"query": "where does the user live", "space": "user"}),
+    )
+    .unwrap();
+    assert!(now.contains("User lives in Porto"), "{now}");
+    // A corrected version was never true, not even on its own date.
+    let then = recall(&f, json!({"query": "Lisbon", "as_of": "2026-11-08"})).unwrap();
+    assert!(!then.contains("User lives in Lisbon"), "{then}");
+    let hist = about(&f, json!({"entity": user(), "history": true})).unwrap();
+    assert!(
+        hist.contains("User lives in Lisbon") && hist.contains("corrected"),
+        "{hist}"
+    );
+}
+
+#[test]
+fn a_change_with_a_replacement_supersedes() {
+    let f = fixture();
+    let out = remember(
+        &f,
+        json!({"space": "user", "facts": [{
+            "kind": "attribute", "subject": user(), "predicate": "likes",
+            "predicate_description": "something the subject likes", "value": "tea",
+            "text": "User likes tea"}]}),
+    )
+    .unwrap();
+    let h = handle(&out);
+    f.clock.advance(DAY_MS);
+    let out = update(
+        &f,
+        json!({"fact": h, "reason": "changed", "value": "coffee", "text": "User likes coffee"}),
+    )
+    .unwrap();
+    assert!(out.starts_with("superseded: "), "{out}");
+    assert!(
+        out.contains("User likes coffee")
+            && out.contains(&format!("{h} was true until 2026-11-09")),
+        "{out}"
+    );
+    // A change keeps the old version true on its own date.
+    let then = recall(&f, json!({"query": "User likes", "as_of": "2026-11-08"})).unwrap();
+    assert!(then.contains("User likes tea"), "{then}");
+}
+
+#[test]
+fn replacing_a_statement_text_gives_a_new_handle() {
+    let f = fixture();
+    let h = statement(&f, "The release is planned for March");
+    f.clock.advance(DAY_MS);
+    let out = update(
+        &f,
+        json!({"fact": h, "reason": "changed", "text": "The release is planned for May"}),
+    )
+    .unwrap();
+    assert!(out.starts_with("superseded: "), "{out}");
+    let new = handle(&out);
+    assert_ne!(new, h);
+    let found = recall(&f, json!({"query": "release"})).unwrap();
+    assert!(
+        found.contains(&format!("{new} [")) && found.contains("planned for May"),
+        "{found}"
+    );
+    assert!(!found.contains("planned for March"), "{found}");
+    // Same text again changes nothing.
+    let same = update(
+        &f,
+        json!({"fact": new, "reason": "changed", "text": "The release is planned for May"}),
+    )
+    .unwrap();
+    assert!(same.starts_with("unchanged"), "{same}");
+}
+
+#[test]
+fn unknown_and_malformed_handles_are_errors() {
+    let f = fixture();
+    statement(&f, "Some note");
+    let err = update(&f, json!({"fact": "f9999", "reason": "wrong"})).unwrap_err();
+    assert_eq!(err, "no fact f9999");
+    for bad in ["12", "fx", "", "f-1", "l3"] {
+        let err = update(&f, json!({"fact": bad, "reason": "wrong"})).unwrap_err();
+        assert!(err.contains("not a handle"), "{bad}: {err}");
+    }
+}
+
+#[test]
+fn updating_a_closed_fact_points_to_the_current_version() {
+    let f = fixture();
+    let old = statement(&f, "The release is planned for March");
+    f.clock.advance(DAY_MS);
+    let new = handle(
+        &update(
+            &f,
+            json!({"fact": old, "reason": "changed", "text": "The release is planned for May"}),
+        )
+        .unwrap(),
+    );
+    let err = update(&f, json!({"fact": old, "reason": "wrong"})).unwrap_err();
+    assert_eq!(
+        err,
+        format!("{old} is already closed; the current version is {new}. Update that one")
+    );
+    // A fact closed without a successor has nothing to point to.
+    update(&f, json!({"fact": new, "reason": "wrong"})).unwrap();
+    let err = update(&f, json!({"fact": new, "reason": "wrong"})).unwrap_err();
+    assert!(err.contains("no current version"), "{err}");
+}
+
+#[test]
+fn bad_update_input_is_explained() {
+    let f = fixture();
+    let h = statement(&f, "The release is planned for March");
+    for (args, needle) in [
+        (
+            json!({"fact": h, "reason": "wrong", "since": "2026-11-09"}),
+            "`since` goes with",
+        ),
+        (
+            json!({"fact": h, "reason": "changed", "since": "soon"}),
+            "`since`",
+        ),
+        (
+            json!({"fact": h, "reason": "changed", "since": "2026-11-01"}),
+            "before the fact became true",
+        ),
+        (
+            json!({"fact": h, "reason": "changed", "when": "tomorrow", "text": "x"}),
+            "`when`",
+        ),
+        (
+            json!({"fact": h, "reason": "changed", "value": "x"}),
+            "`value` is for attributes",
+        ),
+    ] {
+        let err = update(&f, args).unwrap_err();
+        assert!(err.contains(needle), "{needle}: {err}");
+    }
+    // Nothing above changed the fact.
+    assert!(
+        recall(&f, json!({"query": "release"}))
+            .unwrap()
+            .contains("March")
+    );
+}
+
+#[test]
+fn an_attribute_replacement_keeps_subject_and_predicate() {
+    let f = fixture();
+    let out = remember(
+        &f,
+        json!({"space": "user", "facts": [{
+            "kind": "attribute", "subject": user(), "predicate": "lives_in",
+            "value": "Lisbon", "text": "User lives in Lisbon"}]}),
+    )
+    .unwrap();
+    // Only text: the value is the same, so no new version.
+    let out = update(
+        &f,
+        json!({"fact": handle(&out), "reason": "changed", "text": "User is based in Lisbon"}),
+    )
+    .unwrap();
+    assert!(
+        out.starts_with("unchanged") && out.contains("new `value`"),
+        "{out}"
+    );
 }
