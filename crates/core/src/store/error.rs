@@ -176,6 +176,13 @@ pub enum StoreError {
     #[error("internal error: {0}")]
     Internal(String),
 
+    /// A durable commit failed to apply earlier, so the state no longer
+    /// matches the log. Writes are refused; reads still work.
+    #[error(
+        "memory state diverged from the journal after an internal error; reopen it to rebuild the state from the journal"
+    )]
+    Corrupted,
+
     /// A writer panicked earlier; reopen the memory.
     #[error("a writer panicked earlier; reopen the memory")]
     Poisoned,

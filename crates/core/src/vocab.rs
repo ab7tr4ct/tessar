@@ -73,6 +73,37 @@ pub fn starter() -> Vec<PredicateDraft> {
             Many,
         ),
         ("diet", "the way the subject eats", Single),
+        (
+            "allows",
+            "a permission the subject has given an agent: what may be done, and where or until when",
+            Many,
+        ),
+        (
+            "wake_up_time",
+            "the time the subject usually wakes up; value is a clock time",
+            Single,
+        ),
+        ("skin_type", "the type of the subject's skin", Single),
+        (
+            "education",
+            "a degree or course of the subject, with the institution",
+            Many,
+        ),
+        (
+            "budget",
+            "an amount the subject plans to spend on something: the thing and the amount",
+            Many,
+        ),
+        (
+            "skill_level",
+            "the subject's level in an activity: the activity and the level",
+            Many,
+        ),
+        (
+            "commute_duration",
+            "how long the subject's trip to work takes",
+            Single,
+        ),
     ];
     STARTER
         .iter()

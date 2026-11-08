@@ -1,5 +1,6 @@
 //! [`Memory`]: the shared handle to the store.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard};
 
 use super::draft::{PredicateDraft, Recorded, Remember, Remembered, Update, View};
@@ -69,6 +70,15 @@ pub struct Semantic {
 /// Lost updates are caught by version checks: a writer passes the version
 /// it saw, and if someone changed the fact in between the write fails with
 /// [`StoreError::Conflict`].
+///
+/// # Invariant
+///
+/// The state always equals the replay of the log. If applying a durable
+/// commit fails halfway (a bug), the state no longer matches the log and
+/// the memory is marked **poisoned**: every later write fails with
+/// [`StoreError::Corrupted`] without touching the state, so nothing is
+/// planned on a diverged state and the log stays replayable. Reads keep
+/// working. Reopening the memory rebuilds the state from the log.
 #[derive(Clone)]
 pub struct Memory {
     inner: Arc<Inner>,
@@ -79,6 +89,8 @@ struct Inner {
     state: RwLock<State>,
     clock: Arc<dyn Clock>,
     semantic: Option<Semantic>,
+    /// Set when a durable commit failed to apply; see [`Memory`].
+    poisoned: AtomicBool,
 }
 
 struct Writer {
@@ -166,8 +178,16 @@ impl Memory {
                 state: RwLock::new(state),
                 clock,
                 semantic,
+                poisoned: AtomicBool::new(false),
             }),
         })
+    }
+
+    /// Whether the state diverged from the log after an internal error.
+    /// A poisoned memory still reads, but every write fails with
+    /// [`StoreError::Corrupted`]; reopen it to rebuild the state.
+    pub fn is_poisoned(&self) -> bool {
+        self.inner.poisoned.load(Ordering::SeqCst)
     }
 
     /// Finds or creates a space by name. Fails if a space with this name
@@ -459,6 +479,11 @@ impl Memory {
         plan: impl FnOnce(&mut Planner<'_>) -> Result<R, StoreError>,
     ) -> Result<R, StoreError> {
         let mut writer = self.inner.writer.lock().map_err(|_| StoreError::Poisoned)?;
+        // Checked under the writer lock: a writer that poisons the memory
+        // holds it, so no later writer plans on a diverged state.
+        if self.is_poisoned() {
+            return Err(StoreError::Corrupted);
+        }
         let at = self.inner.clock.now().max(writer.last_at);
 
         let (ops, result, texts, predicate_texts) = {
@@ -510,6 +535,9 @@ impl Memory {
             at,
             ops,
         };
+        // Protocol: check not poisoned, plan, embed, append, apply. Once the
+        // append succeeds the commit is durable; an apply error after it
+        // sets `poisoned` (see the invariant on `Memory`).
         // The slow part — the disk — runs without the state lock: readers
         // keep reading the previous state meanwhile.
         writer.log.append(&commit)?;
@@ -520,18 +548,23 @@ impl Memory {
             .state
             .write()
             .unwrap_or_else(PoisonError::into_inner);
-        for op in commit.ops {
-            state.apply(op).map_err(StoreError::Internal)?;
-        }
-        for (id, vector) in predicate_vectors {
-            state
-                .push_predicate_vector(id, vector)
-                .map_err(StoreError::Internal)?;
-        }
-        for (fact, vector) in vectors {
-            state
-                .push_vector(fact, vector)
-                .map_err(StoreError::Internal)?;
+        // The commit is durable, so a failure from here on leaves the state
+        // partially applied: poison the memory before reporting it.
+        let applied = (|| {
+            for op in commit.ops {
+                state.apply(op)?;
+            }
+            for (id, vector) in predicate_vectors {
+                state.push_predicate_vector(id, vector)?;
+            }
+            for (fact, vector) in vectors {
+                state.push_vector(fact, vector)?;
+            }
+            Ok(())
+        })();
+        if let Err(reason) = applied {
+            self.inner.poisoned.store(true, Ordering::SeqCst);
+            return Err(StoreError::Internal(reason));
         }
         Ok(result)
     }
@@ -591,4 +624,33 @@ fn embed_texts(semantic: &Semantic, texts: &[String]) -> Result<Vec<Quantized>, 
         .iter()
         .map(|v| Quantized::new(v, semantic.dims))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::clock::ManualClock;
+    use crate::log::MemLog;
+    use crate::model::SpaceKind;
+
+    #[test]
+    fn a_poisoned_memory_rejects_writes_and_keeps_reading() {
+        let clock = Arc::new(ManualClock::new(Timestamp::from_millis(1)));
+        let memory = Memory::open(MemLog::<Op>::default(), clock).unwrap();
+        let key = |s: &str| Key::new(s).unwrap();
+        let space = memory
+            .create_space(key("work"), SpaceKind::LongTerm, None)
+            .unwrap();
+        assert!(!memory.is_poisoned());
+
+        memory.inner.poisoned.store(true, Ordering::SeqCst);
+        assert!(memory.is_poisoned());
+        let err = memory
+            .create_space(key("home"), SpaceKind::LongTerm, None)
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Corrupted), "{err}");
+        assert!(memory.space_named("home").is_none());
+        assert_eq!(memory.space_named("work").map(|s| s.id), Some(space));
+        assert!(memory.space(space).is_some());
+    }
 }
