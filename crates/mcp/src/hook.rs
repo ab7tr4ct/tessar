@@ -27,6 +27,10 @@ use crate::proxy;
 /// A hit is kept when its similarity is at least this, unless the entity
 /// channel found it. A first guess, to be calibrated.
 pub const DEFAULT_MIN_SIMILARITY: f64 = 0.45;
+/// A hit the entity channel found passes with at least this similarity.
+pub const DEFAULT_ENTITY_MIN_SIMILARITY: f64 = 0.35;
+/// At most this many hits pass through the entity rule alone.
+pub const DEFAULT_ENTITY_MAX: usize = 2;
 /// Characters the `prompt` hook may print.
 pub const DEFAULT_BUDGET: usize = 1500;
 /// Characters the `session` hook may print.
@@ -74,6 +78,10 @@ impl HookInput {
 pub struct Settings {
     /// `TESSAR_HOOK_MIN_SIMILARITY`.
     pub min_similarity: f64,
+    /// `TESSAR_HOOK_ENTITY_MIN_SIMILARITY`.
+    pub entity_min_similarity: f64,
+    /// `TESSAR_HOOK_ENTITY_MAX`.
+    pub entity_max: usize,
     /// `TESSAR_HOOK_BUDGET`.
     pub budget: usize,
     /// `TESSAR_HOOK_SESSION_BUDGET`.
@@ -84,6 +92,8 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             min_similarity: DEFAULT_MIN_SIMILARITY,
+            entity_min_similarity: DEFAULT_ENTITY_MIN_SIMILARITY,
+            entity_max: DEFAULT_ENTITY_MAX,
             budget: DEFAULT_BUDGET,
             session_budget: DEFAULT_SESSION_BUDGET,
         }
@@ -100,6 +110,13 @@ impl Settings {
                 .and_then(|v| v.trim().parse().ok())
                 .filter(|v: &f64| v.is_finite())
                 .unwrap_or(d.min_similarity),
+            entity_min_similarity: env("TESSAR_HOOK_ENTITY_MIN_SIMILARITY")
+                .and_then(|v| v.trim().parse().ok())
+                .filter(|v: &f64| v.is_finite())
+                .unwrap_or(d.entity_min_similarity),
+            entity_max: env("TESSAR_HOOK_ENTITY_MAX")
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(d.entity_max),
             budget: env("TESSAR_HOOK_BUDGET")
                 .and_then(|v| v.trim().parse().ok())
                 .unwrap_or(d.budget),
@@ -181,15 +198,30 @@ pub fn parse_hits(structured: &Value) -> Vec<Hit> {
         .collect()
 }
 
-/// The hits worth showing: similar enough, or found through an entity named
-/// in the prompt, and not shown yet in this session. Order is kept.
-pub fn select(hits: Vec<Hit>, min_similarity: f64, shown: &HashSet<String>) -> Vec<Hit> {
+/// The hits worth showing, in order, not shown yet in this session. A hit
+/// passes when its similarity is at least `min_similarity`, or when the
+/// entity channel found it and its similarity is at least
+/// `entity_min_similarity`; at most `entity_max` hits pass by the second
+/// rule alone, since a prompt naming the project would otherwise pull in
+/// every fact linked to it.
+pub fn select(hits: Vec<Hit>, settings: &Settings, shown: &HashSet<String>) -> Vec<Hit> {
+    let mut by_entity = 0;
     hits.into_iter()
-        .filter(|h| {
-            h.channels.iter().any(|c| c == "entity")
-                || h.similarity.is_some_and(|s| s >= min_similarity)
-        })
         .filter(|h| !shown.contains(&h.id))
+        .filter(|h| {
+            let Some(sim) = h.similarity else {
+                return false;
+            };
+            if sim >= settings.min_similarity {
+                return true;
+            }
+            let entity = h.channels.iter().any(|c| c == "entity");
+            if entity && sim >= settings.entity_min_similarity && by_entity < settings.entity_max {
+                by_entity += 1;
+                return true;
+            }
+            false
+        })
         .collect()
 }
 
@@ -392,7 +424,7 @@ pub async fn prompt(
     )
     .await?;
     let shown = read_shown(home, &input.session_id);
-    let chosen = select(parse_hits(&found), settings.min_similarity, &shown);
+    let chosen = select(parse_hits(&found), settings, &shown);
     let (text, ids) = render_prompt(&chosen, settings.budget);
     if !ids.is_empty()
         && let Err(e) = append_shown(home, &input.session_id, &ids)
@@ -586,33 +618,79 @@ mod tests {
         };
         assert_eq!(env(&[]), Settings::default());
         assert_eq!(Settings::default().min_similarity, 0.45);
+        assert_eq!(Settings::default().entity_min_similarity, 0.35);
+        assert_eq!(Settings::default().entity_max, 2);
         assert_eq!(Settings::default().budget, 1500);
         assert_eq!(Settings::default().session_budget, 3000);
         let s = env(&[
             ("TESSAR_HOOK_MIN_SIMILARITY", "0.6"),
+            ("TESSAR_HOOK_ENTITY_MIN_SIMILARITY", "0.2"),
+            ("TESSAR_HOOK_ENTITY_MAX", "5"),
             ("TESSAR_HOOK_BUDGET", "200"),
             ("TESSAR_HOOK_SESSION_BUDGET", "nope"),
         ]);
         assert_eq!(s.min_similarity, 0.6);
+        assert_eq!(s.entity_min_similarity, 0.2);
+        assert_eq!(s.entity_max, 5);
         assert_eq!(s.budget, 200);
         assert_eq!(s.session_budget, 3000);
     }
 
+    fn ids(hits: Vec<Hit>) -> Vec<String> {
+        hits.into_iter().map(|h| h.id).collect()
+    }
+
     #[test]
-    fn threshold_or_entity_decides() {
+    fn threshold_or_entity_with_a_floor_decides() {
         let hits = vec![
             hit("f1", Some(0.7), &["meaning"], "close"),
             hit("f2", Some(0.45), &["meaning"], "on the line"),
-            hit("f3", Some(0.30), &["meaning"], "far"),
-            hit("f4", Some(0.10), &["entity", "meaning"], "far but named"),
-            hit("f5", None, &["entity"], "named, no vector"),
-            hit("f6", None, &["words"], "words only"),
+            hit("f3", Some(0.40), &["meaning"], "far"),
+            hit(
+                "f4",
+                Some(0.36),
+                &["entity", "meaning"],
+                "named, above the floor",
+            ),
+            hit(
+                "f5",
+                Some(0.10),
+                &["entity", "meaning"],
+                "named, below the floor",
+            ),
+            hit("f6", None, &["entity"], "named, no vector"),
+            hit("f7", None, &["words"], "words only"),
+            hit("f8", Some(0.5), &["entity", "meaning"], "named and close"),
         ];
-        let ids: Vec<String> = select(hits, 0.45, &HashSet::new())
-            .into_iter()
-            .map(|h| h.id)
+        assert_eq!(
+            ids(select(hits, &Settings::default(), &HashSet::new())),
+            ["f1", "f2", "f4", "f8"]
+        );
+    }
+
+    #[test]
+    fn entity_only_hits_are_capped() {
+        let hits: Vec<Hit> = (1..=5)
+            .map(|n| {
+                hit(
+                    &format!("f{n}"),
+                    Some(0.40),
+                    &["entity", "meaning"],
+                    "named",
+                )
+            })
+            .chain([hit("f6", Some(0.8), &["meaning"], "close")])
             .collect();
-        assert_eq!(ids, ["f1", "f2", "f4", "f5"]);
+        // Two pass by the entity rule; a close hit after them still passes.
+        assert_eq!(
+            ids(select(hits.clone(), &Settings::default(), &HashSet::new())),
+            ["f1", "f2", "f6"]
+        );
+        let none = Settings {
+            entity_max: 0,
+            ..Settings::default()
+        };
+        assert_eq!(ids(select(hits, &none, &HashSet::new())), ["f6"]);
     }
 
     #[test]
@@ -622,11 +700,7 @@ mod tests {
             hit("f2", Some(0.9), &[], "b"),
         ];
         let shown: HashSet<String> = ["f1".to_owned()].into();
-        let ids: Vec<String> = select(hits, 0.45, &shown)
-            .into_iter()
-            .map(|h| h.id)
-            .collect();
-        assert_eq!(ids, ["f2"]);
+        assert_eq!(ids(select(hits, &Settings::default(), &shown)), ["f2"]);
     }
 
     #[test]

@@ -284,11 +284,12 @@ async fn prompt_hook_skips_short_prompts_and_slash_commands() {
 }
 
 #[tokio::test]
-async fn an_entity_named_in_the_prompt_passes_whatever_the_cosine() {
+async fn an_entity_named_in_the_prompt_passes_above_the_entity_floor() {
     let (home, daemon, hook) = with_memory().await;
-    // A threshold nothing reaches: only the entity channel can pass.
+    // A threshold nothing reaches: only the entity rule can pass.
     let settings = Settings {
         min_similarity: 2.0,
+        entity_min_similarity: 0.0,
         ..Settings::default()
     };
     let out = hook::prompt(
@@ -416,5 +417,24 @@ async fn run_prompt_uses_the_running_daemon_and_the_cwd_project() {
             .await
             .is_err()
     );
+    daemon.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_entity_floor_keeps_out_loosely_related_facts() {
+    let (home, daemon, hook) = with_memory().await;
+    let settings = Settings {
+        min_similarity: 2.0,
+        ..Settings::default()
+    };
+    let out = hook::prompt(
+        &hook.peer,
+        &input("s", "please tell me everything you know about alpha"),
+        &settings,
+        home.path(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out, "", "the cosine is below the default floor: {out}");
     daemon.shutdown().await;
 }

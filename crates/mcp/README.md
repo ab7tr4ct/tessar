@@ -117,8 +117,10 @@ blocks a prompt.
 - **`tessar hook prompt`** (`UserPromptSubmit`). Skips prompts of fewer than
   three words and slash commands. Otherwise it calls `recall` with the prompt
   (limit 8) and keeps the hits whose similarity is at least the threshold
-  **or** that the entity channel found, since an entity named in the prompt is
-  a strong signal whatever the cosine. Facts already shown in this session are
+  **or** that the entity channel found (an entity named in the prompt) with a
+  similarity of at least the lower entity floor. At most
+  `TESSAR_HOOK_ENTITY_MAX` hits pass by the entity rule alone, so a prompt
+  that names the project does not pull in every fact linked to it. Facts already shown in this session are
   dropped; the ids printed are appended to `$TESSAR_HOME/hooks/<session_id>.shown`.
   The rest, best first, is cut to the budget and printed, or nothing if no hit
   passes:
@@ -140,11 +142,13 @@ blocks a prompt.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `TESSAR_HOOK_MIN_SIMILARITY` | `0.45` | Smallest similarity of a hit the `prompt` hook shows, unless the entity channel found it. |
+| `TESSAR_HOOK_MIN_SIMILARITY` | `0.45` | Smallest similarity of a hit the `prompt` hook shows, unless the entity rule applies. |
+| `TESSAR_HOOK_ENTITY_MIN_SIMILARITY` | `0.35` | Smallest similarity of a hit the entity channel found. |
+| `TESSAR_HOOK_ENTITY_MAX` | `2` | Most hits that pass by the entity rule alone. |
 | `TESSAR_HOOK_BUDGET` | `1500` | Characters the `prompt` hook may print. |
 | `TESSAR_HOOK_SESSION_BUDGET` | `3000` | Characters the `session` hook may print. |
 
-The threshold 0.45 is a first guess; it is to be calibrated on real prompts
+The thresholds 0.45 and 0.35 are first guesses; it is to be calibrated on real prompts
 (experiment E13). The hooks use `$TESSAR_HOME` (default `~/.tessar`) for the
 socket and the `hooks/` directory, or `--home DIR`.
 
