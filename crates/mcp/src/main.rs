@@ -16,8 +16,10 @@ use std::time::Duration;
 use rmcp::ServiceExt;
 use rmcp::transport::stdio;
 use tessar_core::clock::{Clock, SystemClock};
+use tessar_core::embed::Embedder;
 use tessar_core::log::LogError;
 use tessar_core::store::{Memory, Op, Semantic};
+use tessar_embed_cache::CachedEmbedder;
 use tessar_embed_llama::{LlamaEmbedder, voyage_nano_path};
 use tessar_journal::FileJournal;
 use tessar_mcp::daemon::{self, Projects, socket_path};
@@ -62,6 +64,44 @@ const INDEX_DIMS: usize = 1024;
 
 /// The model file name under `<home>/models/`.
 const MODEL_FILE: &str = "voyage-4-nano-Q8_0.gguf";
+
+/// The model's name in the vector cache's key and path.
+const MODEL_NAME: &str = "voyage-4-nano";
+
+/// Where the vectors of `model` are cached under `home`.
+fn vector_cache_path(home: &Path, model: &str) -> PathBuf {
+    home.join("index").join(model).join("vectors.bin")
+}
+
+/// Wraps `inner` in the on-disk vector cache. The cache is derived data,
+/// so any problem with it is reported and the plain embedder is used.
+fn cached(home: &Path, inner: Arc<dyn Embedder>) -> Arc<dyn Embedder> {
+    let path = vector_cache_path(home, MODEL_NAME);
+    let opened = path
+        .parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .map_err(|e| format!("cannot create the cache directory: {e}"))
+        .and_then(|()| {
+            CachedEmbedder::open(&path, MODEL_NAME, Arc::clone(&inner)).map_err(|e| e.to_string())
+        });
+    match opened {
+        Ok(cache) => {
+            eprintln!(
+                "tessar: vector cache {}: {} vectors",
+                path.display(),
+                cache.len()
+            );
+            Arc::new(cache)
+        }
+        Err(e) => {
+            eprintln!(
+                "tessar: vector cache {} unusable, embedding without it: {e}",
+                path.display()
+            );
+            inner
+        }
+    }
+}
 
 /// How long the proxy waits for a freshly started daemon (the model loads).
 const DAEMON_WAIT: Duration = Duration::from_secs(60);
@@ -292,6 +332,7 @@ fn open_memory(
             embedder.dims()
         ));
     }
+    let embedder = cached(home, embedder);
     Memory::open_with(
         journal,
         clock,
@@ -557,6 +598,14 @@ mod tests {
         parse(&args, |name| {
             env.iter().find(|(k, _)| k == name).map(|(_, v)| v.into())
         })
+    }
+
+    #[test]
+    fn vector_cache_lives_under_the_model_in_the_home() {
+        assert_eq!(
+            vector_cache_path(Path::new("/h/.tessar"), "voyage-4-nano"),
+            Path::new("/h/.tessar/index/voyage-4-nano/vectors.bin")
+        );
     }
 
     #[test]

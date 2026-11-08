@@ -85,6 +85,10 @@ the journal admits one process.
 - **`tessar daemon status`.** Connects with `{"tessar": 1, "status": true}`
   and prints the daemon's build id, pid, uptime and number of open sessions.
   Exits with failure if no daemon answers.
+- **Vector cache.** `$TESSAR_HOME/index/voyage-4-nano/vectors.bin` keeps the
+  embeddings of facts already seen, so a start embeds only new facts. It is
+  derived data: safe to delete, rebuilt on the next start, and if it cannot be
+  opened the daemon logs that and runs without it.
 - **Log.** `$TESSAR_HOME/daemon.log` when the proxy started it (appended): one
   line when a connection opens and one when it closes.
 - **`--idle-exit N`.** Exit when no connection has been open for N minutes.

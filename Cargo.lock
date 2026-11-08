@@ -1460,6 +1460,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tessar-core",
+ "tessar-embed-cache",
  "tessar-embed-llama",
  "tessar-journal",
  "tokio",
