@@ -44,4 +44,9 @@ pub struct PredicateDef {
     pub object: ValueType,
     /// How many current values one subject may have.
     pub cardinality: Cardinality,
+    /// One line: what the predicate means and what its value is, for the
+    /// similarity check and for the agent's tool description. Empty for
+    /// predicates defined before descriptions existed.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
 }

@@ -171,6 +171,7 @@ fn a_correction_was_never_true_but_was_known() {
                     subject: w.person("Anna"),
                     predicate: w.lives_in,
                     object: ObjectDraft::Entity(w.place("Minsk")),
+                    text: None,
                 },
                 mentions: vec![],
             }),
@@ -233,6 +234,7 @@ fn a_failed_transaction_writes_nothing() {
         // A person is not a place.
         predicate: w.lives_in,
         object: ObjectDraft::Entity(w.person("Bob")),
+        text: None,
     });
     let result = w.try_remember(vec![w.knows("Zed", "Rust"), bad]);
     assert!(matches!(result, Err(StoreError::TypeMismatch { .. })));
@@ -269,6 +271,7 @@ fn records_of_another_space_are_rejected() {
         },
         predicate: w.knows,
         object: ObjectDraft::Value(Value::Text("Rust".into())),
+        text: None,
     });
     assert!(matches!(
         w.try_remember(vec![draft]),
@@ -347,12 +350,17 @@ fn schema_definitions_are_idempotent_and_conflicts_are_caught() {
     let w = World::new();
     let again = w
         .memory
-        .define_predicate(w.space, name("goal"), ValueType::Text, Cardinality::Single)
+        .define_predicate(
+            w.space,
+            predicate("goal", ValueType::Text, Cardinality::Single),
+        )
         .unwrap();
     assert_eq!(again, w.goal);
     assert!(matches!(
-        w.memory
-            .define_predicate(w.space, name("goal"), ValueType::Text, Cardinality::Many),
+        w.memory.define_predicate(
+            w.space,
+            predicate("goal", ValueType::Text, Cardinality::Many)
+        ),
         Err(StoreError::PredicateConflict { .. })
     ));
     assert_eq!(
@@ -439,6 +447,7 @@ fn concurrent_increments_lose_nothing() {
             subject: w.project("tessar"),
             predicate: w.counter,
             object: ObjectDraft::Value(Value::Int(n)),
+            text: None,
         })
     };
     let first = w.remember_one(counter(0, None));
@@ -465,6 +474,7 @@ fn concurrent_increments_lose_nothing() {
                                 subject: w.project("tessar"),
                                 predicate: w.counter,
                                 object: ObjectDraft::Value(Value::Int(n + 1)),
+                                text: None,
                             })
                         };
                         match w.try_remember(vec![draft]) {

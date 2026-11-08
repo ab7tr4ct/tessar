@@ -15,3 +15,4 @@ pub mod embed;
 pub mod log;
 pub mod model;
 pub mod store;
+pub mod vocab;

@@ -101,10 +101,15 @@ pub enum FactBody {
     Triple {
         /// Who or what the fact is about.
         subject: EntityId,
-        /// A predicate from the space schema.
+        /// A predicate from a space schema.
         predicate: PredicateId,
         /// The value.
         object: Value,
+        /// The fact in one sentence, as the writer put it: "User leads a
+        /// team of 5 engineers". Carries the context the triple drops and
+        /// is what a question resembles. `None` if written without one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
     },
     /// An event. It cannot be created without `when`.
     Event {
@@ -271,6 +276,7 @@ mod tests {
                 subject: e(0),
                 predicate: PredicateId::new(0),
                 object: Value::Entity(e(1)),
+                text: None,
             },
             mentions: vec![e(2), e(0)],
             episode: None,
@@ -340,6 +346,7 @@ mod tests {
             subject: e(5),
             predicate: PredicateId::new(0),
             object: Value::Text("memory engine".into()),
+            text: None,
         };
         assert_eq!(text_only.entities(), vec![e(5)]);
     }
@@ -360,11 +367,13 @@ mod tests {
             subject: e(3),
             predicate: PredicateId::new(1),
             object: Value::Span(july),
+            text: None,
         };
         let deadline = FactBody::Triple {
             subject: e(3),
             predicate: PredicateId::new(2),
             object: Value::Time(ts(15)),
+            text: None,
         };
         assert_eq!(statement.when(), None);
         assert_eq!(event.when(), Some(july));

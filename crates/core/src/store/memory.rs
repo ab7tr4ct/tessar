@@ -2,10 +2,11 @@
 
 use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard};
 
-use super::draft::{Recorded, Remember, Remembered, Update, View};
+use super::draft::{PredicateDraft, Recorded, Remember, Remembered, Update, View};
 use super::error::StoreError;
 use super::op::Op;
 use super::plan::Planner;
+use super::predicate::PredicateCheck;
 use super::recall::{Recall, Recalled, recall};
 use super::state::State;
 use super::text::{fact_text, fact_text_with};
@@ -14,8 +15,8 @@ use crate::clock::Clock;
 use crate::embed::{EmbedError, Embedder};
 use crate::log::{Commit, Log};
 use crate::model::{
-    Cardinality, Entity, EntityId, EntityKindId, Fact, FactId, Key, Lineage, Name, PredicateDef,
-    PredicateId, Space, SpaceId, SpaceKind, Timestamp, ValueType,
+    Entity, EntityId, EntityKindId, Fact, FactId, Key, Lineage, Name, PredicateDef, PredicateId,
+    Space, SpaceId, SpaceKind, Timestamp,
 };
 
 /// How many texts go to the embedder in one call when the memory opens.
@@ -33,6 +34,10 @@ pub struct Semantic {
     /// ([`Recall::near`]). In the model's cosine units, so it is tuned per
     /// model; 0.05 suits voyage-4-nano.
     pub near_bonus: f32,
+    /// Cosine similarity at which a new predicate counts as a duplicate
+    /// of an existing one and [`Memory::define_predicate`] rejects it. In
+    /// the model's cosine units; calibrated per model on known synonyms.
+    pub predicate_threshold: f32,
 }
 
 /// The memory store. Cheap to clone; every clone is the same store, safe
@@ -163,16 +168,85 @@ impl Memory {
         self.write(|p| p.define_kind(space, name))
     }
 
-    /// Finds or defines a predicate in a space schema. Fails if it exists
-    /// with another type or cardinality.
+    /// Finds or defines a predicate in a space schema, checking that the
+    /// name is short and universal and that no existing predicate means
+    /// the same (with the meaning channel on). Fails with
+    /// [`StoreError::PredicateSimilar`] naming the closest predicate, so
+    /// the caller can reuse it or declare a synonym
+    /// ([`Memory::alias_predicate`]); with the name existing with another
+    /// type or cardinality, [`StoreError::PredicateConflict`].
+    ///
+    /// TODO(core-B): embed `predicate_text(name, description)` before
+    /// taking the writer lock and pass it in `PredicateCheck::Full`.
     pub fn define_predicate(
         &self,
         space: SpaceId,
-        name: Name,
-        object: ValueType,
-        cardinality: Cardinality,
+        draft: PredicateDraft,
     ) -> Result<PredicateId, StoreError> {
-        self.write(|p| p.define_predicate(space, name, object, cardinality))
+        let threshold = self
+            .inner
+            .semantic
+            .as_ref()
+            .map_or(1.0, |s| s.predicate_threshold);
+        self.write(|p| {
+            p.define_predicate(
+                space,
+                draft,
+                PredicateCheck::Full {
+                    vector: None,
+                    threshold,
+                },
+            )
+        })
+    }
+
+    /// Finds or defines a predicate without the universality and
+    /// similarity checks: for the starter vocabulary, or for an agent that
+    /// saw the similar predicate and insists. The format is still checked.
+    pub fn define_predicate_unchecked(
+        &self,
+        space: SpaceId,
+        draft: PredicateDraft,
+    ) -> Result<PredicateId, StoreError> {
+        self.write(|p| p.define_predicate(space, draft, PredicateCheck::Format))
+    }
+
+    /// Declares `name` a synonym of `into`: new writes with the name go to
+    /// `into`, and the two count as one for the replacement rule. Returns
+    /// the canonical predicate.
+    pub fn alias_predicate(
+        &self,
+        space: SpaceId,
+        name: Name,
+        description: String,
+        into: PredicateId,
+    ) -> Result<PredicateId, StoreError> {
+        self.write(|p| p.alias_predicate(space, name, description, into))
+    }
+
+    /// Makes the existing predicate `from` a synonym of `into`. Facts
+    /// already written with `from` keep it; see [`Op::MergePredicate`].
+    pub fn merge_predicates(&self, from: PredicateId, into: PredicateId) -> Result<(), StoreError> {
+        self.write(|p| p.merge_predicates(from, into))
+    }
+
+    /// A predicate by id, synonym or canonical.
+    pub fn predicate(&self, id: PredicateId) -> Option<PredicateDef> {
+        self.state().predicate(id).cloned()
+    }
+
+    /// The canonical predicate of `id`: itself unless merged into another.
+    pub fn canonical_predicate(&self, id: PredicateId) -> Option<PredicateId> {
+        let state = self.state();
+        state.predicate(id).map(|_| state.canonical(id))
+    }
+
+    /// The vocabulary: every canonical predicate, in id order. Synonyms are
+    /// left out.
+    ///
+    /// TODO(core-B): implement via a `State` accessor.
+    pub fn predicates(&self) -> Vec<PredicateDef> {
+        todo!("core-B: predicates")
     }
 
     /// Adds another name to an entity.
@@ -213,7 +287,7 @@ impl Memory {
         self.state().kind_named(space, &Name::new(name).ok()?)
     }
 
-    /// A predicate by name.
+    /// A predicate by name; a synonym's name gives its canonical predicate.
     pub fn predicate_named(&self, space: SpaceId, name: &str) -> Option<PredicateDef> {
         let name = Name::new(name).ok()?;
         let state = self.state();

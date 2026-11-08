@@ -11,8 +11,8 @@ use tessar_core::model::{
     SpaceKind, Timestamp, Value, ValueType,
 };
 use tessar_core::store::{
-    BodyDraft, EntityRef, FactDraft, Memory, ObjectDraft, Op, Recorded, Remember, Remembered,
-    Semantic, StoreError,
+    BodyDraft, EntityRef, FactDraft, Memory, ObjectDraft, Op, PredicateDraft, Recorded, Remember,
+    Remembered, Semantic, StoreError,
 };
 
 /// A log shared between several `Memory` instances, to test reopening.
@@ -55,6 +55,16 @@ pub fn v(n: u32) -> NonZeroU32 {
     NonZeroU32::new(n).unwrap()
 }
 
+/// A predicate draft with an empty description.
+pub fn predicate(n: &str, object: ValueType, cardinality: Cardinality) -> PredicateDraft {
+    PredicateDraft {
+        name: name(n),
+        description: String::new(),
+        object,
+        cardinality,
+    }
+}
+
 pub struct World {
     pub memory: Memory,
     pub semantic: Option<Semantic>,
@@ -93,19 +103,30 @@ impl World {
         let lives_in = memory
             .define_predicate(
                 space,
-                name("lives_in"),
-                ValueType::Entity(Some(place)),
-                Cardinality::Single,
+                predicate(
+                    "lives_in",
+                    ValueType::Entity(Some(place)),
+                    Cardinality::Single,
+                ),
             )
             .unwrap();
         let goal = memory
-            .define_predicate(space, name("goal"), ValueType::Text, Cardinality::Single)
+            .define_predicate(
+                space,
+                predicate("goal", ValueType::Text, Cardinality::Single),
+            )
             .unwrap();
         let knows = memory
-            .define_predicate(space, name("knows"), ValueType::Text, Cardinality::Many)
+            .define_predicate(
+                space,
+                predicate("knows", ValueType::Text, Cardinality::Many),
+            )
             .unwrap();
         let counter = memory
-            .define_predicate(space, name("counter"), ValueType::Int, Cardinality::Single)
+            .define_predicate(
+                space,
+                predicate("counter", ValueType::Int, Cardinality::Single),
+            )
             .unwrap();
         Self {
             memory,
@@ -153,6 +174,7 @@ impl World {
             subject: self.project("tessar"),
             predicate: self.goal,
             object: ObjectDraft::Value(Value::Text(text.into())),
+            text: None,
         })
     }
 
@@ -161,6 +183,7 @@ impl World {
             subject: self.person(who),
             predicate: self.lives_in,
             object: ObjectDraft::Entity(self.place(city)),
+            text: None,
         })
     }
 
@@ -169,6 +192,7 @@ impl World {
             subject: self.person(who),
             predicate: self.knows,
             object: ObjectDraft::Value(Value::Text(what.into())),
+            text: None,
         })
     }
 

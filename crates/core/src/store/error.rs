@@ -76,6 +76,49 @@ pub enum StoreError {
         name: String,
     },
 
+    /// A predicate name has more words than allowed.
+    #[error("predicate name {name} has more than {max_words} words")]
+    PredicateNameTooLong {
+        /// The name.
+        name: String,
+        /// The most words a name may have.
+        max_words: usize,
+    },
+
+    /// A word of a predicate name is a number or the name of an entity:
+    /// `plans_trip_to_japan`. The thing named belongs in the value.
+    #[error("predicate name {name} is not universal: {word:?} {reason}")]
+    PredicateNotUniversal {
+        /// The name.
+        name: String,
+        /// The offending word.
+        word: String,
+        /// Why: "is a number", "is the name of an entity".
+        reason: String,
+    },
+
+    /// A predicate with a similar meaning already exists. The caller may
+    /// use it, declare the new name its synonym, or insist with
+    /// [`Memory::define_predicate_unchecked`](super::Memory::define_predicate_unchecked).
+    #[error("predicate {name} is similar to existing {existing} (similarity {similarity:.2})")]
+    PredicateSimilar {
+        /// The proposed name.
+        name: String,
+        /// The most similar existing predicate (its canonical id).
+        existing: PredicateId,
+        /// Cosine similarity of the two, in the embedder's units.
+        similarity: f32,
+    },
+
+    /// Two predicates cannot be merged: another value type or cardinality.
+    #[error("cannot merge {from} into {into}: value type or cardinality differ")]
+    MergeMismatch {
+        /// The predicate that would become a synonym.
+        from: PredicateId,
+        /// The canonical predicate.
+        into: PredicateId,
+    },
+
     /// The value does not have the type the predicate accepts.
     #[error("predicate {predicate} expects {expected:?}")]
     TypeMismatch {

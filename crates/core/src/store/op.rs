@@ -3,7 +3,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::model::{
-    Entity, EntityId, EntityKindDef, Episode, Fact, FactEnd, FactId, Key, PredicateDef, Space,
+    Entity, EntityId, EntityKindDef, Episode, Fact, FactEnd, FactId, Key, PredicateDef,
+    PredicateId, Space,
 };
 
 /// One change to memory, as written to the log.
@@ -20,6 +21,16 @@ pub enum Op {
     DefineKind(EntityKindDef),
     /// A new predicate in a space schema.
     DefinePredicate(PredicateDef),
+    /// `from` becomes a synonym of `into`: lookups by name and new writes
+    /// with `from` resolve to `into`, and the two count as one predicate
+    /// for the replacement rule. Facts already written with `from` keep
+    /// it. Both must have the same value type and cardinality.
+    MergePredicate {
+        /// The predicate that becomes a synonym.
+        from: PredicateId,
+        /// The canonical predicate.
+        into: PredicateId,
+    },
     /// A new entity.
     CreateEntity(Entity),
     /// Another name for an existing entity.

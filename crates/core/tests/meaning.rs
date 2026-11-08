@@ -91,6 +91,7 @@ fn world() -> (World, Arc<Concepts>) {
         embedder: concepts.clone(),
         dims: DIMS,
         near_bonus: 0.05,
+        predicate_threshold: 1.0,
     };
     (World::with(Some(semantic)), concepts)
 }

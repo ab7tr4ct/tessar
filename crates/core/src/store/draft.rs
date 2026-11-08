@@ -3,9 +3,24 @@
 use std::num::NonZeroU32;
 
 use crate::model::{
-    EntityId, EntityKindId, EpisodeId, Fact, FactId, Key, Lineage, Origin, PredicateId, SpaceId,
-    TimeSpan, Timestamp, Value,
+    Cardinality, EntityId, EntityKindId, EpisodeId, Fact, FactId, Key, Lineage, Name, Origin,
+    PredicateId, SpaceId, TimeSpan, Timestamp, Value, ValueType,
 };
+
+/// A predicate to define in a space schema.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PredicateDraft {
+    /// The name: `lives_in`, `trip_destination`. One to four words joined
+    /// by `_`.
+    pub name: Name,
+    /// One line: what the predicate means and what its value is. May be
+    /// empty, but then the similarity check sees the name alone.
+    pub description: String,
+    /// Which values are allowed.
+    pub object: ValueType,
+    /// How many current values one subject may have.
+    pub cardinality: Cardinality,
+}
 
 /// An entity named in a write: by id, or by key — found or created.
 #[derive(Debug, Clone, PartialEq)]
@@ -44,10 +59,13 @@ pub enum BodyDraft {
     Triple {
         /// The subject.
         subject: EntityRef,
-        /// A predicate from the space schema.
+        /// A predicate from a space schema. A synonym resolves to its
+        /// canonical predicate.
         predicate: PredicateId,
         /// The value.
         object: ObjectDraft,
+        /// The fact in one sentence, if the writer has one.
+        text: Option<String>,
     },
     /// An event.
     Event {

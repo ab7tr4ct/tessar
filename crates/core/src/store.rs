@@ -10,14 +10,15 @@ mod error;
 mod memory;
 mod op;
 mod plan;
+mod predicate;
 mod recall;
 mod state;
 mod text;
 mod vector;
 
 pub use draft::{
-    BodyDraft, EntityRef, EpisodeDraft, FactDraft, ObjectDraft, Outcome, Reason, Recorded,
-    Remember, Remembered, Replacement, Update, View,
+    BodyDraft, EntityRef, EpisodeDraft, FactDraft, ObjectDraft, Outcome, PredicateDraft, Reason,
+    Recorded, Remember, Remembered, Replacement, Update, View,
 };
 pub use error::StoreError;
 pub use memory::{Memory, Semantic};

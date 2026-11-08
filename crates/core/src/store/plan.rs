@@ -19,15 +19,17 @@ use super::op::Op;
 use super::state::{Lens, State};
 use crate::model::{
     Cardinality, Ending, Entity, EntityId, EntityKindDef, EntityKindId, Episode, EpisodeId, Fact,
-    FactBody, FactEnd, FactId, Key, Lineage, Name, Origin, PredicateDef, PredicateId, Space,
-    SpaceId, SpaceKind, SpaceState, Timestamp, Value, ValueType,
+    FactBody, FactEnd, FactId, Key, Lineage, Name, Origin, PredicateId, Space, SpaceId, SpaceKind,
+    SpaceState, Timestamp, Value,
 };
 
+/// Planning of predicate definitions and merges lives in
+/// [`super::predicate`]; it shares these fields.
 pub(crate) struct Planner<'s> {
-    state: &'s State,
-    at: Timestamp,
-    ops: Vec<Op>,
-    next: Lens,
+    pub(super) state: &'s State,
+    pub(super) at: Timestamp,
+    pub(super) ops: Vec<Op>,
+    pub(super) next: Lens,
     /// Entities created by this transaction: (space, kind, name) → id.
     new_entities: HashMap<(SpaceId, EntityKindId, String), EntityId>,
     new_entity_kinds: HashMap<EntityId, EntityKindId>,
@@ -97,41 +99,6 @@ impl<'s> Planner<'s> {
         let id = mint(&mut self.next.kinds, EntityKindId::new)?;
         self.ops
             .push(Op::DefineKind(EntityKindDef { id, space, name }));
-        Ok(id)
-    }
-
-    pub(crate) fn define_predicate(
-        &mut self,
-        space: SpaceId,
-        name: Name,
-        object: ValueType,
-        cardinality: Cardinality,
-    ) -> Result<PredicateId, StoreError> {
-        let state = self.state;
-        self.open_space(space)?;
-        if let Some(id) = state.predicate_named(space, &name) {
-            let existing = state
-                .predicate(id)
-                .ok_or(StoreError::UnknownPredicate(id))?;
-            return if existing.object == object && existing.cardinality == cardinality {
-                Ok(id)
-            } else {
-                Err(StoreError::PredicateConflict {
-                    name: name.to_string(),
-                })
-            };
-        }
-        if let ValueType::Entity(Some(kind)) = object {
-            self.kind_in(kind, space)?;
-        }
-        let id = mint(&mut self.next.predicates, PredicateId::new)?;
-        self.ops.push(Op::DefinePredicate(PredicateDef {
-            id,
-            space,
-            name,
-            object,
-            cardinality,
-        }));
         Ok(id)
     }
 
@@ -415,18 +382,15 @@ impl<'s> Planner<'s> {
                 subject,
                 predicate,
                 object,
+                text,
             } => {
                 let subject = self.resolve(space, &subject)?;
+                // A synonym is written under its canonical predicate; the
+                // predicate may belong to any space.
+                let predicate = state.canonical(predicate);
                 let def = state
                     .predicate(predicate)
                     .ok_or(StoreError::UnknownPredicate(predicate))?;
-                if def.space != space {
-                    return Err(StoreError::WrongSpace {
-                        record: predicate.to_string(),
-                        expected: space,
-                        found: def.space,
-                    });
-                }
                 let object = match object {
                     ObjectDraft::Value(Value::Entity(id)) => {
                         Value::Entity(self.resolve(space, &EntityRef::Id(id))?)
@@ -440,10 +404,15 @@ impl<'s> Planner<'s> {
                         expected: def.object,
                     });
                 }
+                let text = match text {
+                    Some(text) => Some(non_empty(text)?),
+                    None => None,
+                };
                 Ok(FactBody::Triple {
                     subject,
                     predicate,
                     object,
+                    text,
                 })
             }
         }
@@ -519,7 +488,7 @@ impl<'s> Planner<'s> {
         }
     }
 
-    fn open_space(&self, space: SpaceId) -> Result<(), StoreError> {
+    pub(super) fn open_space(&self, space: SpaceId) -> Result<(), StoreError> {
         let s = self
             .state
             .space(space)
@@ -532,7 +501,7 @@ impl<'s> Planner<'s> {
 }
 
 /// The id of the next record in a vector of length `*next`.
-fn mint<I>(next: &mut usize, make: fn(u32) -> I) -> Result<I, StoreError> {
+pub(super) fn mint<I>(next: &mut usize, make: fn(u32) -> I) -> Result<I, StoreError> {
     let raw = u32::try_from(*next).map_err(|_| StoreError::TooManyRecords)?;
     *next += 1;
     Ok(make(raw))

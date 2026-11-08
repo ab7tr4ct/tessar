@@ -33,8 +33,11 @@ pub(crate) struct State {
     facts_by_entity: Vec<Vec<FactId>>,
     /// Lineage → its latest version.
     heads: HashMap<Lineage, FactId>,
-    /// (subject, predicate) → lineages of triples with that pair.
+    /// (subject, canonical predicate) → lineages of triples with that
+    /// pair. Keyed by the canonical predicate, so synonyms share pairs.
     pairs: HashMap<(EntityId, PredicateId), Vec<Lineage>>,
+    /// Predicate → its canonical predicate; itself unless merged.
+    canonical: Vec<PredicateId>,
     /// Normalized key or alias → entities with that name, in any space or
     /// kind. For finding entities named in a query.
     names: HashMap<String, Vec<EntityId>>,
@@ -86,8 +89,17 @@ impl State {
         self.kind_by_name.get(&(space, name.clone())).copied()
     }
 
+    /// The canonical predicate of the predicate named `name` in `space`.
     pub(crate) fn predicate_named(&self, space: SpaceId, name: &Name) -> Option<PredicateId> {
-        self.predicate_by_name.get(&(space, name.clone())).copied()
+        self.predicate_by_name
+            .get(&(space, name.clone()))
+            .map(|&id| self.canonical(id))
+    }
+
+    /// The canonical predicate of `id`: `id` itself unless it was merged
+    /// into another. An unknown id is returned unchanged.
+    pub(crate) fn canonical(&self, id: PredicateId) -> PredicateId {
+        self.canonical.get(id.index()).copied().unwrap_or(id)
     }
 
     pub(crate) fn entity_named(
@@ -179,16 +191,20 @@ impl State {
             Op::DefinePredicate(predicate) => {
                 expect_next("predicate", predicate.id.index(), self.predicates.len())?;
                 self.require_space(predicate.space)?;
-                if let ValueType::Entity(Some(kind)) = predicate.object {
-                    self.require_kind_in(kind, predicate.space)?;
+                if let ValueType::Entity(Some(kind)) = predicate.object
+                    && self.kind(kind).is_none()
+                {
+                    return Err(format!("unknown kind {kind}"));
                 }
                 let key = (predicate.space, predicate.name.clone());
                 if self.predicate_by_name.contains_key(&key) {
                     return Err(format!("predicate {} is already defined", predicate.name));
                 }
                 self.predicate_by_name.insert(key, predicate.id);
+                self.canonical.push(predicate.id);
                 self.predicates.push(predicate);
             }
+            Op::MergePredicate { from, into } => self.merge_predicate(from, into)?,
             Op::CreateEntity(entity) => {
                 expect_next("entity", entity.id.index(), self.entities.len())?;
                 self.require_space(entity.space)?;
@@ -252,25 +268,30 @@ impl State {
         Ok(())
     }
 
+    /// Makes `from` a synonym of `into`.
+    ///
+    /// TODO(core-B): check both exist, `into` is canonical, `from` is not
+    /// merged yet and is not `into`, value type and cardinality match;
+    /// then set `canonical[from] = into` and move the `pairs` entries of
+    /// `from` under `into`, keeping lineage order (sort by first version).
+    fn merge_predicate(&mut self, from: PredicateId, into: PredicateId) -> Result<(), String> {
+        let _ = (from, into);
+        Err("merging predicates is not implemented yet".to_owned())
+    }
+
+    /// Adds a fact. Its entities and predicate may live in any space: the
+    /// fact's space says where the fact lies, not what it may refer to.
     fn add_fact(&mut self, fact: Fact) -> Result<(), String> {
         expect_next("fact", fact.id.index(), self.facts.len())?;
         self.require_space(fact.space)?;
         let entities = fact.entities();
         for &e in &entities {
-            let entity = self
-                .entity(e)
+            self.entity(e)
                 .ok_or_else(|| format!("unknown entity {e}"))?;
-            if entity.space != fact.space {
-                return Err(format!("{e} is in another space"));
-            }
         }
         if let FactBody::Triple { predicate, .. } = &fact.body {
-            let p = self
-                .predicate(*predicate)
+            self.predicate(*predicate)
                 .ok_or_else(|| format!("unknown predicate {predicate}"))?;
-            if p.space != fact.space {
-                return Err(format!("{predicate} is in another space"));
-            }
         }
         if let Some(episode) = fact.episode
             && self.episodes.get(episode.index()).is_none()
@@ -307,8 +328,9 @@ impl State {
                 subject, predicate, ..
             } = &fact.body
         {
+            let predicate = self.canonical(*predicate);
             self.pairs
-                .entry((*subject, *predicate))
+                .entry((*subject, predicate))
                 .or_default()
                 .push(fact.lineage);
         }

@@ -100,7 +100,13 @@ pub(crate) fn fact_text_with(state: &State, fact: &Fact, new: &[&Entity]) -> Str
             subject,
             predicate,
             object,
+            text,
         } => {
+            // TODO(core-A): put the sentence first, then the structured
+            // form, so both the phrase and the exact key are found.
+            if let Some(text) = text {
+                parts.push(text.clone());
+            }
             parts.push(key(*subject).to_owned());
             if let Some(p) = state.predicate(*predicate) {
                 parts.push(p.name.as_str().replace('_', " "));
