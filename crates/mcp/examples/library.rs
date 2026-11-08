@@ -47,16 +47,18 @@ fn main() -> Result<(), Box<dyn Error>> {
         },
     )?;
 
-    let anna_lives_in = |city: &str| FactDraft::new(BodyDraft::Triple {
-        subject: EntityRef::Key {
-            kind: person,
-            key: Key::new("Anna").expect("valid key"),
-        },
-        predicate: lives_in,
-        object: ObjectDraft::Value(Value::Text(city.into())),
-        text: Some(format!("Anna lives in {city}.")),
-        when: None,
-    });
+    let anna_lives_in = |city: &str| {
+        FactDraft::new(BodyDraft::Triple {
+            subject: EntityRef::Key {
+                kind: person,
+                key: Key::new("Anna").expect("valid key"),
+            },
+            predicate: lives_in,
+            object: ObjectDraft::Value(Value::Text(city.into())),
+            text: Some(format!("Anna lives in {city}.")),
+            when: None,
+        })
+    };
     let write = |fact: FactDraft| {
         memory.remember(Remember {
             space,
