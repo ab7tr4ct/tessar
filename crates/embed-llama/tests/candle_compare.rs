@@ -1,10 +1,12 @@
+#![cfg(target_os = "macos")]
+
 //! candle vs llama.cpp on the same texts. Ignored: needs the GPU and
 //! `~/.tessar/models/voyage-4-nano-candle/` (safetensors) plus
 //! `~/.tessar/models/voyage-4-nano-Q8_0.gguf`.
 //!
 //! ```sh
-//! cargo test -p tessar-embed-candle --release --features metal \
-//!     --test compare -- --ignored --nocapture
+//! cargo test -p tessar-embed-llama --release --test candle_compare \
+//!     -- --ignored --nocapture
 //! ```
 //!
 //! Knobs (environment): `CANDLE_DTYPE` (f16|bf16|f32), `CANDLE_DEVICE`
@@ -14,9 +16,8 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use candle_core::DType;
 use tessar_core::embed::{Embedder, Prompts};
-use tessar_embed_candle::{Accel, CandleEmbedder, Options};
+use tessar_embed_candle::{Accel, CandleEmbedder, DType, Options};
 use tessar_embed_llama::{LlamaEmbedder, Options as LlamaOptions, voyage_nano_path};
 
 fn home() -> PathBuf {
@@ -139,7 +140,7 @@ fn candle_vs_llama() {
     };
     let options = Options {
         context: 2048,
-        batch: env("CANDLE_BATCH").map_or(64, |v| v.parse().unwrap()),
+        batch: env("CANDLE_BATCH").map_or(8, |v| v.parse().unwrap()),
         device: if env("CANDLE_DEVICE").as_deref() == Some("cpu") {
             Accel::Cpu
         } else {
@@ -147,6 +148,7 @@ fn candle_vs_llama() {
         },
         dtype,
         append_eos: env("CANDLE_EOS").as_deref() == Some("1"),
+        fused: env("TESSAR_CANDLE_NO_SDPA").is_none(),
     };
 
     let mut reference = None;

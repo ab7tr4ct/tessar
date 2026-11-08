@@ -4,7 +4,9 @@
 //! of the encoder path only.
 
 use candle_core::{D, DType, Device, Result, Tensor};
-use candle_nn::{Embedding, Linear, Module, RmsNorm, VarBuilder, linear_no_bias, rms_norm};
+use candle_nn::{
+    Embedding, Linear, Module, RmsNorm, VarBuilder, embedding, linear_no_bias, rms_norm,
+};
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -19,6 +21,23 @@ pub struct Config {
     pub rope_theta: f64,
     pub vocab_size: usize,
     pub num_labels: usize,
+    #[serde(default)]
+    pub use_bidirectional_attention: Option<bool>,
+    #[serde(default)]
+    pub use_sliding_window: Option<bool>,
+}
+
+impl Config {
+    /// Rejects configs this implementation does not model.
+    pub fn check(&self) -> std::result::Result<(), String> {
+        if self.use_bidirectional_attention == Some(false) {
+            return Err("the model uses causal attention; only bidirectional is supported".into());
+        }
+        if self.use_sliding_window == Some(true) {
+            return Err("sliding-window attention is not supported".into());
+        }
+        Ok(())
+    }
 }
 
 struct Attention {
@@ -31,6 +50,7 @@ struct Attention {
     heads: usize,
     kv_heads: usize,
     head_dim: usize,
+    scale: f32,
     fused: bool,
 }
 
@@ -52,6 +72,7 @@ impl Attention {
             heads: h,
             kv_heads: kv,
             head_dim: d,
+            scale: (d as f32).powf(-0.5),
             fused,
         })
     }
@@ -73,7 +94,7 @@ impl Attention {
                 &v.contiguous()?,
                 Some(&mask),
                 false,
-                (d as f32).powf(-0.5),
+                self.scale,
                 1.0,
             )?
             .transpose(1, 2)?
@@ -84,7 +105,7 @@ impl Attention {
             let rep = h / kv;
             let q = q.reshape((b, kv, rep * l, d))?;
             let k = k.transpose(2, 3)?.contiguous()?;
-            let scores = (q.matmul(&k)? / (d as f64).sqrt())?;
+            let scores = (q.matmul(&k)? * f64::from(self.scale))?;
             let scores = scores.broadcast_add(mask)?;
             let probs = candle_nn::ops::softmax_last_dim(&scores)?;
             let out = probs.matmul(&v.contiguous()?)?;
@@ -126,11 +147,6 @@ impl Layer {
     }
 }
 
-/// `TESSAR_CANDLE_NO_SDPA=1` turns the fused kernel off (for measuring).
-fn no_fused() -> bool {
-    std::env::var_os("TESSAR_CANDLE_NO_SDPA").is_some()
-}
-
 pub struct Model {
     embed: Embedding,
     layers: Vec<Layer>,
@@ -143,32 +159,23 @@ pub struct Model {
 }
 
 impl Model {
-    pub fn load(c: &Config, vb: VarBuilder, device: &Device) -> Result<Self> {
+    pub fn load(c: &Config, vb: VarBuilder, fused: bool) -> Result<Self> {
+        let device = vb.device().clone();
         let m = vb.pp("model");
         let layers = (0..c.num_hidden_layers)
-            .map(|i| {
-                Layer::load(
-                    c,
-                    m.pp(format!("layers.{i}")),
-                    device.is_metal() && !no_fused(),
-                )
-            })
+            .map(|i| Layer::load(c, m.pp(format!("layers.{i}")), device.is_metal() && fused))
             .collect::<Result<Vec<_>>>()?;
         let inv_freq = (0..c.head_dim / 2)
             .map(|i| (1.0 / c.rope_theta.powf(2.0 * i as f64 / c.head_dim as f64)) as f32)
             .collect();
         Ok(Self {
-            embed: Embedding::new(
-                m.pp("embed_tokens")
-                    .get((c.vocab_size, c.hidden_size), "weight")?,
-                c.hidden_size,
-            ),
+            embed: embedding(c.vocab_size, c.hidden_size, m.pp("embed_tokens"))?,
             layers,
             norm: rms_norm(c.hidden_size, c.rms_norm_eps, m.pp("norm"))?,
             proj: linear_no_bias(c.hidden_size, c.num_labels, vb.pp("linear"))?,
             inv_freq,
             dtype: vb.dtype(),
-            device: device.clone(),
+            device,
             dims: c.num_labels,
         })
     }

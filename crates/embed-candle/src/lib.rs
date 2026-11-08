@@ -6,15 +6,17 @@ mod model;
 use std::path::Path;
 use std::sync::Mutex;
 
-use candle_core::{DType, Device, Tensor};
+pub use candle_core::DType;
+use candle_core::{Device, Tensor};
 use candle_nn::VarBuilder;
 use tessar_core::embed::{EmbedError, Embedder, Prompts};
-use tokenizers::Tokenizer;
+use tokenizers::{Tokenizer, TruncationParams};
 
 /// Where the weights run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Accel {
     /// Metal when the crate is built with the `metal` feature, else CPU.
+    /// Decided at compile time: a Metal failure is an error, not a fallback.
     Auto,
     /// Always the CPU.
     Cpu,
@@ -23,16 +25,21 @@ pub enum Accel {
 /// How to load the model.
 #[derive(Debug, Clone)]
 pub struct Options {
-    /// Tokens per text, prompt included; longer texts are cut.
+    /// Token budget of one forward pass, and the most one text may take
+    /// (prompt included; a longer text is cut). A pass holds as many
+    /// texts as fit in `context` tokens when padded to the longest one,
+    /// so memory stays bounded however many texts a call brings.
     pub context: usize,
-    /// Most texts per forward pass.
+    /// Most texts in one forward pass.
     pub batch: usize,
     /// Device choice.
     pub device: Accel,
-    /// Compute dtype (weights are bf16 on disk and converted on load).
+    /// Compute dtype (the weights are bf16 on disk and converted on load).
     pub dtype: DType,
     /// Append `<|endoftext|>` to every text. The HF tokenizer does not.
     pub append_eos: bool,
+    /// Use the fused Metal attention kernel (no effect on the CPU).
+    pub fused: bool,
 }
 
 impl Default for Options {
@@ -43,6 +50,7 @@ impl Default for Options {
             device: Accel::Auto,
             dtype: DType::F16,
             append_eos: false,
+            fused: true,
         }
     }
 }
@@ -51,8 +59,66 @@ fn err(e: impl std::fmt::Display) -> EmbedError {
     EmbedError(format!("candle: {e}"))
 }
 
+#[cfg(feature = "metal")]
+fn auto_device() -> Result<Device, EmbedError> {
+    Device::new_metal(0).map_err(err)
+}
+
+#[cfg(not(feature = "metal"))]
+#[allow(clippy::unnecessary_wraps)]
+fn auto_device() -> Result<Device, EmbedError> {
+    Ok(Device::Cpu)
+}
+
+fn pick_device(accel: Accel) -> Result<Device, EmbedError> {
+    match accel {
+        Accel::Cpu => Ok(Device::Cpu),
+        Accel::Auto => auto_device(),
+    }
+}
+
+/// L2-normalizes `row` in place. A zero vector stays zero; a vector with
+/// NaN or infinite parts is an error, never an index entry.
+fn normalize(row: &mut [f32]) -> Result<(), EmbedError> {
+    let norm = row
+        .iter()
+        .map(|x| f64::from(*x).powi(2))
+        .sum::<f64>()
+        .sqrt();
+    if !norm.is_finite() {
+        return Err(EmbedError("candle: non-finite vector".into()));
+    }
+    let scale = if norm > 0.0 { (1.0 / norm) as f32 } else { 0.0 };
+    for x in row {
+        *x *= scale;
+    }
+    Ok(())
+}
+
+/// Splits `order` (indices sorted by ascending length) into passes of at
+/// most `batch` texts whose padded size fits the `context` token budget.
+/// A text longer than the budget gets a pass of its own.
+fn plan<'a>(order: &'a [usize], lens: &[usize], batch: usize, context: usize) -> Vec<&'a [usize]> {
+    let mut passes = Vec::new();
+    let mut start = 0;
+    while start < order.len() {
+        let mut end = start + 1;
+        // Ascending lengths: the newest text is the longest.
+        while end < order.len()
+            && end - start < batch.max(1)
+            && (end - start + 1) * lens[order[end]] <= context
+        {
+            end += 1;
+        }
+        passes.push(&order[start..end]);
+        start = end;
+    }
+    passes
+}
+
 /// `voyage-4-nano` on candle.
 pub struct CandleEmbedder {
+    // Serializes use of the GPU only: `Model::forward` takes `&self`.
     model: Mutex<model::Model>,
     tokenizer: Tokenizer,
     device: Device,
@@ -65,22 +131,44 @@ pub struct CandleEmbedder {
 impl CandleEmbedder {
     /// Loads `config.json`, `tokenizer.json` and `model.safetensors`
     /// from `model_dir`, without prompts.
-    pub fn load(model_dir: &Path, options: &Options) -> Result<Self, EmbedError> {
+    pub fn load(model_dir: impl AsRef<Path>, options: &Options) -> Result<Self, EmbedError> {
+        let dir = model_dir.as_ref();
         let cfg: model::Config =
-            serde_json::from_slice(&std::fs::read(model_dir.join("config.json")).map_err(err)?)
+            serde_json::from_slice(&std::fs::read(dir.join("config.json")).map_err(err)?)
                 .map_err(err)?;
-        let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json")).map_err(err)?;
-        let eos = tokenizer.token_to_id("<|endoftext|>").unwrap_or(151_643);
-        let device = match options.device {
-            #[cfg(feature = "metal")]
-            Accel::Auto => Device::new_metal(0).map_err(err)?,
-            _ => Device::Cpu,
-        };
+        cfg.check().map_err(err)?;
+        let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json")).map_err(err)?;
+        let device = pick_device(options.device)?;
         // Buffered read instead of mmap: mmap needs `unsafe` in candle's API.
-        let bytes = std::fs::read(model_dir.join("model.safetensors")).map_err(err)?;
+        let bytes = std::fs::read(dir.join("model.safetensors")).map_err(err)?;
         let vb =
             VarBuilder::from_buffered_safetensors(bytes, options.dtype, &device).map_err(err)?;
-        let model = model::Model::load(&cfg, vb, &device).map_err(err)?;
+        let model = model::Model::load(&cfg, vb, options.fused).map_err(err)?;
+        Self::assemble(model, tokenizer, device, options)
+    }
+
+    fn assemble(
+        model: model::Model,
+        mut tokenizer: Tokenizer,
+        device: Device,
+        options: &Options,
+    ) -> Result<Self, EmbedError> {
+        let eos = tokenizer
+            .token_to_id("<|endoftext|>")
+            .ok_or_else(|| err("the tokenizer has no <|endoftext|> token"))?;
+        let reserved = usize::from(options.append_eos);
+        if options.context <= reserved {
+            return Err(err(format!(
+                "context {} leaves no room for text",
+                options.context
+            )));
+        }
+        tokenizer
+            .with_truncation(Some(TruncationParams {
+                max_length: options.context - reserved,
+                ..TruncationParams::default()
+            }))
+            .map_err(err)?;
         Ok(Self {
             dims: model.dims,
             model: Mutex::new(model),
@@ -93,11 +181,12 @@ impl CandleEmbedder {
     }
 
     /// `voyage-4-nano` in `model_dir` with its prompts.
-    pub fn voyage_nano(model_dir: &Path) -> Result<Self, EmbedError> {
+    pub fn voyage_nano(model_dir: impl AsRef<Path>) -> Result<Self, EmbedError> {
         Ok(Self::load(model_dir, &Options::default())?.with_prompts(Prompts::voyage()))
     }
 
     /// Sets the instructions before queries and documents.
+    #[must_use]
     pub fn with_prompts(mut self, prompts: Prompts) -> Self {
         self.prompts = prompts;
         self
@@ -114,14 +203,11 @@ impl CandleEmbedder {
     }
 
     fn encode(&self, text: &str) -> Result<Vec<u32>, EmbedError> {
+        // The tokenizer cuts to `context` minus the EOS slot.
         let enc = self.tokenizer.encode(text, false).map_err(err)?;
         let mut ids = enc.get_ids().to_vec();
-        let max = self.options.context.max(1);
         if self.options.append_eos {
-            ids.truncate(max - 1);
             ids.push(self.eos);
-        } else {
-            ids.truncate(max);
         }
         if ids.is_empty() {
             return Err(EmbedError("candle: text has no tokens".into()));
@@ -134,16 +220,17 @@ impl CandleEmbedder {
             .iter()
             .map(|t| self.encode(&format!("{prefix}{t}")))
             .collect::<Result<Vec<_>, _>>()?;
-        // Sort by length so batches pad little; order is restored below.
+        let lens: Vec<usize> = tokens.iter().map(Vec::len).collect();
+        // Sort by length so passes pad little; order is restored below.
         let mut order: Vec<usize> = (0..tokens.len()).collect();
-        order.sort_by_key(|&i| tokens[i].len());
+        order.sort_by_key(|&i| lens[i]);
         let mut out = vec![Vec::new(); texts.len()];
         let model = self
             .model
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for chunk in order.chunks(self.options.batch.max(1)) {
-            let len = chunk.iter().map(|&i| tokens[i].len()).max().unwrap_or(1);
+        for chunk in plan(&order, &lens, self.options.batch, self.options.context) {
+            let len = chunk.iter().map(|&i| lens[i]).max().unwrap_or(1);
             let mut ids = Vec::with_capacity(chunk.len() * len);
             let mut valid = Vec::with_capacity(chunk.len() * len);
             for &i in chunk {
@@ -151,20 +238,15 @@ impl CandleEmbedder {
                 valid.extend((0..len).map(|p| if p < t.len() { 1f32 } else { 0.0 }));
                 let pad = len - t.len();
                 ids.extend(t);
-                ids.extend(std::iter::repeat_n(self.eos, pad));
+                // Padding is masked out, any valid id will do.
+                ids.extend(std::iter::repeat_n(0u32, pad));
             }
             let ids = Tensor::from_vec(ids, (chunk.len(), len), &self.device).map_err(err)?;
             let valid = Tensor::from_vec(valid, (chunk.len(), len), &self.device).map_err(err)?;
             let v = model.forward(&ids, &valid).map_err(err)?;
             let v = v.to_vec2::<f32>().map_err(err)?;
             for (&i, mut row) in chunk.iter().zip(v) {
-                let norm = row
-                    .iter()
-                    .map(|x| f64::from(*x).powi(2))
-                    .sum::<f64>()
-                    .sqrt();
-                let scale = if norm > 0.0 { (1.0 / norm) as f32 } else { 0.0 };
-                row.iter_mut().for_each(|x| *x *= scale);
+                normalize(&mut row)?;
                 out[i] = row;
             }
         }
@@ -202,8 +284,41 @@ mod tests {
 
     #[test]
     fn missing_model_dir_is_an_error() {
-        let e = CandleEmbedder::load(Path::new("/nonexistent/tessar-model"), &Options::default())
-            .unwrap_err();
+        let e = CandleEmbedder::load("/nonexistent/tessar-model", &Options::default()).unwrap_err();
         assert!(e.0.starts_with("candle:"), "{e}");
+    }
+
+    #[test]
+    fn plan_respects_batch_and_token_budget() {
+        let lens = [10, 10, 10, 10, 50, 50, 300];
+        let order: Vec<usize> = (0..lens.len()).collect();
+        let sizes = |batch, context| -> Vec<usize> {
+            plan(&order, &lens, batch, context)
+                .iter()
+                .map(|c| c.len())
+                .collect()
+        };
+        assert_eq!(sizes(8, 1000), vec![6, 1]);
+        assert_eq!(sizes(2, 1000), vec![2, 2, 2, 1]);
+        // 4 x 10 fits in 40 tokens; 2 x 50 does not fit in 60.
+        assert_eq!(sizes(8, 60), vec![4, 1, 1, 1]);
+    }
+
+    #[test]
+    fn normalize_scales_to_unit_length() {
+        let mut row = [3.0f32, 4.0];
+        normalize(&mut row).unwrap();
+        assert!((row[0] - 0.6).abs() < 1e-6 && (row[1] - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn normalize_keeps_zero_and_rejects_non_finite() {
+        let mut zero = [0.0f32; 3];
+        normalize(&mut zero).unwrap();
+        assert_eq!(zero, [0.0; 3]);
+        let mut nan = [1.0f32, f32::NAN];
+        assert!(normalize(&mut nan).is_err());
+        let mut inf = [1.0f32, f32::INFINITY];
+        assert!(normalize(&mut inf).is_err());
     }
 }

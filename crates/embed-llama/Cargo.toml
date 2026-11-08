@@ -21,6 +21,10 @@ serde_json.workspace = true
 tempfile.workspace = true
 ureq.workspace = true
 
+# The candle-vs-llama.cpp comparison (tests/candle_compare.rs).
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+tessar-embed-candle = { workspace = true, features = ["metal"] }
+
 # The workspace forbids unsafe code, and `forbid` cannot be lifted locally.
 # The cxx bridge expands to `unsafe` items and the handle needs one
 # `unsafe impl Send`, so this crate denies unsafe code instead and allows

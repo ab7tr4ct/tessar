@@ -19,8 +19,5 @@ tokenizers.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
-[dev-dependencies]
-tessar-embed-llama.workspace = true
-
-[lints.rust]
-unsafe_code = "forbid"
+[lints]
+workspace = true

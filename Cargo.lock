@@ -230,7 +230,7 @@ dependencies = [
  "rayon",
  "safetensors",
  "thiserror 2.0.21",
- "tokenizers 0.23.2",
+ "tokenizers",
  "yoke",
  "zerocopy",
  "zip",
@@ -814,17 +814,6 @@ name = "esaxx-rs"
 version = "0.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d817e038c30374a4bcb22f94d0a8a0e216958d4c3dcde369b1439fec4bdda6e6"
-
-[[package]]
-name = "fancy-regex"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6e24cb5a94bcae1e5408b0effca5cd7172ea3c5755049c5f3af4cd283a165298"
-dependencies = [
- "bit-set 0.8.0",
- "regex-automata",
- "regex-syntax",
-]
 
 [[package]]
 name = "fancy-regex"
@@ -2422,8 +2411,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tessar-core",
- "tessar-embed-llama",
- "tokenizers 0.22.2",
+ "tokenizers",
 ]
 
 [[package]]
@@ -2437,6 +2425,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tessar-core",
+ "tessar-embed-candle",
  "ureq",
 ]
 
@@ -2550,39 +2539,6 @@ dependencies = [
 
 [[package]]
 name = "tokenizers"
-version = "0.22.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b238e22d44a15349529690fb07bd645cf58149a1b1e44d6cb5bd1641ff1a6223"
-dependencies = [
- "ahash",
- "aho-corasick",
- "compact_str",
- "dary_heap",
- "derive_builder",
- "esaxx-rs",
- "fancy-regex 0.14.0",
- "getrandom 0.3.4",
- "itertools",
- "log",
- "macro_rules_attribute",
- "monostate",
- "paste",
- "rand 0.9.5",
- "rayon",
- "rayon-cond",
- "regex",
- "regex-syntax",
- "serde",
- "serde_json",
- "spm_precompiled",
- "thiserror 2.0.21",
- "unicode-normalization-alignments",
- "unicode-segmentation",
- "unicode_categories",
-]
-
-[[package]]
-name = "tokenizers"
 version = "0.23.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7afbf6e88718afcc138bad01d6ccc3051dbbc3b2ce9793d8b8a3aeb610969cfc"
@@ -2593,7 +2549,7 @@ dependencies = [
  "dary_heap",
  "derive_builder",
  "esaxx-rs",
- "fancy-regex 0.17.0",
+ "fancy-regex",
  "getrandom 0.3.4",
  "itertools",
  "log",

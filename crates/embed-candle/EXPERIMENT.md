@@ -55,7 +55,7 @@ normalization in f64, vectors of 2048 floats. `tokenizers` is built with
 read, not mmap, to keep `unsafe` out. Texts are length-sorted inside a call to
 cut padding. Features: `metal` (`candle-core/metal`), `accelerate`.
 
-Comparison harness: `tests/compare.rs` (ignored, GPU). 100 generated
+Comparison harness: `crates/embed-llama/tests/candle_compare.rs` (ignored, GPU). 100 generated
 bilingual texts (50 en + 50 ru, about 15-25 words), same Voyage prompts for both
 adapters, llama.cpp with context 2048 and batch 64, `n_gpu_layers` all. 5 warm-up
 calls before timing, 100 timed single queries, 10 timed batches of 64 documents
@@ -63,7 +63,7 @@ calls before timing, 100 timed single queries, 10 timed batches of 64 documents
 for llama.cpp. `tests/profile.rs`: Metal kernel micro-benchmark.
 
 ```sh
-cargo test -p tessar-embed-candle --release --features metal --test compare -- --ignored --nocapture
+cargo test -p tessar-embed-llama --release --test candle_compare -- --ignored --nocapture
 ```
 
 ## Results
@@ -204,5 +204,5 @@ or as the fast path until the bulk gap closes. Concretely:
    (c) a macOS-only adapter on `mlx-rs` (Apple's MLX, usually faster on Apple
    silicon, but C++ underneath so it loses the main point), with candle (or
    ONNX) elsewhere.
-3. Keep `tests/compare.rs` as the gate: cosine >= 0.999 mean to the
+3. Keep `crates/embed-llama/tests/candle_compare.rs` as the gate: cosine >= 0.999 mean to the
    llama.cpp adapter on the same texts.
