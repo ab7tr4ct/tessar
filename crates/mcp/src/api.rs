@@ -50,6 +50,8 @@ pub struct Tessar {
     clock: Arc<dyn Clock>,
     user: SpaceId,
     project: SpaceId,
+    /// The key of the project entity: the project space's name.
+    project_key: Key,
     user_kinds: HashMap<String, EntityKindId>,
     project_kinds: HashMap<String, EntityKindId>,
 }
@@ -86,6 +88,8 @@ impl Tessar {
         let project_kinds = define_kinds(project)?;
 
         mem.create_entity(user_kinds["person"], key("user")?)?;
+        let project_key = key(&project_key)?;
+        mem.create_entity(project_kinds["project"], project_key.clone())?;
         for draft in vocab::starter() {
             let name = draft.name.as_str().to_owned();
             match mem.define_predicate_unchecked(user, draft) {
@@ -101,6 +105,7 @@ impl Tessar {
             clock,
             user,
             project,
+            project_key,
             user_kinds,
             project_kinds,
         })
@@ -323,10 +328,23 @@ impl Tessar {
             .filter_map(|e| ok(&mut problems, self.resolve(e, space)))
             .collect();
 
+        let subject_ref = f
+            .subject
+            .as_ref()
+            .and_then(|s| ok(&mut problems, self.resolve(s, space)));
+        // The fact is about the person (user space) or the project (project
+        // space) even when the agent does not say so.
+        let own = self.own_entity(space);
+        if subject_ref.as_ref() != Some(&own) && !mentions.contains(&own) {
+            mentions.push(own);
+        }
+
         let body = match f.kind {
             FactKind::Statement => {
-                if let Some(subject) = &f.subject {
-                    mentions.extend(ok(&mut problems, self.resolve(subject, space)));
+                if let Some(r) = subject_ref
+                    && !mentions.contains(&r)
+                {
+                    mentions.push(r);
                 }
                 match &text {
                     Some(text) => Some(PendingBody::Ready(BodyDraft::Statement {
@@ -337,9 +355,8 @@ impl Tessar {
                 }
             }
             FactKind::Event => {
-                if let Some(subject) = &f.subject
-                    && let Some(r) = ok(&mut problems, self.resolve(subject, space))
-                {
+                if let Some(r) = subject_ref {
+                    mentions.retain(|m| m != &r);
                     mentions.insert(0, r);
                 }
                 match (&text, when) {
@@ -357,7 +374,7 @@ impl Tessar {
             }
             FactKind::Attribute => {
                 let subject = match &f.subject {
-                    Some(s) => ok(&mut problems, self.resolve(s, space)),
+                    Some(_) => subject_ref,
                     None => ok(
                         &mut problems,
                         Err("an attribute needs `subject`".to_owned()),
@@ -577,6 +594,21 @@ impl Tessar {
         };
         let kind = self.kind_id(space, &e.kind)?;
         Ok(EntityRef::Key { kind, key })
+    }
+
+    /// The entity facts of `space` are about by default: `user` in the user
+    /// space, the project in the project space.
+    fn own_entity(&self, space: Space) -> EntityRef {
+        match space {
+            Space::User => EntityRef::Key {
+                kind: self.user_kinds["person"],
+                key: Key::new("user").expect("`user` is a valid key"),
+            },
+            Space::Project => EntityRef::Key {
+                kind: self.project_kinds["project"],
+                key: self.project_key.clone(),
+            },
+        }
     }
 
     /// Whether the entity already exists in `space`.

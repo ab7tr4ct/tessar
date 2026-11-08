@@ -622,3 +622,68 @@ fn an_existing_entity_is_found_before_a_new_one_is_made() {
         "{list}"
     );
 }
+
+#[test]
+fn a_user_statement_appears_in_about_user() {
+    let f = fixture();
+    remember(
+        &f,
+        json!({"space": "user", "facts": [{
+            "kind": "statement", "text": "User dislikes long meetings"}]}),
+    )
+    .unwrap();
+    let list = about(&f, json!({"entity": user()})).unwrap();
+    assert!(list.contains("User dislikes long meetings"), "{list}");
+}
+
+#[test]
+fn a_project_statement_appears_in_about_the_project() {
+    let f = fixture();
+    remember(
+        &f,
+        json!({"facts": [{
+            "kind": "statement", "text": "The journal is append-only"}]}),
+    )
+    .unwrap();
+    let list = about(&f, json!({"entity": {"key": "tessar", "kind": "project"}})).unwrap();
+    assert!(list.contains("The journal is append-only"), "{list}");
+    assert!(list.contains("in space `tessar`"), "{list}");
+}
+
+#[test]
+fn a_user_attribute_in_the_project_space_appears_in_both() {
+    let f = fixture();
+    remember(
+        &f,
+        json!({"facts": [{
+            "kind": "attribute", "subject": user(), "predicate": "prefers",
+            "value": "tabs", "text": "User prefers tabs in this repository"}]}),
+    )
+    .unwrap();
+    let of_user = about(&f, json!({"entity": user()})).unwrap();
+    assert!(of_user.contains("User prefers tabs"), "{of_user}");
+    let of_project = about(&f, json!({"entity": {"key": "tessar", "kind": "project"}})).unwrap();
+    assert!(of_project.contains("User prefers tabs"), "{of_project}");
+}
+
+#[test]
+fn an_explicit_mention_is_not_duplicated() {
+    let f = fixture();
+    remember(
+        &f,
+        json!({"space": "user", "facts": [{
+            "kind": "statement", "text": "User likes tea",
+            "mentions": [user()]}]}),
+    )
+    .unwrap();
+    let list = about(&f, json!({"entity": user()})).unwrap();
+    assert!(list.contains("1 fact(s)"), "{list}");
+    let user_space = f.mem.space_named("user").unwrap().id;
+    let person = f.mem.kind_named(user_space, "person").unwrap();
+    let entity = f.mem.find_entity(user_space, person, "user").unwrap();
+    let facts = f
+        .mem
+        .facts_about(entity.id, tessar_core::store::View::Current);
+    assert_eq!(facts.len(), 1);
+    assert_eq!(facts[0].mentions, vec![entity.id]);
+}

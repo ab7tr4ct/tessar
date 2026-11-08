@@ -29,7 +29,9 @@ SPACES. `user` holds facts about the person you work for (preferences, plans, ha
 they live, what they own); they hold in every project. `project` (the default) holds facts \
 about the current repository: decisions, conventions, architecture, deadlines. The person is \
 the entity {key: \"user\", kind: \"person\"}; it lives in the user space and resolves there \
-even when you write to the project space.
+even when you write to the project space. `mentions` lists other entities a fact is about; \
+facts automatically mention the person (user space) or the project (project space), so `about` \
+finds them.
 
 FACT KINDS. `statement`: one free-form sentence, for decisions and notes. `attribute`: a \
 property of an entity that can change (subject + predicate + value), such as where the user \

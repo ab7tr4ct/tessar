@@ -55,6 +55,10 @@ exits with status 1.
 | `vocabulary` | Lists the predicates with `single` or `many` cardinality, descriptions and synonyms. |
 | `about`      | Lists the facts about one entity, oldest first; `history: true` includes replaced versions. |
 
+Every fact also mentions the person (`user` space) or the project entity
+(project space), unless it is already its subject or mentioned, so `about`
+finds statements that name no entity. Explicit `mentions` are kept.
+
 The vocabulary at startup is part of the `remember` tool description, so the
 agent sees it without a call. The tool descriptions are the agent's manual:
 they explain spaces, fact kinds and predicate rules.
