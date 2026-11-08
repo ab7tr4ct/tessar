@@ -100,31 +100,15 @@ variables, are in [`crates/mcp/README.md`](crates/mcp/README.md).
 
 ## Using the core as a library
 
+The flow in a few lines; the complete, compiled version is
+[`crates/mcp/examples/library.rs`](crates/mcp/examples/library.rs)
+(`cargo run --release -p tessar-mcp --example library`).
+
 ```rust
-use std::sync::Arc;
-use tessar_core::clock::SystemClock;
-use tessar_core::model::{Cardinality, Key, Name, Origin, SpaceKind, Value, ValueType};
-use tessar_core::store::{
-    BodyDraft, EntityRef, FactDraft, Memory, ObjectDraft, Op, PredicateDraft, Recall, Remember,
-    Semantic,
-};
-
-let journal = tessar_journal::FileJournal::<Op>::open("journal.jsonl")?;
-let embedder = Arc::new(tessar_embed_llama::LlamaEmbedder::voyage_nano("voyage-4-nano-Q8_0.gguf")?);
-let memory = Memory::open_with(
-    journal,
-    Arc::new(SystemClock),
-    Semantic { embedder, dims: 1024, near_bonus: 0.05, predicate_threshold: 0.70 },
-)?;
-
+let memory = Memory::open_with(journal, Arc::new(SystemClock), semantic)?;
 let space = memory.create_space(Key::new("notes")?, SpaceKind::LongTerm, None)?;
 let person = memory.define_kind(space, Name::new("person")?)?;
-let lives_in = memory.define_predicate_unchecked(space, PredicateDraft {
-    name: Name::new("lives_in")?,
-    description: "the place where the subject lives".into(),
-    object: ValueType::Text,
-    cardinality: Cardinality::Single,
-})?;
+let lives_in = memory.define_predicate_unchecked(space, PredicateDraft { /* lives_in, Single */ })?;
 
 memory.remember(Remember {
     space,
@@ -139,9 +123,7 @@ memory.remember(Remember {
     })],
 })?;
 
-for hit in memory.recall(&Recall::new("where does Anna live?")).hits {
-    println!("{:?} because {:?}", hit.fact.body, hit.why);
-}
+let found = memory.recall(&Recall::new("where does Anna live?"));
 ```
 
 Writing "Anna lives in Munich" later supersedes the Berlin version;
@@ -177,4 +159,4 @@ day one; no feature without a measurement.
 
 ## License
 
-MIT or Apache-2.0, at your option.
+MIT, see [LICENSE](LICENSE).
