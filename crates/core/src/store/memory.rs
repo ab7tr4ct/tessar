@@ -489,6 +489,10 @@ impl Memory {
 
     /// The current values of a (subject, predicate) pair; a synonym gives
     /// the values of its canonical predicate.
+    ///
+    /// A single-valued pair with an asserted and an inferred current value
+    /// is a conflict ([`Outcome::Conflicting`](super::Outcome)): the
+    /// inferred one never replaced the asserted one.
     pub fn values_of(&self, subject: EntityId, predicate: PredicateId) -> Vec<Fact> {
         let state = self.state();
         let predicate = state.canonical(predicate);

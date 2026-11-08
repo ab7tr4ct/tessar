@@ -249,6 +249,13 @@ impl<'s> Planner<'s> {
     /// [`Outcome::Unchanged`]. A pair with no current head continues its
     /// latest lineage.
     ///
+    /// An [`Origin::Inferred`] write never replaces an [`Origin::Asserted`]
+    /// current value. If it differs from one, it continues a current
+    /// inferred head if there is one (closing only that), and otherwise
+    /// starts a lineage of its own beside the asserted value
+    /// ([`Outcome::Conflicting`]). An asserted write closes all current
+    /// heads as above.
+    ///
     /// A write with the same value and another `text` is
     /// [`Outcome::Unchanged`] and does not store the new text (see
     /// [`FactBody::same_content`]).
@@ -263,6 +270,7 @@ impl<'s> Planner<'s> {
         let body = self.body(draft.body)?;
         let mentions = self.resolve_all(&draft.mentions)?;
         let valid_from = draft.valid_from.unwrap_or(self.at);
+        let mut outcome = Outcome::Created;
 
         if let FactBody::Triple {
             subject, predicate, ..
@@ -320,28 +328,84 @@ impl<'s> Planner<'s> {
                                 outcome: Outcome::Unchanged,
                             });
                         }
-                        if let Some(late) = current.iter().find(|h| valid_from < h.valid_from) {
+                        if matches!(origin, Origin::Inferred { .. }) {
+                            let asserted = current
+                                .iter()
+                                .copied()
+                                .filter(|h| matches!(h.origin, Origin::Asserted { .. }))
+                                .max_by_key(|h| (h.recorded_at, h.id));
+                            if let Some(asserted) = asserted {
+                                // An inferred value never replaces an
+                                // asserted one. It continues an inferred
+                                // current head beside it, or else starts
+                                // a lineage of its own.
+                                let inferred = current
+                                    .iter()
+                                    .copied()
+                                    .filter(|h| matches!(h.origin, Origin::Inferred { .. }))
+                                    .max_by_key(|h| (h.recorded_at, h.id));
+                                match inferred {
+                                    Some(prev) => {
+                                        if valid_from < prev.valid_from {
+                                            return Err(StoreError::ChangeBeforeValid {
+                                                at: valid_from,
+                                                valid_from: prev.valid_from,
+                                            });
+                                        }
+                                        let id = self.push_version(
+                                            prev, space, body, mentions, episode, origin,
+                                            valid_from,
+                                        )?;
+                                        self.close(
+                                            prev.id,
+                                            Ending::Changed {
+                                                valid_to: valid_from,
+                                            },
+                                            Some(id),
+                                        );
+                                        return Ok(Recorded {
+                                            fact: id,
+                                            outcome: Outcome::Superseded { previous: prev.id },
+                                        });
+                                    }
+                                    None => {
+                                        outcome = Outcome::Conflicting {
+                                            current: asserted.id,
+                                        };
+                                    }
+                                }
+                            }
+                        }
+                        if matches!(outcome, Outcome::Conflicting { .. }) {
+                            // Falls through to a new lineage below.
+                        } else if let Some(late) =
+                            current.iter().find(|h| valid_from < h.valid_from)
+                        {
                             return Err(StoreError::ChangeBeforeValid {
                                 at: valid_from,
                                 valid_from: late.valid_from,
                             });
                         }
-                        let id = self.push_version(
-                            head, space, body, mentions, episode, origin, valid_from,
-                        )?;
-                        let ending = Ending::Changed {
-                            valid_to: valid_from,
-                        };
-                        for other in current.iter().filter(|h| h.id != head.id) {
-                            self.close(other.id, ending, None);
+                        if !matches!(outcome, Outcome::Conflicting { .. }) {
+                            let id = self.push_version(
+                                head, space, body, mentions, episode, origin, valid_from,
+                            )?;
+                            let ending = Ending::Changed {
+                                valid_to: valid_from,
+                            };
+                            for other in current.iter().filter(|h| h.id != head.id) {
+                                self.close(other.id, ending, None);
+                            }
+                            self.close(head.id, ending, Some(id));
+                            return Ok(Recorded {
+                                fact: id,
+                                outcome: Outcome::Superseded { previous: head.id },
+                            });
                         }
-                        self.close(head.id, ending, Some(id));
-                        return Ok(Recorded {
-                            fact: id,
-                            outcome: Outcome::Superseded { previous: head.id },
-                        });
                     }
-                    check_expected(draft.expected_version, None, None)?;
+                    if !matches!(outcome, Outcome::Conflicting { .. }) {
+                        check_expected(draft.expected_version, None, None)?;
+                    }
                 }
                 Cardinality::Many => {
                     let same = lineages
@@ -373,10 +437,7 @@ impl<'s> Planner<'s> {
             valid_from,
             end: None,
         }));
-        Ok(Recorded {
-            fact: id,
-            outcome: Outcome::Created,
-        })
+        Ok(Recorded { fact: id, outcome })
     }
 
     fn add_episode(
