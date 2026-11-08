@@ -8,7 +8,8 @@ reads them back across conversations and projects. The core keeps every
 version of every fact in an append-only journal, answers "what is true
 now" and "what was true on that date", finds facts by the entities,
 words and meaning of a question, and explains every hit. Embeddings come
-from `voyage-4-nano` running in the same process through llama.cpp.
+from `voyage-4-nano` running in the same process (pure Rust on candle by
+default, or llama.cpp).
 Nothing leaves the machine.
 
 Status: version 0.1. The core and the MCP server work end to end on macOS
@@ -76,18 +77,19 @@ not published yet.
 
 ## Quick start
 
-Prerequisites: a recent stable Rust (edition 2024), `cmake` and a C++
-toolchain (Xcode Command Line Tools on macOS). The build compiles
-llama.cpp from the submodule once; it takes a few minutes.
+Prerequisites: a recent stable Rust (edition 2024). No C++ toolchain is
+needed for the default build, which embeds with candle (Metal on macOS,
+CPU elsewhere).
 
 ```sh
 git clone https://github.com/ab7tr4ct/tessar.git && cd tessar
-scripts/setup.sh                      # llama.cpp submodule, sparse checkout
 cargo build --release -p tessar-mcp   # the `tessar` binary
 
-mkdir -p ~/.tessar/models
+mkdir -p ~/.tessar/models/voyage-4-nano
 curl -L -o ~/.tessar/models/voyage-4-nano-Q8_0.gguf \
   https://huggingface.co/MongoDB/voyage-4-nano-GGUF/resolve/main/voyage-4-nano-Q8_0.gguf
+curl -L -o ~/.tessar/models/voyage-4-nano/tokenizer.json \
+  https://huggingface.co/voyageai/voyage-4-nano/resolve/main/tokenizer.json
 
 claude mcp add tessar -- "$PWD/target/release/tessar" mcp
 ```
@@ -97,6 +99,15 @@ Claude Code then has four tools: `remember`, `recall`, `vocabulary` and
 `~/.tessar/journal.jsonl`; the project space is named after the
 repository's `origin`. Details, including `.mcp.json` and environment
 variables, are in [`crates/mcp/README.md`](crates/mcp/README.md).
+
+To embed with llama.cpp instead, install `cmake` and a C++ toolchain (Xcode
+Command Line Tools on macOS), run `scripts/setup.sh` (the submodule, a few
+minutes to compile) and build with
+`cargo build --release -p tessar-mcp --no-default-features --features llama`;
+`TESSAR_EMBEDDER=candle|llama` picks the embedder at run time when both are
+built. The candle CPU path on Linux is not measured yet, so llama.cpp stays
+available through the feature. `TESSAR_MODEL` and `TESSAR_TOKENIZER` point to
+the model and tokenizer files if they live elsewhere.
 
 ## Using the core as a library
 
@@ -136,10 +147,11 @@ Writing "Anna lives in Munich" later supersedes the Berlin version;
 |---|---|
 | `crates/core` | data model, store, recall, ports (`Log`, `Clock`, `Embedder`). No I/O, no network, no LLM. |
 | `crates/journal` | the file journal: JSON Lines, CRC-32 per line, `fsync`, torn-write recovery, file lock. |
-| `crates/embed-llama` | in-process embedder: a small C++ shim over llama.cpp bridged with `cxx`; Metal on macOS, CPU elsewhere. |
+| `crates/embed-candle` | default in-process embedder: pure Rust on candle, GGUF Q8; Metal on macOS, CPU elsewhere. |
+| `crates/embed-llama` | optional in-process embedder (cargo feature `llama`): a small C++ shim over llama.cpp bridged with `cxx`; needs cmake. |
 | `crates/embed` | HTTP embedder for `llama-server` and embedding APIs. |
 | `crates/mcp` | the `tessar` binary: an MCP server on stdio. |
-| `third_party/llama.cpp` | git submodule (release b12189); `scripts/setup.sh` checks out only the parts the build needs. |
+| `third_party/llama.cpp` | git submodule (release b12189); `scripts/setup.sh` checks out only the parts the build needs (only for the `llama` feature). |
 
 Principles: the core has no LLM and is deterministic; nothing is deleted;
 exact keys come before vectors; every result is explainable; spaces from

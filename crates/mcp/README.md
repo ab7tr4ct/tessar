@@ -6,19 +6,26 @@ Claude Code can remember facts between conversations and recall them later.
 
 The memory is deterministic and local: typed facts with validity periods and
 version history in an append-only journal, recalled by entity, words and
-meaning (voyage-4-nano running in-process through llama.cpp). No LLM and no
+meaning (voyage-4-nano running in-process, on candle or llama.cpp). No LLM and no
 network are involved.
 
 ## Build
 
 ```sh
-scripts/setup.sh                        # llama.cpp submodule, sparse checkout
-cargo build --release -p tessar-mcp     # needs cmake and a C++ toolchain
+cargo build --release -p tessar-mcp     # candle embedder, pure Rust
 ```
+
+For llama.cpp instead, run `scripts/setup.sh` (submodule) and build with
+`--no-default-features --features llama` (needs cmake and a C++ toolchain).
+`TESSAR_EMBEDDER=candle|llama` picks the embedder at run time; the default
+is candle if compiled in. The daemon log names the one in use.
 
 The binary is `target/release/tessar`. It needs the embedding model at
 `~/.tessar/models/voyage-4-nano-Q8_0.gguf` (or `$TESSAR_HOME/models/…`, or
-the file named by `TESSAR_MODEL`). If the model is missing, the server says
+the file named by `TESSAR_MODEL`). The candle embedder also needs
+`tokenizer.json` from the `voyageai/voyage-4-nano` repository at
+`~/.tessar/models/voyage-4-nano/tokenizer.json` (or the file named by
+`TESSAR_TOKENIZER`). If the model is missing, the server says
 where it expected it and exits with status 1.
 
 ## Add to Claude Code
