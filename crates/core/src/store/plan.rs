@@ -209,6 +209,14 @@ impl<'s> Planner<'s> {
     /// supersedes the current version written to another one, and the new
     /// version lies in `space`.
     ///
+    /// After a merge a single-valued pair may have several current values
+    /// (one per lineage). The next write resolves the contradiction: the
+    /// head recorded last (ties: the highest id) continues with the new
+    /// version, and the other current heads are closed as changed at the
+    /// same moment, with no successor. A value equal to any current head is
+    /// [`Outcome::Unchanged`]. A pair with no current head continues its
+    /// latest lineage.
+    ///
     /// A write with the same value and another `text` is
     /// [`Outcome::Unchanged`] and does not store the new text (see
     /// [`FactBody::same_content`]).
@@ -238,14 +246,26 @@ impl<'s> Planner<'s> {
                     if !self.single_pairs.insert((subject, predicate)) {
                         return Err(StoreError::DuplicatePair { subject, predicate });
                     }
-                    // A single-valued pair has at most one lineage: new
-                    // values become its new versions.
-                    if let Some(&lineage) = lineages.first() {
-                        let head = state.head(lineage).ok_or_else(|| {
-                            StoreError::Internal(format!("{lineage} has no head"))
-                        })?;
-                        if !head.is_current() {
-                            check_expected(draft.expected_version, Some(lineage), None)?;
+                    // Normally a single-valued pair has one lineage and the
+                    // new value becomes its next version. After a merge it
+                    // may have several current heads; this write resolves
+                    // them (see the method docs).
+                    let heads: Vec<&Fact> = lineages
+                        .iter()
+                        .map(|&l| {
+                            state
+                                .head(l)
+                                .ok_or_else(|| StoreError::Internal(format!("{l} has no head")))
+                        })
+                        .collect::<Result<_, _>>()?;
+                    let current: Vec<&Fact> =
+                        heads.iter().copied().filter(|h| h.is_current()).collect();
+                    let latest = |facts: &[&'s Fact]| {
+                        facts.iter().copied().max_by_key(|h| (h.recorded_at, h.id))
+                    };
+                    if current.is_empty() {
+                        if let Some(head) = latest(&heads) {
+                            check_expected(draft.expected_version, Some(head.lineage), None)?;
                             let id = self.push_version(
                                 head, space, body, mentions, episode, origin, valid_from,
                             )?;
@@ -254,29 +274,36 @@ impl<'s> Planner<'s> {
                                 outcome: Outcome::Created,
                             });
                         }
-                        check_expected(draft.expected_version, Some(lineage), Some(head.version))?;
-                        if self.same_content(&head.body, &body) {
+                    } else if let Some(head) = latest(&current) {
+                        check_expected(
+                            draft.expected_version,
+                            Some(head.lineage),
+                            Some(head.version),
+                        )?;
+                        if let Some(same) =
+                            current.iter().find(|h| self.same_content(&h.body, &body))
+                        {
                             return Ok(Recorded {
-                                fact: head.id,
+                                fact: same.id,
                                 outcome: Outcome::Unchanged,
                             });
                         }
-                        if valid_from < head.valid_from {
+                        if let Some(late) = current.iter().find(|h| valid_from < h.valid_from) {
                             return Err(StoreError::ChangeBeforeValid {
                                 at: valid_from,
-                                valid_from: head.valid_from,
+                                valid_from: late.valid_from,
                             });
                         }
                         let id = self.push_version(
                             head, space, body, mentions, episode, origin, valid_from,
                         )?;
-                        self.close(
-                            head.id,
-                            Ending::Changed {
-                                valid_to: valid_from,
-                            },
-                            Some(id),
-                        );
+                        let ending = Ending::Changed {
+                            valid_to: valid_from,
+                        };
+                        for other in current.iter().filter(|h| h.id != head.id) {
+                            self.close(other.id, ending, None);
+                        }
+                        self.close(head.id, ending, Some(id));
                         return Ok(Recorded {
                             fact: id,
                             outcome: Outcome::Superseded { previous: head.id },

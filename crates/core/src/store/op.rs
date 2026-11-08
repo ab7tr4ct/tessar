@@ -25,6 +25,10 @@ pub enum Op {
     /// with `from` resolve to `into`, and the two count as one predicate
     /// for the replacement rule. Facts already written with `from` keep
     /// it. Both must have the same value type and cardinality.
+    ///
+    /// Merging leaves existing values untouched, so a single-valued pair
+    /// can end up with several current values. The next write to that pair
+    /// closes them all (see `Memory::remember`).
     MergePredicate {
         /// The predicate that becomes a synonym.
         from: PredicateId,

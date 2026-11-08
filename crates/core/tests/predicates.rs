@@ -835,3 +835,46 @@ fn bodies_compare_by_canonical_predicate() {
         replaced.outcome
     );
 }
+
+#[test]
+fn next_write_closes_every_current_head_after_a_merge() {
+    let w = World::new();
+    let p1 = single_text(&w, "aim");
+    let p2 = single_text(&w, "target");
+    let x = w.remember_one(set(&w, "anna", p1, "x"));
+    w.clock.set(ts(200));
+    let y = w.remember_one(set(&w, "anna", p2, "y"));
+    w.memory.merge_predicates(p1, p2).unwrap();
+    let anna = w.entity(w.person, "anna");
+    assert_eq!(w.memory.values_of(anna, p2).len(), 2);
+
+    // The same value as one of the current heads is not a change.
+    w.clock.set(ts(300));
+    let again = w.remember_one(set(&w, "anna", p2, "y"));
+    assert_eq!(again.outcome, Outcome::Unchanged);
+    assert_eq!(again.fact, y.fact);
+    assert_eq!(w.memory.values_of(anna, p2).len(), 2);
+
+    let z = w.remember_one(set(&w, "anna", p2, "z"));
+    assert_eq!(z.outcome, Outcome::Superseded { previous: y.fact });
+    let now = w.memory.values_of(anna, p2);
+    assert_eq!(now.len(), 1);
+    assert_eq!(now[0].id, z.fact);
+
+    // The newer-recorded head continues; the other one just stops.
+    let end_y = w.fact(y).end.unwrap();
+    let end_x = w.fact(x).end.unwrap();
+    assert_eq!(end_y.next, Some(z.fact));
+    assert_eq!(end_x.next, None);
+    assert!(matches!(
+        end_x.ending,
+        tessar_core::model::Ending::Changed { .. }
+    ));
+    let history: Vec<_> = w
+        .memory
+        .history(w.fact(z).lineage)
+        .iter()
+        .map(|f| f.id)
+        .collect();
+    assert_eq!(history, [y.fact, z.fact]);
+}

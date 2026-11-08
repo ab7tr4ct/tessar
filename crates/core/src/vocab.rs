@@ -6,6 +6,8 @@
 //! (the starter names are universal by construction, and they should not be
 //! rejected for resembling each other) and shows it to the agent in the
 //! description of its `remember` tool.
+//! A predicate is many-valued unless declared single: `Single` is only for
+//! relations where a new value always replaces the old one.
 //! Predicates here are universal: they name a relation, never the thing
 //! related (`trip_destination`, not `plans_trip_to_japan`). Values are text,
 //! as an LLM writer produces them.
@@ -63,7 +65,7 @@ pub fn starter() -> Vec<PredicateDraft> {
         (
             "currently_reading",
             "the book the subject is reading now",
-            Single,
+            Many,
         ),
         (
             "health_condition",
