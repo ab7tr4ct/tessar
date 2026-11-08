@@ -65,10 +65,12 @@ they explain spaces, fact kinds and predicate rules.
   the whole memory; vectors are recomputed on start.
 - Two spaces. `user` holds facts about the person and the entity `user`
   (kind `person`), plus the predicate vocabulary shared by every project. The
-  **project space** is named after the repository: the name of the main
-  checkout (the parent of `git rev-parse --git-common-dir`, so all worktrees
-  of a repository share one space), lowercased. Outside a git repository the
-  basename of the server's working directory is used instead.
+  **project space** is named after the repository: the last path component
+  of `git remote get-url origin` without `.git`, lowercased (so a second clone
+  shares the space; `https://…/owner/repo.git` and `git@host:owner/repo.git`
+  both give `repo`). Without an origin it is the name of the main checkout
+  (the parent of `git rev-parse --git-common-dir`, so worktrees agree), and
+  outside git the basename of the server's working directory.
   Claude Code starts MCP servers in the project directory. `recall` searches
   all spaces by default, including other repositories; each hit shows its
   space.
