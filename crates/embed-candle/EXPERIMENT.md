@@ -329,3 +329,51 @@ than batch 8): **defaults kept**. The best cell (16, 122 texts/s) equals batch 8
 larger batches are slower. Padding is not the cost (2% waste at batch 8); larger
 passes get slower per text (not diagnosed further; plausibly the Q8 matmul is already
 saturated at 8 x ~35 = 280 rows and attention and element-wise kernels scale worse than linearly).
+
+## E15c: two custom Metal kernels
+
+Criteria, fixed before any timing (`.notes/research/2026-11-09-e15c-criteria.md`): cosine
+min >= 0.9999, query p50 <= 12.0 ms and p95 <= 13.2 ms, bulk >= 121 texts/s, dispatches
+per layer <= 17. Raw rows: `evals/runs/e15c/kernels.md`.
+
+What was built (`src/ops.rs`, `src/kernels/*.metal`, commented as a lesson):
+
+- K1 `swiglu`: `silu(gate) * up` in one kernel (was 2 launches).
+- K2 `add_rmsnorm`: residual add and the following RMSNorm in one kernel, one
+  threadgroup per row, reduction in f32 with `simd_sum`. It is used for
+  residual + ln2 inside a layer and for residual + next layer's ln1 (or the final
+  norm) across layers. Output is a stacked `[2, b, l, h]` with the *normalized* copy first.
+- Both are candle `CustomOp2`/`CustomOp3` with a safe-Rust `cpu_fwd` that is also the
+  unit-test reference (f32 within 1e-5, f16 within 1e-2 of the composed ops), and a
+  `metal_fwd` using only safe APIs of `candle-metal-kernels` (`new_library_with_source`,
+  `set_input_buffer`, `dispatch_thread_groups`). No `unsafe`, no candle fork. Other dtypes
+  fall back to the composed ops. `Options.kernels` switches them off.
+
+A candle 0.11.1 bug found on the way: `QMatMul` on Metal (matrix-matrix path) rebuilds a
+fresh layout and drops the start offset of its input, so a view into the middle of a
+buffer gives garbage (non-finite vectors). The first K2 layout put the residual at index 0
+and the normalized copy at index 1 and failed that way; the normalized copy (which feeds
+the matmuls) now sits at offset 0.
+
+| | composed ops (20 dispatches/layer) | kernels (17 dispatches/layer) | criterion |
+| --- | --- | --- | --- |
+| cosine min to llama.cpp | 1.00000 | 1.00000 | >= 0.9999 |
+| query p50, median of 9 / best clean | 12.3 | 11.9 / 11.7-11.8 | <= 12.0 |
+| query p95, median of 9 / best clean | 13.4-13.8 (4 runs) | 14.2 / 12.8-13.1 | <= 13.2 |
+| bulk texts/s | 118-123 | 126 (117-126) | >= 121 |
+| 64 docs p50 | 521-573 ms | 510-552 ms | |
+| max RSS | 676 MB | 675-677 MB | |
+| K1 alone, (6400, 3072) f32 | 3.37 ms | 1.67 ms | |
+| K2 alone, (6400, 1024) f32 | 1.63 ms | 0.88 ms | |
+
+Verdict (first session, shared GPU): not usable, runs were disturbed.
+
+Idle GPU re-run, 5 paired runs (kernels on / off), medians: query p50 12.1 / 12.4 ms,
+p95 13.9 / 14.3 ms, bulk 119 / 118 texts/s. By the criteria fixed in advance, on the
+medians with kernels on: p50 12.1 > 12.0, p95 13.9 > 13.2 and bulk 119 < 121 all
+**fail**; cosine (1.00000) and dispatches (17) pass. The kernels are only marginally
+better than the composed ops (about 0.3 ms on p50, 0.4 ms on p95, +1 text/s) and the
+machine itself was about 5% slower than in the first session (llama.cpp query
+10.6 / 11.7 ms against 10.1 / 10.6 ms). The rule says: record the numbers, delete the
+kernel code, keep the commit hash. The code has been removed from the tree; the kernels
+live in commit `1e77400` (sources in `src/kernels/`, ops in `src/ops.rs`).
