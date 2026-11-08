@@ -20,6 +20,7 @@ pub mod hook;
 pub mod lifecycle;
 pub mod project;
 pub mod proxy;
+pub mod purge;
 pub mod server;
 pub mod when;
 

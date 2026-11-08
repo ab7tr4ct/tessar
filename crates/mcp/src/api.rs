@@ -6,7 +6,7 @@
 //! text the agent reads. `Ok` is a result, `Err` is a tool error the agent
 //! should act on (nothing was written).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::sync::Arc;
 
@@ -44,6 +44,9 @@ const AGENT: &str = "claude-code";
 
 /// The most facts `recall` returns.
 const MAX_LIMIT: usize = 50;
+
+/// How a redacted fact reads.
+const REDACTED: &str = "[redacted]";
 
 /// A tool result: the text the agent reads, and the same hits as JSON
 /// (`{"hits": [...]}`) for programs such as the Claude Code hooks.
@@ -587,6 +590,15 @@ impl Tessar {
             StoreError::EmptyText => "a text field is empty".to_owned(),
             StoreError::Embed(e) => format!("the embedder failed ({e}); try again"),
             StoreError::SpaceArchived(_) => "the space is archived and read-only".to_owned(),
+            StoreError::UnknownFact(id) => format!("no fact {id}"),
+            StoreError::UnknownEpisode(id) => format!("no episode {id}"),
+            StoreError::AlreadyRedacted(id) => format!(
+                "{id} is already redacted; its content is gone from memory. \
+                 Run `tessar purge` to erase it from the journal file on disk"
+            ),
+            StoreError::EpisodeAlreadyRedacted(id) => {
+                format!("episode {id} is already redacted")
+            }
             other => other.to_string(),
         }
     }
@@ -668,6 +680,7 @@ impl Tessar {
         match body {
             FactBody::Triple { object, .. } => self.value_text(object),
             FactBody::Statement { text, .. } | FactBody::Event { text, .. } => text.clone(),
+            FactBody::Redacted => REDACTED.to_owned(),
         }
     }
 
@@ -687,6 +700,7 @@ impl Tessar {
     fn sentence(&self, fact: &Fact) -> String {
         match &fact.body {
             FactBody::Statement { text, .. } | FactBody::Event { text, .. } => text.clone(),
+            FactBody::Redacted => REDACTED.to_owned(),
             FactBody::Triple {
                 subject,
                 predicate,
@@ -737,7 +751,7 @@ impl Tessar {
                 .mem
                 .history(fact.lineage)
                 .iter()
-                .filter(|h| h.version < fact.version)
+                .filter(|h| h.version < fact.version && !h.is_redacted())
                 .rev()
                 .map(|h| format!("{} ({})", self.value_of(&h.body), when::ymd(h.recorded_at)))
                 .collect();
@@ -771,6 +785,7 @@ impl Tessar {
             FactBody::Statement { .. } => "statement",
             FactBody::Triple { .. } => "attribute",
             FactBody::Event { .. } => "event",
+            FactBody::Redacted => "redacted",
         };
         let mut channels = Vec::new();
         let mut similarity = None;
@@ -828,6 +843,20 @@ impl Tessar {
         let id = parse_handle(handle)
             .ok_or_else(|| format!("`fact` {handle:?} is not a handle: use the leading `fNN` of a line from `recall` or `about`, for example \"f12\""))?;
         let fact = self.mem.fact(id).ok_or_else(|| format!("no fact {id}"))?;
+        let clean = |s: &Option<String>| {
+            s.as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+        };
+        if args.reason == UpdateReason::Redact {
+            return self.redact(&fact, &args);
+        }
+        if fact.is_redacted() {
+            return Err(format!(
+                "{id} is redacted: its content was destroyed and it cannot be updated"
+            ));
+        }
         if fact.end.is_some() {
             return Err(match self.mem.current(fact.lineage) {
                 Some(current) => format!(
@@ -841,12 +870,6 @@ impl Tessar {
             });
         }
 
-        let clean = |s: &Option<String>| {
-            s.as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_owned)
-        };
         let (text, value, when_arg) = (clean(&args.text), clean(&args.value), clean(&args.when));
         let since = clean(&args.since);
         let reason = match (args.reason, since) {
@@ -858,6 +881,7 @@ impl Tessar {
                 }
             }
             (UpdateReason::Wrong, None) => Reason::Correction,
+            (UpdateReason::Redact, _) => unreachable!("redact returns before this"),
             (UpdateReason::Wrong, Some(_)) => {
                 return Err(
                     "`since` goes with reason \"changed\"; a \"wrong\" fact was never true, \
@@ -926,6 +950,43 @@ impl Tessar {
         })
     }
 
+    /// `update` with reason "redact": destroys the content of `fact`, a
+    /// current or an earlier version alike.
+    fn redact(&self, fact: &Fact, args: &UpdateArgs) -> Result<String, String> {
+        let given = [
+            ("text", &args.text),
+            ("value", &args.value),
+            ("when", &args.when),
+            ("since", &args.since),
+        ]
+        .into_iter()
+        .filter(|(_, v)| v.as_deref().is_some_and(|s| !s.trim().is_empty()))
+        .map(|(name, _)| format!("`{name}`"))
+        .collect::<Vec<_>>();
+        if !given.is_empty() {
+            return Err(format!(
+                "reason \"redact\" destroys the fact and takes only `fact`; remove {}. \
+                 To replace the content instead, use reason \"wrong\" with `text`",
+                given.join(", ")
+            ));
+        }
+        let id = fact.id;
+        self.mem
+            .redact(id)
+            .map_err(|e| format!("Nothing was changed. {}", self.store_message(&e)))?;
+        let mut out = format!(
+            "redacted: {id} (content removed from memory; run `tessar purge` to erase it from the \
+             journal file on disk)"
+        );
+        if let Some(episode) = fact.episode {
+            let _ = write!(
+                out,
+                ". The source text it was taken from ({episode}) is not removed by this call"
+            );
+        }
+        Ok(out)
+    }
+
     /// The mentions of a replacement: the old ones, plus the entity the
     /// space is about (the person or the project) unless the fact already
     /// names it. Facts of other repositories keep their mentions as they are.
@@ -975,6 +1036,9 @@ impl Tessar {
             ));
         }
         Ok(match &fact.body {
+            FactBody::Redacted => {
+                return Err(format!("{handle} is redacted; there is nothing to update"));
+            }
             FactBody::Statement { text: old, when } => BodyDraft::Statement {
                 text: text.unwrap_or_else(|| old.clone()),
                 when: when_new.or(*when),
@@ -1078,9 +1142,21 @@ impl Tessar {
     /// ones included. The store has no such read, so this walks the dense
     /// fact ids.
     fn all_facts_about(&self, entity: EntityId) -> Vec<Fact> {
-        (0..)
+        let facts = (0..)
             .map_while(|n| parse_handle(&format!("f{n}")).and_then(|id| self.mem.fact(id)))
+            .collect::<Vec<_>>();
+        // A redacted version has lost its mentions; it belongs to the entity
+        // through the chain it sits in.
+        let lineages: HashSet<_> = facts
+            .iter()
             .filter(|f| f.entities().contains(&entity))
+            .map(|f| f.lineage)
+            .collect();
+        facts
+            .into_iter()
+            .filter(|f| {
+                f.entities().contains(&entity) || (f.is_redacted() && lineages.contains(&f.lineage))
+            })
             .collect()
     }
 
@@ -1132,7 +1208,9 @@ impl Tessar {
         let mut hits = Vec::new();
         for f in &facts {
             let mut detail = self.detail(f, now, !history, None);
-            if history {
+            if f.is_redacted() {
+                detail = format!("[redacted, version {}]", f.version);
+            } else if history {
                 let _ = match f.end.map(|end| end.ending) {
                     None => write!(detail, " [version {}, current]", f.version),
                     Some(tessar_core::model::Ending::Changed { valid_to }) => {

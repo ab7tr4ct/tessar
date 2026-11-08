@@ -27,6 +27,7 @@ use tessar_mcp::hook;
 use tessar_mcp::lifecycle;
 use tessar_mcp::project::project_name;
 use tessar_mcp::proxy;
+use tessar_mcp::purge;
 use tessar_mcp::server::TessarServer;
 use tokio::net::{UnixListener, UnixStream};
 
@@ -47,6 +48,9 @@ USAGE:
                                stop the daemon (SIGTERM to the pid in
                                DIR/tessar.pid), or print its build, pid, uptime
                                and open sessions
+    tessar purge [--home DIR]  erase redacted content from the journal file and
+                               drop the vector cache. Stops the daemon first;
+                               the next session starts it again
     tessar hook prompt|session [--home DIR]
                                Claude Code hooks: read the hook JSON on stdin,
                                print context for the model on stdout
@@ -124,6 +128,9 @@ enum Cli {
     DaemonStatus {
         home: PathBuf,
     },
+    Purge {
+        home: PathBuf,
+    },
     Hook {
         home: PathBuf,
         kind: HookKind,
@@ -160,6 +167,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Ok(Cli::Daemon { home, idle_exit }) => run_daemon(&home, idle_exit),
+        Ok(Cli::Purge { home }) => run_purge(&home),
         Ok(Cli::Hook { home, kind }) => run_hook(&home, kind),
         Ok(Cli::Help) => {
             println!("{USAGE}");
@@ -187,6 +195,9 @@ fn parse(args: &[String], env: impl Fn(&str) -> Option<std::ffi::OsString>) -> R
     }
     if command == "hook" {
         return parse_hook(&args[1..], env);
+    }
+    if command == "purge" {
+        return parse_purge(&args[1..], env);
     }
     if !matches!(command, "mcp" | "daemon") {
         return Err(format!("unknown command `{command}`\n\n{USAGE}"));
@@ -232,6 +243,28 @@ fn parse(args: &[String], env: impl Fn(&str) -> Option<std::ffi::OsString>) -> R
         (_, Some(_)) => Cli::DaemonStatus { home },
         _ => Cli::Daemon { home, idle_exit },
     })
+}
+
+fn parse_purge(
+    args: &[String],
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<Cli, String> {
+    let mut home = None;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--home" => {
+                home = Some(PathBuf::from(it.next().ok_or("--home needs a directory")?));
+            }
+            a if a.starts_with("--home=") => home = Some(PathBuf::from(&a["--home=".len()..])),
+            other => return Err(format!("unexpected argument `{other}`\n\n{USAGE}")),
+        }
+    }
+    let home = match home {
+        Some(home) => home,
+        None => default_home(env)?,
+    };
+    Ok(Cli::Purge { home })
 }
 
 fn parse_hook(
@@ -520,6 +553,33 @@ fn run_lifecycle(work: impl std::future::Future<Output = Result<String, String>>
     }
 }
 
+// ---- tessar purge --------------------------------------------------
+
+/// Stops the daemon if one runs, rewrites the journal without redacted
+/// content and drops the vector cache.
+fn run_purge(home: &Path) -> ExitCode {
+    let stopped = match runtime().and_then(|rt| {
+        let running = lifecycle::read_pid_file(home).is_some();
+        let message = rt.block_on(lifecycle::stop(home))?;
+        Ok((running, message))
+    }) {
+        Ok((running, message)) => {
+            if running {
+                eprintln!("tessar: {message}");
+            }
+            running && message.starts_with("stopped")
+        }
+        Err(e) => return fail(&e),
+    };
+    match purge::purge_home(home) {
+        Ok(done) => {
+            println!("{}", purge::summary(&done, stopped));
+            ExitCode::SUCCESS
+        }
+        Err(e) => fail(&e),
+    }
+}
+
 // ---- tessar hook ---------------------------------------------------
 
 /// Runs a hook. Whatever goes wrong, the status is 0 and stdout is empty:
@@ -649,6 +709,19 @@ mod tests {
             }
         );
         assert!(p(&["daemon", "--keep-daemon"], &[("HOME", "/u")]).is_err());
+    }
+
+    #[test]
+    fn purge_takes_a_home() {
+        assert_eq!(
+            p(&["purge", "--home", "/d"], &[]).unwrap(),
+            Cli::Purge { home: "/d".into() }
+        );
+        assert_eq!(
+            p(&["purge"], &[("TESSAR_HOME", "/t")]).unwrap(),
+            Cli::Purge { home: "/t".into() }
+        );
+        assert!(p(&["purge", "--standalone"], &[("HOME", "/u")]).is_err());
     }
 
     #[test]

@@ -135,6 +135,8 @@ pub enum UpdateReason {
     Changed,
     /// It was never true (a mistake). The old version is hidden from "what was true" but stays in the record of what memory knew.
     Wrong,
+    /// The content must be destroyed (a secret, personal data the person wants gone). Irreversible. Takes only `fact`.
+    Redact,
 }
 
 /// Input of `update`.
@@ -142,7 +144,7 @@ pub enum UpdateReason {
 pub struct UpdateArgs {
     /// The handle of the fact, the leading `fNN` of a line from `recall` or `about`, for example "f12". It must be a current version.
     pub fact: String,
-    /// "changed": it stopped being true or has a new value. "wrong": it was never true.
+    /// "changed": it stopped being true or has a new value. "wrong": it was never true. "redact": destroy the content for good (only `fact` is allowed).
     pub reason: UpdateReason,
     /// reason "changed" only: the day it stopped being true, "YYYY-MM-DD" (it was not true on that day). Default now.
     #[serde(default)]

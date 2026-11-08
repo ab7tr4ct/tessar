@@ -185,9 +185,9 @@ socket and the `hooks/` directory, or `--home DIR`.
 | `recall`     | Natural-language search over both spaces (or one), best first, each hit starting with its handle `fNN` and the channels that found it. `as_of` (`YYYY-MM-DD`) shows what was true on that day. |
 | `vocabulary` | Lists the predicates with `single` or `many` cardinality, descriptions and synonyms. |
 | `about`      | Lists the facts about one entity, oldest first, each starting with its handle `fNN`; `history: true` includes replaced, closed and corrected versions. |
-| `update`     | Says a fact is outdated or wrong, by its handle `fNN` from `recall` or `about`. `reason: changed` closes it as true until `since` (default now), `wrong` marks it as never true. With `text`, `value` or `when` it also writes the replacement, keeping the kind (and for an attribute the subject and predicate) and the fields not given. Reports `closed`, `superseded`, `corrected` or `unchanged`. Only a current version can be updated; a closed one is refused and the current version is named. |
+| `update`     | Says a fact is outdated or wrong, by its handle `fNN` from `recall` or `about`. `reason: changed` closes it as true until `since` (default now), `wrong` marks it as never true, `redact` destroys its content (see Forgetting). With `text`, `value` or `when` it also writes the replacement, keeping the kind (and for an attribute the subject and predicate) and the fields not given. Reports `closed`, `superseded`, `corrected` or `unchanged`. Only a current version can be updated; a closed one is refused and the current version is named. |
 
-Nothing is ever deleted. `update` closes a version or replaces it with a new
+Nothing is deleted by `changed` or `wrong`. `update` closes a version or replaces it with a new
 one, and the old version stays in the journal: `about` with `history: true`
 lists it, and `recall` with `as_of` finds a changed fact on the days it was
 true. A fact marked `wrong` is hidden from what was true on any day, since it
@@ -202,6 +202,46 @@ finds statements that name no entity. Explicit `mentions` are kept.
 The vocabulary at startup is part of the `remember` tool description, so the
 agent sees it without a call. The tool descriptions are the agent's manual:
 they explain spaces, fact kinds and predicate rules.
+
+## Forgetting
+
+Three levels of taking a fact out of use:
+
+- **`changed`**: it was true and no longer is. The old version stays, true
+  until `since`.
+- **`wrong`**: it was never true. It leaves "what was true" but memory still
+  shows it knew it.
+- **`redact`**: the content is destroyed. Use it for secrets and for personal
+  data the person wants gone, not for mistakes.
+
+`update` with `reason: "redact"` takes only `fact`; `text`, `value`, `when` and
+`since` are refused. It works on any version, current or closed. The text
+leaves the keyword, entity and meaning indexes at once, the mentions and the
+source link are cleared, and `recall` and `about` never show the fact again.
+With `history: true`, `about` lists the version as `[redacted, version N]` when
+other versions of its chain are still about the entity. It cannot be undone.
+
+The text is still in `journal.jsonl`, because the journal is append-only.
+`tessar purge [--home DIR]` finishes the job on disk: it stops the daemon if
+one runs, rewrites the journal without the redacted content, and deletes the
+vector cache (`index/<model>/vectors.bin`, rebuilt on the next start). The
+next `tessar mcp` or hook starts the daemon again. It prints one line:
+
+```
+purged 2 fact(s) and 0 episode(s); journal 1843 bytes before, 1520 after; vector cache files deleted: 1
+```
+
+With nothing to purge it says `nothing to purge: the journal holds no redacted
+content (N bytes); vector cache files deleted: M` and still succeeds. When it
+stopped a daemon the line starts with `stopped the daemon (it restarts with
+the next session); `.
+
+What stays: fact ids, the chain structure and times, entity keys and aliases
+(an entity created for a secret keeps its name; redaction does not touch
+entities). The episode a fact was taken from keeps its text: redacting the
+fact does not blank the source, and there is no tool for that yet. Known
+limit from the core: a chain whose every version is purged loses its
+(subject, predicate) pair, so the next write of that pair starts a new chain.
 
 ## Where data lives
 

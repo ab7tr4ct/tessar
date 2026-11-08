@@ -83,7 +83,12 @@ current version is named).
 
 `reason: \"changed\"`: it stopped being true, or has a new value now. The old version is kept as \
 true until `since` (YYYY-MM-DD, the first day it was not true; default now). `reason: \"wrong\"`: \
-it was never true; it disappears from \"what was true\" but memory still shows it knew it.
+it was never true; it disappears from \"what was true\" but memory still shows it knew it. \
+`reason: \"redact\"`: destroy the content for good, for secrets (keys, passwords, tokens) and personal \
+data the person wants gone. It takes only `fact` (no `text`, `value`, `when` or `since`), works on \
+any version, and cannot be undone: the text leaves memory at once, only an id and the dates remain. \
+It stays in the journal file on disk until the person runs `tessar purge`. Do not use it for a \
+mistake or an outdated fact; use \"wrong\" or \"changed\", which keep the record.
 
 Without `text`, `value` and `when` the fact is only closed (\"closed\" / \"corrected\"). With them \
 it is replaced by a new version (\"superseded\" / \"corrected\"), which keeps the old fields you do \

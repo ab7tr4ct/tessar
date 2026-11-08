@@ -1005,3 +1005,119 @@ fn a_replacement_gets_the_default_mention_once() {
     assert!(out.contains("juice"), "{out}");
     assert_eq!(last.mentions.len(), 1);
 }
+
+// ---- redaction ------------------------------------------------------
+
+fn remember_statement(f: &Fixture, text: &str) -> String {
+    let out = remember(f, json!({"facts": [{"kind": "statement", "text": text}]})).unwrap();
+    handle(&out)
+}
+
+#[test]
+fn redacting_a_statement_removes_it_from_every_read() {
+    let f = fixture();
+    let secret = remember_statement(&f, "The deploy token is zebracrossing99");
+    remember_statement(&f, "The journal uses JSON lines");
+
+    let out = update(&f, json!({"fact": secret, "reason": "redact"})).unwrap();
+    assert_eq!(
+        out,
+        format!(
+            "redacted: {secret} (content removed from memory; run `tessar purge` to erase it \
+             from the journal file on disk)"
+        )
+    );
+
+    let found = recall(&f, json!({"query": "zebracrossing99 deploy token"})).unwrap();
+    assert!(!found.contains("zebracrossing99"), "{found}");
+    assert!(!found.contains(&format!("{secret} ")), "{found}");
+    let rendered = f
+        .api
+        .recall_rendered(
+            serde_json::from_value::<RecallArgs>(json!({"query": "zebracrossing99"})).unwrap(),
+        )
+        .unwrap();
+    // What the hooks read: no hit for the redacted fact.
+    let hits = rendered.structured["hits"].as_array().unwrap();
+    assert!(hits.iter().all(|h| h["id"] != json!(secret)), "{hits:?}");
+
+    let project = about(&f, json!({"entity": {"key": "tessar", "kind": "project"}})).unwrap();
+    assert!(!project.contains("zebracrossing99"), "{project}");
+    assert!(project.contains("JSON lines"), "{project}");
+    let hist = about(
+        &f,
+        json!({"entity": {"key": "tessar", "kind": "project"}, "history": true}),
+    )
+    .unwrap();
+    assert!(!hist.contains("zebracrossing99"), "{hist}");
+}
+
+#[test]
+fn a_redacted_version_shows_in_history_as_redacted() {
+    let f = fixture();
+    let write = |city: &str| {
+        remember(
+            &f,
+            json!({"space": "user", "facts": [{
+                "kind": "attribute", "subject": user(), "predicate": "lives_in",
+                "value": city, "text": format!("User lives in {city}")}]}),
+        )
+        .unwrap()
+    };
+    let boston = handle(&write("Boston"));
+    f.clock.advance(DAY_MS);
+    write("Denver");
+
+    // The earlier version is closed; redaction still reaches it.
+    let out = update(&f, json!({"fact": boston, "reason": "redact"})).unwrap();
+    assert!(out.starts_with(&format!("redacted: {boston}")), "{out}");
+
+    let hist = about(&f, json!({"entity": user(), "history": true})).unwrap();
+    assert!(!hist.contains("Boston"), "{hist}");
+    assert!(hist.contains("[redacted, version 1]"), "{hist}");
+    assert!(hist.contains("User lives in Denver"), "{hist}");
+
+    let now = about(&f, json!({"entity": user()})).unwrap();
+    assert!(
+        !now.contains("redacted") && !now.contains("Boston"),
+        "{now}"
+    );
+    assert!(!now.contains("earlier:"), "{now}");
+}
+
+#[test]
+fn redact_takes_only_the_fact() {
+    let f = fixture();
+    let id = remember_statement(&f, "The password is hunter2hunter2");
+    for (field, value) in [
+        ("text", "new text"),
+        ("value", "x"),
+        ("when", "2026-01-01"),
+        ("since", "2026-01-01"),
+    ] {
+        let err = update(&f, json!({"fact": id, "reason": "redact", field: value})).unwrap_err();
+        assert!(
+            err.contains(&format!("`{field}`")) && err.contains("only `fact`"),
+            "{err}"
+        );
+    }
+    // Nothing was redacted by the refused calls.
+    let found = recall(&f, json!({"query": "hunter2hunter2 password"})).unwrap();
+    assert!(found.contains("hunter2hunter2"), "{found}");
+}
+
+#[test]
+fn redacting_twice_explains_itself() {
+    let f = fixture();
+    let id = remember_statement(&f, "An api key lives in the vault");
+    update(&f, json!({"fact": id, "reason": "redact"})).unwrap();
+    let err = update(&f, json!({"fact": id, "reason": "redact"})).unwrap_err();
+    assert!(
+        err.contains("already redacted") && err.contains("tessar purge"),
+        "{err}"
+    );
+    let err = update(&f, json!({"fact": id, "reason": "changed"})).unwrap_err();
+    assert!(err.contains("redacted"), "{err}");
+    let err = update(&f, json!({"fact": "f999", "reason": "redact"})).unwrap_err();
+    assert!(err.contains("no fact"), "{err}");
+}
