@@ -1,0 +1,26 @@
+[package]
+name = "tessar-embed-candle"
+description = "Pure-Rust in-process embedder for tessar on candle (experiment)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+metal = ["candle-core/metal", "candle-nn/metal"]
+accelerate = ["candle-core/accelerate", "candle-nn/accelerate"]
+
+[dependencies]
+tessar-core.workspace = true
+candle-core.workspace = true
+candle-nn.workspace = true
+tokenizers.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tessar-embed-llama.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
