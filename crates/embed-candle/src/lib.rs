@@ -25,13 +25,16 @@ pub enum Accel {
 /// How to load the model.
 #[derive(Debug, Clone)]
 pub struct Options {
-    /// Token budget of one forward pass, and the most one text may take
-    /// (prompt included; a longer text is cut). A pass holds as many
-    /// texts as fit in `context` tokens when padded to the longest one,
-    /// so memory stays bounded however many texts a call brings. The
-    /// non-fused attention path (CPU) materializes the scores, so one text
-    /// of 8192 tokens costs about `heads * len^2 * 4` bytes, ~4.3 GB in f32.
+    /// The most tokens one text may take (prompt included); a longer text
+    /// is cut. The non-fused attention path (CPU) materializes the scores,
+    /// so one text of 8192 tokens costs about `heads * len^2 * 4` bytes,
+    /// ~4.3 GB in f32.
     pub context: usize,
+    /// Token budget of one forward pass: a pass holds as many texts as fit
+    /// in `pass_tokens` when padded to the longest one (a single longer text
+    /// gets a pass of its own), so memory stays bounded however many texts a
+    /// call brings.
+    pub pass_tokens: usize,
     /// Most texts in one forward pass.
     pub batch: usize,
     /// Device choice.
@@ -49,6 +52,7 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             context: 8192,
+            pass_tokens: 8192,
             batch: 8,
             device: Accel::Auto,
             dtype: DType::F16,
@@ -99,9 +103,9 @@ fn normalize(row: &mut [f32]) -> Result<(), EmbedError> {
 }
 
 /// Splits `order` (indices sorted by ascending length) into passes of at
-/// most `batch` texts whose padded size fits the `context` token budget.
+/// most `batch` texts whose padded size fits the `budget` in tokens.
 /// A text longer than the budget gets a pass of its own.
-fn plan<'a>(order: &'a [usize], lens: &[usize], batch: usize, context: usize) -> Vec<&'a [usize]> {
+fn plan<'a>(order: &'a [usize], lens: &[usize], batch: usize, budget: usize) -> Vec<&'a [usize]> {
     let mut passes = Vec::new();
     let mut start = 0;
     while start < order.len() {
@@ -109,7 +113,7 @@ fn plan<'a>(order: &'a [usize], lens: &[usize], batch: usize, context: usize) ->
         // Ascending lengths: the newest text is the longest.
         while end < order.len()
             && end - start < batch.max(1)
-            && (end - start + 1) * lens[order[end]] <= context
+            && (end - start + 1) * lens[order[end]] <= budget
         {
             end += 1;
         }
@@ -238,6 +242,23 @@ impl CandleEmbedder {
         Ok(ids)
     }
 
+    /// Real and padded token counts of the passes `embed_documents` would
+    /// run for `texts` (for tuning `batch` and `pass_tokens`).
+    pub fn padding_stats(&self, texts: &[String]) -> Result<(usize, usize), EmbedError> {
+        let lens = texts
+            .iter()
+            .map(|t| Ok(self.encode(&format!("{}{t}", self.prompts.document))?.len()))
+            .collect::<Result<Vec<usize>, EmbedError>>()?;
+        let mut order: Vec<usize> = (0..lens.len()).collect();
+        order.sort_by_key(|&i| lens[i]);
+        let passes = plan(&order, &lens, self.options.batch, self.options.pass_tokens);
+        let padded = passes
+            .iter()
+            .map(|c| c.len() * c.iter().map(|&i| lens[i]).max().unwrap_or(0))
+            .sum();
+        Ok((lens.iter().sum(), padded))
+    }
+
     fn embed(&self, prefix: &str, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
         let mut tokens = texts
             .iter()
@@ -252,7 +273,7 @@ impl CandleEmbedder {
             .model
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for chunk in plan(&order, &lens, self.options.batch, self.options.context) {
+        for chunk in plan(&order, &lens, self.options.batch, self.options.pass_tokens) {
             let len = chunk.iter().map(|&i| lens[i]).max().unwrap_or(1);
             let mut ids = Vec::with_capacity(chunk.len() * len);
             let mut valid = Vec::with_capacity(chunk.len() * len);

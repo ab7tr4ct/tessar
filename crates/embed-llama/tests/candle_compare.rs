@@ -149,6 +149,7 @@ fn candle_vs_llama() {
     };
     let options = Options {
         context: 2048,
+        pass_tokens: env("CANDLE_PASS_TOKENS").map_or(2048, |v| v.parse().unwrap()),
         batch: env("CANDLE_BATCH").map_or(8, |v| v.parse().unwrap()),
         device: if env("CANDLE_DEVICE").as_deref() == Some("cpu") {
             Accel::Cpu
@@ -204,6 +205,11 @@ fn candle_vs_llama() {
     );
     assert_eq!(candle.dims(), 2048);
     let ours = report("candle", &texts, &candle);
+    let (real, padded) = candle.padding_stats(&texts).unwrap();
+    println!(
+        "RESULT candle padding: {real} real, {padded} padded tokens, waste {:.1}%",
+        (padded - real) as f64 * 100.0 / real as f64
+    );
 
     if let Some(reference) = reference {
         let mut c: Vec<f64> = reference

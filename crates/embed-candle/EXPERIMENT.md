@@ -312,3 +312,20 @@ removed from the tree; it lives in commits `2d441b8` and `abec331` if anyone wan
 
 Remaining ideas, none cheap: a fused SwiGLU or residual+norm custom op; sdpa
 that accepts a strided q; a single command buffer per forward pass.
+
+## E15b step 3: batching by token budget
+
+`Options.context` is now only the per-text limit; `Options.pass_tokens` (default 8192,
+the old behaviour) is the per-pass token budget, and `batch` still caps the texts per
+pass. `CandleEmbedder::padding_stats` reports real and padded tokens of a bulk run.
+Raw table: `evals/runs/e15b/step3-batching.md`.
+
+GGUF Q8, Metal, 200 texts (mean 34 tokens): batch 8 / 16 / 32 / 64 give 122 / 122 /
+119 / 104-109 texts/s, 64 docs 523 / 536 / 566 / 688-758 ms, padding waste 1.9% / 3.9% /
+7.1% / 11-14%, max RSS 679-715 MB, query p50/p95 unchanged at about 13.1 / 14.5 ms.
+
+Decision (rule fixed in advance: change defaults only if the best cell is >= 10% faster
+than batch 8): **defaults kept**. The best cell (16, 122 texts/s) equals batch 8, and
+larger batches are slower. Padding is not the cost (2% waste at batch 8); larger
+passes get slower per text (not diagnosed further; plausibly the Q8 matmul is already
+saturated at 8 x ~35 = 280 rows and attention and element-wise kernels scale worse than linearly).
