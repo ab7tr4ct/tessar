@@ -212,6 +212,15 @@ impl CandleEmbedder {
         Ok(Self::load(model_dir, &Options::default())?.with_prompts(Prompts::voyage()))
     }
 
+    /// `voyage-4-nano` from a GGUF file and its `tokenizer.json`, with its
+    /// prompts. Mirrors `LlamaEmbedder::voyage_nano`.
+    pub fn voyage_nano_gguf(
+        gguf: impl AsRef<Path>,
+        tokenizer: impl AsRef<Path>,
+    ) -> Result<Self, EmbedError> {
+        Ok(Self::load_gguf(gguf, tokenizer, &Options::default())?.with_prompts(Prompts::voyage()))
+    }
+
     /// Sets the instructions before queries and documents.
     #[must_use]
     pub fn with_prompts(mut self, prompts: Prompts) -> Self {
