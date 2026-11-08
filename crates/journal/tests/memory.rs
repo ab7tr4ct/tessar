@@ -10,7 +10,7 @@ use tessar_core::model::{
     Cardinality, FactBody, Key, Name, Origin, SpaceKind, Timestamp, Value, ValueType,
 };
 use tessar_core::store::{
-    BodyDraft, EntityRef, FactDraft, Memory, ObjectDraft, Op, Remember, View,
+    BodyDraft, EntityRef, FactDraft, Memory, ObjectDraft, Op, PredicateDraft, Remember, View,
 };
 use tessar_journal::FileJournal;
 
@@ -20,6 +20,16 @@ fn key(s: &str) -> Key {
 
 fn name(s: &str) -> Name {
     Name::new(s).unwrap()
+}
+
+/// A predicate draft with an empty description.
+fn predicate(n: &str, object: ValueType, cardinality: Cardinality) -> PredicateDraft {
+    PredicateDraft {
+        name: name(n),
+        description: String::new(),
+        object,
+        cardinality,
+    }
 }
 
 fn text(fact: &tessar_core::model::Fact) -> String {
@@ -45,7 +55,10 @@ fn memory_survives_a_restart() {
             .unwrap();
         let project = memory.define_kind(space, name("project")).unwrap();
         let goal = memory
-            .define_predicate(space, name("goal"), ValueType::Text, Cardinality::Single)
+            .define_predicate(
+                space,
+                predicate("goal", ValueType::Text, Cardinality::Single),
+            )
             .unwrap();
         let draft = |text: &str| Remember {
             space,
@@ -58,6 +71,7 @@ fn memory_survives_a_restart() {
                 },
                 predicate: goal,
                 object: ObjectDraft::Value(Value::Text(text.into())),
+                text: None,
             })],
         };
         let first = memory.remember(draft("graph database")).unwrap();
@@ -101,7 +115,10 @@ fn write_throughput_and_read_latency() {
         .unwrap();
     let person = memory.define_kind(space, name("person")).unwrap();
     let knows = memory
-        .define_predicate(space, name("knows"), ValueType::Text, Cardinality::Many)
+        .define_predicate(
+            space,
+            predicate("knows", ValueType::Text, Cardinality::Many),
+        )
         .unwrap();
     let draft = move |i: usize| Remember {
         space,
@@ -114,6 +131,7 @@ fn write_throughput_and_read_latency() {
             },
             predicate: knows,
             object: ObjectDraft::Value(Value::Text(format!("skill {i}"))),
+            text: None,
         })],
     };
 
@@ -193,7 +211,10 @@ fn throughput_limits() {
             .unwrap();
         let person = memory.define_kind(space, name("person")).unwrap();
         let knows = memory
-            .define_predicate(space, name("knows"), ValueType::Text, Cardinality::Many)
+            .define_predicate(
+                space,
+                predicate("knows", ValueType::Text, Cardinality::Many),
+            )
             .unwrap();
         (space, person, knows)
     }
@@ -210,6 +231,7 @@ fn throughput_limits() {
             },
             predicate: knows,
             object: ObjectDraft::Value(Value::Text(format!("skill {i}"))),
+            text: None,
         })
     }
     let origin = || Origin::Asserted { by: key("bench") };
