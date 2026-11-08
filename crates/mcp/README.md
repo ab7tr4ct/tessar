@@ -49,8 +49,10 @@ Or in `.mcp.json` (project) / `~/.claude.json` (user):
 
 `tessar mcp` is a thin proxy: it connects to the daemon, starting it if none
 runs. The first start takes a few seconds, because the daemon loads the model
-and embeds every fact again (vectors are not stored yet), so startup grows
-with the journal; a vector cache is planned. The proxy exits with status 0
+and embeds the facts it has no vector for. Vectors are cached in
+`<home>/index/<model>/vectors.bin`, so a later start embeds only new facts.
+The first start of a new build on macOS takes about 15 s while Metal compiles
+the candle kernels; later starts are fast. The proxy exits with status 0
 when stdin closes. As many sessions as you like can run at once.
 
 ## Daemon

@@ -385,7 +385,15 @@ fn default_models_dir() -> Option<PathBuf> {
 /// `~/.tessar/models/…`.
 fn model_path(home: &Path) -> Result<PathBuf, String> {
     if let Some(path) = std::env::var_os("TESSAR_MODEL").filter(|p| !p.is_empty()) {
-        return Ok(PathBuf::from(path));
+        let path = PathBuf::from(path);
+        return if path.is_file() {
+            Ok(path)
+        } else {
+            Err(format!(
+                "embedding model not found: TESSAR_MODEL is {}, which is not a file",
+                path.display()
+            ))
+        };
     }
     let local = home.join("models").join(MODEL_FILE);
     if local.is_file() {
@@ -411,7 +419,15 @@ fn model_path(home: &Path) -> Result<PathBuf, String> {
 #[cfg(feature = "candle")]
 fn tokenizer_path(home: &Path) -> Result<PathBuf, String> {
     if let Some(path) = std::env::var_os("TESSAR_TOKENIZER").filter(|p| !p.is_empty()) {
-        return Ok(PathBuf::from(path));
+        let path = PathBuf::from(path);
+        return if path.is_file() {
+            Ok(path)
+        } else {
+            Err(format!(
+                "tokenizer not found: TESSAR_TOKENIZER is {}, which is not a file",
+                path.display()
+            ))
+        };
     }
     let local = home.join("models").join(MODEL_NAME).join("tokenizer.json");
     if local.is_file() {
@@ -530,6 +546,16 @@ fn open_memory(
             loaded.dims
         ));
     }
+    // The first embedding compiles the GPU kernels (about 15 s for a new
+    // build on macOS); pay for it here, not in the first request.
+    let started = std::time::Instant::now();
+    if let Err(e) = loaded.embedder.embed_query("warm-up") {
+        eprintln!("tessar: embedder warm-up failed: {e}");
+    }
+    eprintln!(
+        "tessar: embedder warm-up took {} ms",
+        started.elapsed().as_millis()
+    );
     let embedder = cached(home, loaded.embedder);
     Memory::open_with(
         journal,
@@ -856,6 +882,14 @@ fn run_proxy(home: &Path, keep_daemon: bool) -> ExitCode {
 mod tests {
 
     #[test]
+    fn vector_cache_lives_under_the_model_in_the_home() {
+        assert_eq!(
+            vector_cache_path(Path::new("/h/.tessar"), "voyage-4-nano"),
+            Path::new("/h/.tessar/index/voyage-4-nano/vectors.bin")
+        );
+    }
+
+    #[test]
     fn embedder_choice_follows_the_compiled_features() {
         assert!(choose_backend(Some("bogus")).is_err());
         assert!(choose_backend(None).is_ok());
@@ -882,14 +916,6 @@ mod tests {
         parse(&args, |name| {
             env.iter().find(|(k, _)| k == name).map(|(_, v)| v.into())
         })
-    }
-
-    #[test]
-    fn vector_cache_lives_under_the_model_in_the_home() {
-        assert_eq!(
-            vector_cache_path(Path::new("/h/.tessar"), "voyage-4-nano"),
-            Path::new("/h/.tessar/index/voyage-4-nano/vectors.bin")
-        );
     }
 
     #[test]

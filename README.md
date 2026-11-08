@@ -105,7 +105,8 @@ Command Line Tools on macOS), run `scripts/setup.sh` (the submodule, a few
 minutes to compile) and build with
 `cargo build --release -p tessar-mcp --no-default-features --features llama`;
 `TESSAR_EMBEDDER=candle|llama` picks the embedder at run time when both are
-built. The candle CPU path on Linux is not measured yet, so llama.cpp stays
+built. The first start of a new build on macOS takes about 15 s while Metal
+compiles the candle kernels; later starts are fast. The candle CPU path on Linux is not measured yet, so llama.cpp stays
 available through the feature. `TESSAR_MODEL` and `TESSAR_TOKENIZER` point to
 the model and tokenizer files if they live elsewhere.
 
@@ -113,7 +114,7 @@ the model and tokenizer files if they live elsewhere.
 
 The flow in a few lines; the complete, compiled version is
 [`crates/mcp/examples/library.rs`](crates/mcp/examples/library.rs)
-(`cargo run --release -p tessar-mcp --example library`).
+(`cargo run --release -p tessar-mcp --features llama --example library`; it needs cmake).
 
 ```rust
 let memory = Memory::open_with(journal, Arc::new(SystemClock), semantic)?;
