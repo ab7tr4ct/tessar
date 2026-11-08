@@ -2,6 +2,8 @@
 //! no C++. See `EXPERIMENT.md`.
 
 mod model;
+// Public only so that `tests/profile.rs` can time the kernels; not a stable API.
+#[doc(hidden)]
 pub mod ops;
 
 use std::path::Path;

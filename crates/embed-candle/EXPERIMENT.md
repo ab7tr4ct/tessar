@@ -366,9 +366,15 @@ the matmuls) now sits at offset 0.
 | K1 alone, (6400, 3072) f32 | 3.37 ms | 1.67 ms | |
 | K2 alone, (6400, 1024) f32 | 1.63 ms | 0.88 ms | |
 
-Verdict. Cosine, dispatches (17) and bulk pass. The two latency limits pass on the
-clean runs (p50 11.7-11.8, p95 12.8-13.1) but the GPU was shared with another process
-during the session: across all 9 runs the median p95 is 14.2 ms, over the 13.2 limit,
-while p50 (median 11.9) passes. The kernels are faster than the composed ops in every
-paired comparison (query p50 about 0.5 ms, bulk about 2-5%), so they are kept as the
-default; the p95 criterion should be re-confirmed on an idle GPU.
+Verdict (first session, shared GPU): not usable, runs were disturbed.
+
+Idle GPU re-run, 5 paired runs (kernels on / off), medians: query p50 12.1 / 12.4 ms,
+p95 13.9 / 14.3 ms, bulk 119 / 118 texts/s. By the criteria fixed in advance, on the
+medians with kernels on: p50 12.1 > 12.0, p95 13.9 > 13.2 and bulk 119 < 121 all
+**fail**; cosine (1.00000) and dispatches (17) pass. The kernels are only marginally
+better than the composed ops (about 0.3 ms on p50, 0.4 ms on p95, +1 text/s) and the
+machine itself was about 5% slower than in the first session (llama.cpp query
+10.6 / 11.7 ms against 10.1 / 10.6 ms). The rule says: record the numbers, delete the
+kernel code, keep the commit hash. The code is in commit `1e77400` (`ops.rs`,
+`kernels/*.metal`); whether to delete it is the coordinator's call, it is still in the
+tree on branch `e15c-kernels`.
