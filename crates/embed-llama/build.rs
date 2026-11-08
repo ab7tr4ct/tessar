@@ -1,4 +1,4 @@
-//! Builds llama.cpp (the `llama.cpp` submodule) as static libraries with
+//! Builds llama.cpp (the `third_party/llama.cpp` submodule) as static libraries with
 //! CMake, then the C++ shim and the cxx bridge, and links them together.
 //!
 //! On macOS the Metal backend is on and its shader source is embedded in
@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 fn main() {
     let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
-    let source = manifest.join("llama.cpp");
+    let source = manifest.join("../../third_party/llama.cpp");
     if !source.join("CMakeLists.txt").is_file() {
         panic!(
             "{} is empty: run `git submodule update --init` first",
@@ -70,7 +70,7 @@ fn main() {
         "ggml/include",
         "ggml/src",
     ] {
-        println!("cargo:rerun-if-changed=llama.cpp/{path}");
+        println!("cargo:rerun-if-changed=../../third_party/llama.cpp/{path}");
     }
 }
 

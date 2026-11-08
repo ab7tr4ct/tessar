@@ -1,0 +1,2 @@
+# Third-party code is vendored: not ours, not counted as the project's language.
+third_party/** linguist-vendored

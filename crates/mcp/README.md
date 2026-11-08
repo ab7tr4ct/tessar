@@ -12,7 +12,7 @@ network are involved.
 ## Build
 
 ```sh
-git submodule update --init --depth 1   # llama.cpp for crates/embed-llama
+scripts/setup.sh                        # llama.cpp submodule, sparse checkout
 cargo build --release -p tessar-mcp     # needs cmake and a C++ toolchain
 ```
 

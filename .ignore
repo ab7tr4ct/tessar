@@ -1,0 +1,2 @@
+# ripgrep, fd and friends: skip third-party sources.
+third_party/
