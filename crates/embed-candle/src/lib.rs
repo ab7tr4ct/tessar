@@ -28,7 +28,9 @@ pub struct Options {
     /// Token budget of one forward pass, and the most one text may take
     /// (prompt included; a longer text is cut). A pass holds as many
     /// texts as fit in `context` tokens when padded to the longest one,
-    /// so memory stays bounded however many texts a call brings.
+    /// so memory stays bounded however many texts a call brings. The
+    /// non-fused attention path (CPU) materializes the scores, so one text
+    /// of 8192 tokens costs about `heads * len^2 * 4` bytes, ~4.3 GB in f32.
     pub context: usize,
     /// Most texts in one forward pass.
     pub batch: usize,
@@ -150,7 +152,7 @@ impl CandleEmbedder {
 
     /// Loads the quantized GGUF at `gguf` (the file llama.cpp uses) and the
     /// tokenizer from `tokenizer_json`. Linear layers stay quantized and run
-    /// through `QMatMul`; norms are dequantized to f16.
+    /// through `QMatMul`; norms are dequantized to f32.
     pub fn load_gguf(
         gguf: impl AsRef<Path>,
         tokenizer_json: impl AsRef<Path>,
@@ -169,9 +171,14 @@ impl CandleEmbedder {
         device: Device,
         options: &Options,
     ) -> Result<Self, EmbedError> {
-        let eos = tokenizer
-            .token_to_id("<|endoftext|>")
-            .ok_or_else(|| err("the tokenizer has no <|endoftext|> token"))?;
+        // The id is only used for `append_eos`; padding is masked and uses 0.
+        let eos = match tokenizer.token_to_id("<|endoftext|>") {
+            Some(id) => id,
+            None if options.append_eos => {
+                return Err(err("the tokenizer has no <|endoftext|> token"));
+            }
+            None => 0,
+        };
         let reserved = usize::from(options.append_eos);
         if options.context <= reserved {
             return Err(err(format!(

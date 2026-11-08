@@ -5,11 +5,11 @@
 //! from the llama.cpp GGUF (Q8_0, `QMatMul`).
 
 use std::fs::File;
-use std::sync::Arc;
 
 use candle_core::quantized::gguf_file::{Content, Value};
-use candle_core::quantized::{GgmlDType, QMatMul};
+use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
 use candle_core::{D, DType, Device, Result, Tensor};
+use candle_nn::rotary_emb::rope_thd;
 use candle_nn::{Embedding, Linear, Module, RmsNorm, VarBuilder};
 use serde::Deserialize;
 
@@ -25,9 +25,7 @@ pub struct Config {
     pub rope_theta: f64,
     pub vocab_size: usize,
     pub num_labels: usize,
-    #[serde(default)]
     pub use_bidirectional_attention: Option<bool>,
-    #[serde(default)]
     pub use_sliding_window: Option<bool>,
 }
 
@@ -115,14 +113,16 @@ const Q8_BLOCK_BYTES: usize = 34;
 /// from which only the rows in use get dequantized.
 enum Embed {
     Dense(Embedding),
-    Q8 { bytes: Vec<u8>, hidden: usize },
+    Q8 { table: Box<QTensor>, hidden: usize },
 }
 
 impl Embed {
     fn forward(&self, ids: &[u32], b: usize, l: usize, device: &Device) -> Result<Tensor> {
         match self {
             Self::Dense(e) => e.forward(&Tensor::from_slice(ids, (b, l), device)?),
-            Self::Q8 { bytes, hidden } => {
+            Self::Q8 { table, hidden } => {
+                // On the CPU `data()` borrows the quantized bytes.
+                let bytes = table.data()?;
                 let row_bytes = hidden / Q8_BLOCK * Q8_BLOCK_BYTES;
                 let mut out = Vec::with_capacity(ids.len() * hidden);
                 for &id in ids {
@@ -167,7 +167,7 @@ impl Source {
                 if q.shape().dims() != [out, inp] {
                     candle_core::bail!("{gg}: shape {:?}, want [{out}, {inp}]", q.shape());
                 }
-                Ok(Lin::Quant(QMatMul::from_arc(Arc::new(q))?))
+                Ok(Lin::Quant(QMatMul::from_qtensor(q)?))
             }
         }
     }
@@ -202,7 +202,7 @@ impl Source {
                     candle_core::bail!("token_embd must be a Q8_0 [{vocab}, {hidden}] table");
                 }
                 Ok(Embed::Q8 {
-                    bytes: q.data()?.into_owned(),
+                    table: Box::new(q),
                     hidden,
                 })
             }
@@ -237,10 +237,6 @@ struct Attention {
     head_dim: usize,
     scale: f32,
     fused: bool,
-}
-
-fn rope(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
-    candle_nn::rotary_emb::rope(&x.contiguous()?, cos, sin)
 }
 
 impl Attention {
@@ -293,18 +289,23 @@ impl Attention {
     fn forward(&self, x: &Tensor, cos: &Tensor, sin: &Tensor, mask: &Tensor) -> Result<Tensor> {
         let (b, l, _) = x.dims3()?;
         let (h, kv, d) = (self.heads, self.kv_heads, self.head_dim);
-        let q = self.q.forward(x)?.reshape((b, l, h, d))?.transpose(1, 2)?;
-        let k = self.k.forward(x)?.reshape((b, l, kv, d))?.transpose(1, 2)?;
-        let v = self.v.forward(x)?.reshape((b, l, kv, d))?.transpose(1, 2)?;
-        let q = rope(&self.q_norm.forward(&q)?, cos, sin)?;
-        let k = rope(&self.k_norm.forward(&k)?, cos, sin)?;
+        // Everything up to attention stays in the (b, l, heads, d) layout the
+        // projections produce: contiguous, so the fused rms_norm and
+        // rope_thd kernels apply without copies.
+        let q = self.q.forward(x)?.reshape((b, l, h, d))?;
+        let k = self.k.forward(x)?.reshape((b, l, kv, d))?;
+        let v = self.v.forward(x)?.reshape((b, l, kv, d))?;
+        let q = rope_thd(&self.q_norm.forward(&q)?, cos, sin)?;
+        let k = rope_thd(&self.k_norm.forward(&k)?, cos, sin)?;
         let out = if self.fused {
             // Fused Metal kernel; GQA and the key mask are handled inside.
+            // It takes strides for k and v, so those stay transposed views;
+            // q has to be contiguous (b, h, l, d).
             let mask = mask.expand((b, h, l, l))?;
             candle_nn::ops::sdpa(
-                &q,
-                &k.contiguous()?,
-                &v.contiguous()?,
+                &q.transpose(1, 2)?.contiguous()?,
+                &k.transpose(1, 2)?,
+                &v.transpose(1, 2)?,
                 Some(&mask),
                 false,
                 self.scale,
@@ -316,13 +317,15 @@ impl Attention {
             // Grouped-query attention without copying K and V: the `rep`
             // query heads that share a KV head are stacked along the length.
             let rep = h / kv;
-            let q = q.reshape((b, kv, rep * l, d))?;
-            let k = k.transpose(2, 3)?.contiguous()?;
+            let q = q.transpose(1, 2)?.reshape((b, kv, rep * l, d))?;
+            let k = k.transpose(1, 2)?.transpose(2, 3)?.contiguous()?;
+            let v = v.transpose(1, 2)?.contiguous()?;
             let scores = (q.matmul(&k)? * f64::from(self.scale))?;
             let scores = scores.broadcast_add(mask)?;
             let probs = candle_nn::ops::softmax_last_dim(&scores)?;
-            let out = probs.matmul(&v.contiguous()?)?;
-            out.reshape((b, h, l, d))?
+            probs
+                .matmul(&v)?
+                .reshape((b, h, l, d))?
                 .transpose(1, 2)?
                 .reshape((b, l, h * d))?
         };

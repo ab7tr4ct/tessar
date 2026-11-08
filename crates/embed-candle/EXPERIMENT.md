@@ -55,8 +55,8 @@ normalization in f64, vectors of 2048 floats. `tokenizers` is built with
 read, not mmap, to keep `unsafe` out. Texts are length-sorted inside a call to
 cut padding. Features: `metal` (`candle-core/metal`), `accelerate`.
 
-Comparison harness: `crates/embed-llama/tests/candle_compare.rs` (ignored, GPU). 100 generated
-bilingual texts (50 en + 50 ru, about 15-25 words), same Voyage prompts for both
+Comparison harness: `crates/embed-llama/tests/candle_compare.rs` (ignored, GPU). generated
+bilingual texts (100 for E15a, 200 for E15b; half en, half ru, about 15-25 words), same Voyage prompts for both
 adapters, llama.cpp with context 2048 and batch 64, `n_gpu_layers` all. 5 warm-up
 calls before timing, 100 timed single queries, 10 timed batches of 64 documents
 (2 warm-up). Model: the HF safetensors for candle; `voyage-4-nano-Q8_0.gguf`

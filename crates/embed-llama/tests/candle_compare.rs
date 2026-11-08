@@ -216,7 +216,7 @@ fn candle_vs_llama() {
         println!(
             "RESULT cosine: mean {mean:.5} min {:.5} p5 {:.5} max {:.5}",
             c[0],
-            c[5],
+            c[c.len() / 20],
             c[c.len() - 1]
         );
     }
