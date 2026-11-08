@@ -25,7 +25,10 @@ thing happens ("the trip is in March"). Values that must be single
 (`lives_in`, `job_title`) replace the old value and keep it in history;
 everything else accumulates. Nothing is ever deleted: a change closes a
 version and opens the next one, a correction marks a version as never
-true, and reads can be made `as_of` any moment.
+true, and reads can be made `as_of` any moment. What the person asserted
+outranks what an agent inferred: an inferred value never replaces an
+asserted one, it sits beside it as a reported contradiction until the
+next asserted write settles it.
 
 **Entities and spaces.** Entities have a kind, a key and aliases, and are
 the first thing recall looks for in a question. Facts live in spaces: one
@@ -42,7 +45,7 @@ are rejected with the reason; names close in meaning to an existing
 predicate get a hint ("looks like `goal`") and the agent decides whether
 to reuse it, declare a synonym or insist. Synonyms merge for the
 replacement rule without rewriting old facts. A starter vocabulary of
-twenty-two predicates ships with the engine.
+twenty-nine predicates ships with the engine.
 
 **Recall over three channels.** Entities named in the question, BM25
 over words, and cosine similarity of int8 vectors, fused by reciprocal
@@ -74,6 +77,13 @@ history did not add accuracy on this benchmark, and the embedding
 similarity hint for duplicate predicates is noisy, so the vocabulary
 relies on its hard rules and the starter set. The evaluation harness is
 not published yet.
+
+The embedder runs in-process on candle, in pure Rust, reading the same
+Q8 GGUF file as llama.cpp. On an M1 Pro it produces vectors identical to
+llama.cpp (cosine 1.0000 on 200 texts) in 676 MB of memory, at about
+13 ms per query against 10 ms for llama.cpp and at half its bulk
+throughput; the measurements, including the fusions and custom Metal
+kernels that did not pay off, are in `crates/embed-candle/EXPERIMENT.md`.
 
 ## Quick start
 
@@ -162,11 +172,14 @@ day one; no feature without a measurement.
 
 ## Roadmap
 
-- Hooks for Claude Code: recall on every prompt within a token budget, a
-  summary at session start, past / present / future tags on hits, stale
-  value warnings.
-- A vector cache on disk, so that opening a large memory is instant; a
-  daemon shared by all sessions on the machine.
+- A lessons log: the agent records its own mistakes with the situation
+  that should trigger them, and the prompt hook surfaces them when that
+  situation comes back.
+- Write-back at the end of a session: a hook that asks the agent what it
+  learned, the first step towards consolidation (inferred facts that never
+  override asserted ones).
+- A profile block at session start, contradiction candidates on every
+  write, import and export of memories kept by other tools.
 - A voice agent as the second consumer: memory between calls within a
   latency budget.
 - Memory about code and documents: symbols and files with edges from the
