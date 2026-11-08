@@ -9,7 +9,8 @@
 //! dense without any atomic counter. The same rule reproduces the same ids
 //! when the journal is replayed. An id that comes from outside (an API
 //! call, a deserialized request) is only a reference: the store checks that
-//! the record exists and belongs to the right space before using it.
+//! the record exists before using it. The space of a fact says where the
+//! fact lies, not what it refers to, so a reference may cross spaces.
 
 use std::fmt;
 

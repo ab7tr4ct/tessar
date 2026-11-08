@@ -142,7 +142,7 @@ impl FactBody {
     ///
     /// The version chain records changes of value, not rephrasings: the
     /// same value written in other words is not a new version.
-    pub fn same_content(&self, other: &FactBody) -> bool {
+    pub fn same_content(&self, other: &Self) -> bool {
         match (self, other) {
             (
                 Self::Triple {

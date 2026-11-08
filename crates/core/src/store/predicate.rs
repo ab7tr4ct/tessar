@@ -9,9 +9,10 @@
 //! ([`Op::MergePredicate`]).
 
 use super::draft::PredicateDraft;
-use super::error::StoreError;
+use super::error::{NotUniversal, StoreError};
 use super::op::Op;
 use super::plan::{Planner, mint};
+use super::text::name_candidates;
 use super::vector::Quantized;
 use crate::model::{Key, Name, PredicateDef, PredicateId, SpaceId, ValueType};
 
@@ -53,8 +54,8 @@ impl Planner<'_> {
     /// check. A new name must pass `check`:
     ///
     /// - format (always): at most [`MAX_NAME_WORDS`] words;
-    /// - universality (`Full`): no word is a number, and no word (nor the
-    ///   whole name with `_` as spaces) is the key or alias of an entity
+    /// - universality (`Full`): no word is a number, and no run of words
+    ///   of the name with `_` as spaces is the key or alias of an entity
     ///   in any space;
     /// - similarity (`Full` with a vector): the best cosine to the vectors
     ///   of existing predicates is below the threshold. A threshold of 1.0
@@ -83,9 +84,10 @@ impl Planner<'_> {
         if let ValueType::Entity(Some(kind)) = draft.object {
             state.kind(kind).ok_or(StoreError::UnknownKind(kind))?;
         }
-        check_format(&draft.name)?;
+        let words = name_words(&draft.name);
+        check_format(&draft.name, &words)?;
         if let PredicateCheck::Full { vector, threshold } = check {
-            self.check_universal(&draft.name)?;
+            self.check_universal(&draft.name, &words)?;
             if let Some(vector) = vector
                 && let Some((best, similarity)) = state.most_similar_predicate(vector)
                 && threshold < 1.0
@@ -111,31 +113,21 @@ impl Planner<'_> {
     }
 
     /// Rejects names with a number or the name of an entity in them.
-    fn check_universal(&self, name: &Name) -> Result<(), StoreError> {
-        let not_universal = |word: &str, reason: &str| StoreError::PredicateNotUniversal {
+    fn check_universal(&self, name: &Name, words: &[&str]) -> Result<(), StoreError> {
+        let not_universal = |word: &str, reason: NotUniversal| StoreError::PredicateNotUniversal {
             name: name.to_string(),
             word: word.to_owned(),
-            reason: reason.to_owned(),
+            reason,
         };
-        let words = name_words(name);
-        for word in &words {
-            if is_number(word) {
-                return Err(not_universal(word, "is a number"));
-            }
+        if let Some(word) = words.iter().find(|w| is_number(w)) {
+            return Err(not_universal(word, NotUniversal::Number));
         }
-        let names_entity = |text: &str| {
-            Key::new(text)
-                .map(|k| !self.state.entities_named(&k.normalized()).is_empty())
-                .unwrap_or(false)
-        };
-        for word in &words {
-            if names_entity(word) {
-                return Err(not_universal(word, "is the name of an entity"));
+        for candidate in name_candidates(&words.join(" "), MAX_NAME_WORDS) {
+            let names_entity = Key::new(candidate.as_str())
+                .is_ok_and(|k| !self.state.entities_named(&k.normalized()).is_empty());
+            if names_entity {
+                return Err(not_universal(&candidate, NotUniversal::EntityName));
             }
-        }
-        let whole = words.join(" ");
-        if words.len() > 1 && names_entity(&whole) {
-            return Err(not_universal(&whole, "is the name of an entity"));
         }
         Ok(())
     }
@@ -203,7 +195,7 @@ impl Planner<'_> {
                 Err(StoreError::NameTaken(format!("predicate {name}")))
             };
         }
-        check_format(&name)?;
+        check_format(&name, &name_words(&name))?;
         let (object, cardinality) = (target.object, target.cardinality);
         let id = mint(&mut self.next.predicates, PredicateId::new)?;
         self.ops.push(Op::DefinePredicate(PredicateDef {
@@ -220,12 +212,12 @@ impl Planner<'_> {
 }
 
 /// The non-empty parts of a name between underscores.
-fn name_words(name: &Name) -> Vec<&str> {
+pub(crate) fn name_words(name: &Name) -> Vec<&str> {
     name.as_str().split('_').filter(|w| !w.is_empty()).collect()
 }
 
-fn check_format(name: &Name) -> Result<(), StoreError> {
-    if name_words(name).len() > MAX_NAME_WORDS {
+pub(crate) fn check_format(name: &Name, words: &[&str]) -> Result<(), StoreError> {
+    if words.len() > MAX_NAME_WORDS {
         return Err(StoreError::PredicateNameTooLong {
             name: name.to_string(),
             max_words: MAX_NAME_WORDS,
@@ -236,6 +228,5 @@ fn check_format(name: &Name) -> Result<(), StoreError> {
 
 /// Whether a word is a number. `inf` and `nan` are words, not numbers.
 fn is_number(word: &str) -> bool {
-    word.chars().any(|c| c.is_ascii_digit())
-        && (word.parse::<i64>().is_ok() || word.parse::<f64>().is_ok())
+    word.chars().any(|c| c.is_ascii_digit()) && word.parse::<f64>().is_ok()
 }

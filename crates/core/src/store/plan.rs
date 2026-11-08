@@ -176,10 +176,10 @@ impl<'s> Planner<'s> {
             });
         };
         let body = self.body(replacement.body)?;
-        if !same_shape(&head.body, &body) {
+        if !self.same_shape(&head.body, &body) {
             return Err(StoreError::ShapeMismatch(update.lineage));
         }
-        if body.same_content(&head.body) {
+        if self.same_content(&body, &head.body) {
             return Ok(Recorded {
                 fact: head.id,
                 outcome: Outcome::Unchanged,
@@ -255,7 +255,7 @@ impl<'s> Planner<'s> {
                             });
                         }
                         check_expected(draft.expected_version, Some(lineage), Some(head.version))?;
-                        if head.body.same_content(&body) {
+                        if self.same_content(&head.body, &body) {
                             return Ok(Recorded {
                                 fact: head.id,
                                 outcome: Outcome::Unchanged,
@@ -288,7 +288,7 @@ impl<'s> Planner<'s> {
                     let same = lineages
                         .iter()
                         .filter_map(|&l| state.head(l))
-                        .find(|h| h.is_current() && h.body.same_content(&body));
+                        .find(|h| h.is_current() && self.same_content(&h.body, &body));
                     if let Some(existing) = same {
                         return Ok(Recorded {
                             fact: existing.id,
@@ -487,6 +487,60 @@ impl<'s> Planner<'s> {
         }
     }
 
+    /// Finds or creates the entity of `kind` with `key` (or that alias).
+    pub(crate) fn create_entity(
+        &mut self,
+        kind: EntityKindId,
+        key: Key,
+    ) -> Result<EntityId, StoreError> {
+        self.resolve(&EntityRef::Key { kind, key })
+    }
+
+    /// [`FactBody::same_content`] with the predicates of triples compared
+    /// by their canonical predicate, so a synonym written before a merge
+    /// equals its canonical.
+    fn same_content(&self, old: &FactBody, new: &FactBody) -> bool {
+        match (old, new) {
+            (
+                FactBody::Triple {
+                    predicate: p1,
+                    subject: s1,
+                    object: o1,
+                    ..
+                },
+                FactBody::Triple {
+                    predicate: p2,
+                    subject: s2,
+                    object: o2,
+                    ..
+                },
+            ) => s1 == s2 && o1 == o2 && self.state.canonical(*p1) == self.state.canonical(*p2),
+            _ => old.same_content(new),
+        }
+    }
+
+    /// Whether a replacement keeps the kind, subject and (canonical)
+    /// predicate.
+    fn same_shape(&self, old: &FactBody, new: &FactBody) -> bool {
+        match (old, new) {
+            (FactBody::Statement { .. }, FactBody::Statement { .. })
+            | (FactBody::Event { .. }, FactBody::Event { .. }) => true,
+            (
+                FactBody::Triple {
+                    subject: s1,
+                    predicate: p1,
+                    ..
+                },
+                FactBody::Triple {
+                    subject: s2,
+                    predicate: p2,
+                    ..
+                },
+            ) => s1 == s2 && self.state.canonical(*p1) == self.state.canonical(*p2),
+            _ => false,
+        }
+    }
+
     fn kind_of(&self, entity: EntityId) -> Option<EntityKindId> {
         self.state
             .entity(entity)
@@ -537,26 +591,5 @@ fn non_empty(text: String) -> Result<String, StoreError> {
         Ok(text)
     } else {
         Ok(trimmed.to_owned())
-    }
-}
-
-/// Whether a replacement keeps the kind, subject and predicate.
-fn same_shape(old: &FactBody, new: &FactBody) -> bool {
-    match (old, new) {
-        (FactBody::Statement { .. }, FactBody::Statement { .. })
-        | (FactBody::Event { .. }, FactBody::Event { .. }) => true,
-        (
-            FactBody::Triple {
-                subject: s1,
-                predicate: p1,
-                ..
-            },
-            FactBody::Triple {
-                subject: s2,
-                predicate: p2,
-                ..
-            },
-        ) => s1 == s2 && p1 == p2,
-        _ => false,
     }
 }

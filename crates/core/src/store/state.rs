@@ -145,8 +145,8 @@ impl State {
         self.vectors.as_ref()
     }
 
-    /// Turns the meaning channel on. Vectors of the facts already here
-    /// must be pushed next, in order.
+    /// Turns the meaning channel on. Vectors of the predicates and of the
+    /// facts already here must be pushed next, in order.
     pub(crate) fn enable_vectors(&mut self, dims: usize) {
         self.vectors = Some(VectorIndex::new(dims));
         self.predicate_vectors = Some(PredicateVectors::new(dims));
@@ -179,6 +179,15 @@ impl State {
         self.predicates
             .iter()
             .filter(|p| self.canonical(p.id) == p.id)
+    }
+
+    /// The synonyms of the canonical predicate of `id` (it excluded), in
+    /// id order.
+    pub(crate) fn synonyms_of(&self, id: PredicateId) -> impl Iterator<Item = &PredicateDef> {
+        let canonical = self.canonical(id);
+        self.predicates
+            .iter()
+            .filter(move |p| p.id != canonical && self.canonical(p.id) == canonical)
     }
 
     /// Every predicate, synonyms included, in id order.
@@ -226,22 +235,7 @@ impl State {
                 self.kind_by_name.insert(key, kind.id);
                 self.kinds.push(kind);
             }
-            Op::DefinePredicate(predicate) => {
-                expect_next("predicate", predicate.id.index(), self.predicates.len())?;
-                self.require_space(predicate.space)?;
-                if let ValueType::Entity(Some(kind)) = predicate.object
-                    && self.kind(kind).is_none()
-                {
-                    return Err(format!("unknown kind {kind}"));
-                }
-                let key = (predicate.space, predicate.name.clone());
-                if self.predicate_by_name.contains_key(&key) {
-                    return Err(format!("predicate {} is already defined", predicate.name));
-                }
-                self.predicate_by_name.insert(key, predicate.id);
-                self.canonical.push(predicate.id);
-                self.predicates.push(predicate);
-            }
+            Op::DefinePredicate(predicate) => self.add_predicate(predicate)?,
             Op::MergePredicate { from, into } => self.merge_predicate(from, into)?,
             Op::CreateEntity(entity) => {
                 expect_next("entity", entity.id.index(), self.entities.len())?;
@@ -306,6 +300,26 @@ impl State {
         Ok(())
     }
 
+    /// Adds a predicate: its space and entity kind exist, the name is free
+    /// in the space.
+    fn add_predicate(&mut self, predicate: PredicateDef) -> Result<(), String> {
+        expect_next("predicate", predicate.id.index(), self.predicates.len())?;
+        self.require_space(predicate.space)?;
+        if let ValueType::Entity(Some(kind)) = predicate.object
+            && self.kind(kind).is_none()
+        {
+            return Err(format!("unknown kind {kind}"));
+        }
+        let key = (predicate.space, predicate.name.clone());
+        if self.predicate_by_name.contains_key(&key) {
+            return Err(format!("predicate {} is already defined", predicate.name));
+        }
+        self.predicate_by_name.insert(key, predicate.id);
+        self.canonical.push(predicate.id);
+        self.predicates.push(predicate);
+        Ok(())
+    }
+
     /// Makes `from` a synonym of `into`: both exist, `into` is canonical,
     /// `from` is canonical (not merged yet) and not `into`, and value type
     /// and cardinality match. The pairs of `from` move under `into`, their
@@ -333,6 +347,13 @@ impl State {
             ));
         }
         self.canonical[from.index()] = into;
+        // Flatten chains: synonyms of `from` now point at `into`. Their
+        // pairs already sit under `from` and move with it below.
+        for c in &mut self.canonical {
+            if *c == from {
+                *c = into;
+            }
+        }
         let moved: Vec<(EntityId, PredicateId)> = self
             .pairs
             .keys()

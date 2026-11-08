@@ -20,7 +20,7 @@ pub use draft::{
     BodyDraft, EntityRef, EpisodeDraft, FactDraft, ObjectDraft, Outcome, PredicateDraft, Reason,
     Recorded, Remember, Remembered, Replacement, Update, View,
 };
-pub use error::StoreError;
+pub use error::{NotUniversal, StoreError};
 pub use memory::{Memory, Semantic};
 pub use op::Op;
 pub use recall::{Channels, Hit, Recall, Recalled, Why};

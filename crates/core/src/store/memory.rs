@@ -6,7 +6,7 @@ use super::draft::{PredicateDraft, Recorded, Remember, Remembered, Update, View}
 use super::error::StoreError;
 use super::op::Op;
 use super::plan::Planner;
-use super::predicate::{PredicateCheck, predicate_text};
+use super::predicate::{PredicateCheck, check_format, name_words, predicate_text};
 use super::recall::{Recall, Recalled, recall};
 use super::state::State;
 use super::text::{fact_text, fact_text_with};
@@ -141,13 +141,14 @@ impl Memory {
                     next += 1;
                 }
             }
-            let texts: Vec<(FactId, String)> = state
+            let (ids, texts): (Vec<FactId>, Vec<String>) = state
                 .facts()
                 .iter()
                 .map(|f| (f.id, fact_text(&state, f)))
-                .collect();
+                .unzip();
+            let mut ids = ids.into_iter();
             for batch in texts.chunks(EMBED_BATCH) {
-                for (fact, vector) in embed(semantic, batch)? {
+                for (fact, vector) in ids.by_ref().zip(embed_texts(semantic, batch)?) {
                     state
                         .push_vector(fact, vector)
                         .map_err(StoreError::Internal)?;
@@ -200,17 +201,27 @@ impl Memory {
         space: SpaceId,
         draft: PredicateDraft,
     ) -> Result<PredicateId, StoreError> {
-        let Some(semantic) = &self.inner.semantic else {
-            return self.write(|p| {
-                p.define_predicate(
-                    space,
-                    draft,
-                    PredicateCheck::Full {
-                        vector: None,
-                        threshold: 1.0,
-                    },
-                )
-            });
+        // Cheap checks first: a name that already exists is reused (or
+        // conflicts) without a vector, and a malformed name never reaches
+        // the embedder.
+        let known = self.state().predicate_named(space, &draft.name).is_some();
+        let semantic = match &self.inner.semantic {
+            Some(semantic) if !known => {
+                check_format(&draft.name, &name_words(&draft.name))?;
+                semantic
+            }
+            _ => {
+                return self.write(|p| {
+                    p.define_predicate(
+                        space,
+                        draft,
+                        PredicateCheck::Full {
+                            vector: None,
+                            threshold: 1.0,
+                        },
+                    )
+                });
+            }
         };
         let text = predicate_text(&draft.name, &draft.description);
         let vector = embed_texts(semantic, std::slice::from_ref(&text))?
@@ -270,10 +281,22 @@ impl Memory {
         state.predicate(id).map(|_| state.canonical(id))
     }
 
+    /// The synonyms of the canonical predicate of `id` (it excluded), in id
+    /// order. Empty for an unknown id.
+    pub fn synonyms_of(&self, id: PredicateId) -> Vec<PredicateDef> {
+        self.state().synonyms_of(id).cloned().collect()
+    }
+
     /// The vocabulary: every canonical predicate, in id order. Synonyms are
     /// left out.
     pub fn predicates(&self) -> Vec<PredicateDef> {
         self.state().canonical_predicates().cloned().collect()
+    }
+
+    /// Finds or creates the entity of `kind` with `key` (or that alias), in
+    /// the kind's space. Returns its id. An existing entity writes nothing.
+    pub fn create_entity(&self, kind: EntityKindId, key: Key) -> Result<EntityId, StoreError> {
+        self.write(|p| p.create_entity(kind, key))
     }
 
     /// Adds another name to an entity.
@@ -454,30 +477,28 @@ impl Memory {
         // Embedding is slow; it runs before the log, so a failure writes
         // nothing, and without the state lock, so readers go on.
         let mut predicate_vectors: Vec<(PredicateId, Quantized)> = Vec::new();
-        let mut to_embed: Vec<(PredicateId, String)> = Vec::new();
+        // One batch for the new predicates, then the new facts. Ids and
+        // texts are kept apart so no text is cloned.
+        let mut embed_ids: Vec<PredicateId> = Vec::new();
+        let mut strings: Vec<String> = Vec::new();
         for (id, text) in predicate_texts {
             match known {
                 Some((t, q)) if t == text => predicate_vectors.push((id, q.clone())),
-                _ => to_embed.push((id, text)),
+                _ => {
+                    embed_ids.push(id);
+                    strings.push(text);
+                }
             }
         }
-        let vectors = match &self.inner.semantic {
-            Some(semantic) if !texts.is_empty() || !to_embed.is_empty() => {
-                // One batch for the new predicates and the new facts.
-                let strings: Vec<String> = to_embed
-                    .iter()
-                    .map(|(_, t)| t.clone())
-                    .chain(texts.iter().map(|(_, t)| t.clone()))
-                    .collect();
-                let mut all = embed_texts(semantic, &strings)?.into_iter();
-                for ((id, _), v) in to_embed.iter().zip(all.by_ref()) {
-                    predicate_vectors.push((*id, v));
-                }
-                texts
-                    .iter()
-                    .zip(all)
-                    .map(|((id, _), v)| (*id, v))
-                    .collect::<Vec<(FactId, Quantized)>>()
+        let new_predicates = embed_ids.len();
+        let (fact_ids, fact_strings): (Vec<FactId>, Vec<String>) = texts.into_iter().unzip();
+        strings.extend(fact_strings);
+        let vectors: Vec<(FactId, Quantized)> = match &self.inner.semantic {
+            Some(semantic) if !strings.is_empty() => {
+                let mut all = embed_texts(semantic, &strings)?;
+                let fact_vectors = all.split_off(new_predicates);
+                predicate_vectors.extend(embed_ids.into_iter().zip(all));
+                fact_ids.into_iter().zip(fact_vectors).collect()
             }
             _ => Vec::new(),
         };
@@ -567,26 +588,5 @@ fn embed_texts(semantic: &Semantic, texts: &[String]) -> Result<Vec<Quantized>, 
     vectors
         .iter()
         .map(|v| Quantized::new(v, semantic.dims))
-        .collect()
-}
-
-/// Embeds fact texts and prepares the vectors for the index.
-fn embed(
-    semantic: &Semantic,
-    texts: &[(FactId, String)],
-) -> Result<Vec<(FactId, Quantized)>, EmbedError> {
-    let strings: Vec<String> = texts.iter().map(|(_, t)| t.clone()).collect();
-    let vectors = semantic.embedder.embed_documents(&strings)?;
-    if vectors.len() != texts.len() {
-        return Err(EmbedError(format!(
-            "{} vectors for {} texts",
-            vectors.len(),
-            texts.len()
-        )));
-    }
-    texts
-        .iter()
-        .zip(vectors)
-        .map(|((fact, _), v)| Ok((*fact, Quantized::new(&v, semantic.dims)?)))
         .collect()
 }

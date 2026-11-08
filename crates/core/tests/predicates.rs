@@ -9,7 +9,8 @@ use common::*;
 use tessar_core::embed::{EmbedError, Embedder};
 use tessar_core::model::{Cardinality, FactBody, PredicateId, Value, ValueType};
 use tessar_core::store::{
-    BodyDraft, FactDraft, Memory, ObjectDraft, Outcome, PredicateDraft, Semantic, StoreError,
+    BodyDraft, FactDraft, Memory, NotUniversal, ObjectDraft, Outcome, PredicateDraft, Reason,
+    Replacement, Semantic, StoreError, Update,
 };
 use tessar_core::vocab;
 
@@ -98,8 +99,7 @@ fn plans_visit() -> PredicateDraft {
     )
 }
 
-/// The predicate id the store gave a name, found through a synonym's
-/// definition order: ids are consecutive record numbers.
+/// A predicate id that may not exist: ids are consecutive record numbers.
 fn pid(n: u32) -> PredicateId {
     serde_json::from_str(&n.to_string()).unwrap()
 }
@@ -204,7 +204,7 @@ fn a_number_in_the_name_is_rejected() {
         }
         match r.unwrap_err() {
             StoreError::PredicateNotUniversal { reason, .. } => {
-                assert_eq!(reason, "is a number", "{n}");
+                assert_eq!(reason, NotUniversal::Number, "{n}");
             }
             other => panic!("{n}: {other}"),
         }
@@ -230,7 +230,7 @@ fn an_entity_name_in_the_name_is_rejected() {
     {
         StoreError::PredicateNotUniversal { word, reason, .. } => {
             assert_eq!(word, "japan");
-            assert_eq!(reason, "is the name of an entity");
+            assert_eq!(reason, NotUniversal::EntityName);
         }
         other => panic!("{other}"),
     }
@@ -282,7 +282,7 @@ fn whole_name_matches_an_entity_with_several_words() {
     {
         StoreError::PredicateNotUniversal { word, reason, .. } => {
             assert_eq!(word, "works at");
-            assert_eq!(reason, "is the name of an entity");
+            assert_eq!(reason, NotUniversal::EntityName);
         }
         other => panic!("{other}"),
     }
@@ -396,7 +396,10 @@ fn alias_writes_under_the_canonical_predicate() {
         .alias_predicate(w.space, name("aim"), "what to achieve".into(), w.goal)
         .unwrap();
     assert_eq!(canonical, w.goal);
-    let alias = pid(4); // the next id after the world's four predicates
+    let synonyms = w.memory.synonyms_of(w.goal);
+    assert_eq!(synonyms.len(), 1);
+    assert_eq!(w.memory.synonyms_of(synonyms[0].id).len(), 1);
+    let alias = synonyms[0].id;
 
     // The synonym is not in the vocabulary, but is a known predicate.
     let names: Vec<_> = w
@@ -462,11 +465,11 @@ fn single_valued_replacement_works_across_synonyms() {
             predicate("target", ValueType::Text, Cardinality::Single),
         )
         .unwrap();
-    let a = w.remember_one(set_single(&w, "anna", from, "v1"));
+    let a = w.remember_one(set(&w, "anna", from, "v1"));
     assert_eq!(a.outcome, Outcome::Created);
 
     w.memory.merge_predicates(from, w.goal).unwrap();
-    let b = w.remember_one(set_single(&w, "anna", w.goal, "v2"));
+    let b = w.remember_one(set(&w, "anna", w.goal, "v2"));
     assert_eq!(
         a.fact,
         match b.outcome {
@@ -483,10 +486,6 @@ fn single_valued_replacement_works_across_synonyms() {
     assert_eq!(stored_predicate(&w, b), w.goal);
     // Reading by the synonym finds the same.
     assert_eq!(w.memory.values_of(anna, from).len(), 1);
-}
-
-fn set_single(w: &World, who: &str, predicate: PredicateId, text: &str) -> FactDraft {
-    set(w, who, predicate, text)
 }
 
 #[test]
@@ -684,4 +683,155 @@ fn the_starter_vocabulary_applies_to_a_fresh_memory() {
         }
         assert_eq!(memory.predicates().len(), all.len());
     }
+}
+
+#[test]
+fn merge_chains_are_flattened() {
+    let w = World::new();
+    let a = single_text(&w, "aim");
+    let goal2 = single_text(&w, "objective");
+    let target = single_text(&w, "target");
+    w.memory.merge_predicates(a, goal2).unwrap();
+    w.memory.merge_predicates(goal2, target).unwrap();
+    assert_eq!(w.memory.canonical_predicate(a), Some(target));
+    assert_eq!(w.memory.canonical_predicate(goal2), Some(target));
+
+    // A write through the first synonym lands under the final target.
+    let written = w.remember_one(set(&w, "anna", a, "ship it"));
+    let anna = w.entity(w.person, "anna");
+    assert_eq!(w.memory.values_of(anna, a).len(), 1);
+    assert_eq!(w.memory.values_of(anna, target).len(), 1);
+    assert_eq!(w.memory.values_of(anna, a)[0].id, written.fact);
+    let found = w.memory.predicate_named(w.space, "aim").unwrap();
+    assert_eq!(found.id, target);
+}
+
+#[test]
+fn multi_word_entity_inside_a_name_is_rejected() {
+    let w = World::new();
+    w.remember(vec![w.lives_in("anna", "New York")]);
+    match w
+        .memory
+        .define_predicate(w.space, text_draft("plans_trip_new_york"))
+        .unwrap_err()
+    {
+        StoreError::PredicateNotUniversal { word, reason, .. } => {
+            assert_eq!(word, "new york");
+            assert_eq!(reason, NotUniversal::EntityName);
+        }
+        other => panic!("{other}"),
+    }
+}
+
+/// Works until switched off.
+struct Switch(Arc<std::sync::atomic::AtomicBool>);
+impl Embedder for Switch {
+    fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
+        if self.0.load(std::sync::atomic::Ordering::SeqCst) {
+            Err(EmbedError("down".into()))
+        } else {
+            Ok(texts.iter().map(|t| embed(t)).collect())
+        }
+    }
+    fn embed_query(&self, text: &str) -> Result<Vec<f32>, EmbedError> {
+        self.embed_documents(&[text.to_owned()])
+            .map(|mut v| v.remove(0))
+    }
+}
+
+#[test]
+fn cheap_checks_run_before_the_embedder() {
+    let down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let clock = Arc::new(tessar_core::clock::ManualClock::new(ts(1)));
+    let memory = Memory::open_with(
+        SharedLog::default(),
+        clock,
+        Semantic {
+            embedder: Arc::new(Switch(down.clone())),
+            dims: DIMS,
+            near_bonus: 0.0,
+            predicate_threshold: THRESHOLD,
+        },
+    )
+    .unwrap();
+    let space = memory
+        .create_space(key("s"), tessar_core::model::SpaceKind::LongTerm, None)
+        .unwrap();
+    let owns = memory.define_predicate(space, text_draft("owns")).unwrap();
+
+    down.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        memory.define_predicate(space, text_draft("owns")).unwrap(),
+        owns
+    );
+    let err = memory
+        .define_predicate(space, text_draft("one_two_three_four_five"))
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::PredicateNameTooLong { .. }),
+        "{err}"
+    );
+    // A new valid name still needs the embedder.
+    let err = memory
+        .define_predicate(space, text_draft("likes"))
+        .unwrap_err();
+    assert!(matches!(err, StoreError::Embed(_)), "{err}");
+}
+
+#[test]
+fn create_entity_finds_or_creates_in_the_kind_space() {
+    let w = World::new();
+    let commits = w.log.commits();
+    let id = w.memory.create_entity(w.place, key("Atlantis")).unwrap();
+    assert_eq!(w.log.commits(), commits + 1);
+    assert_eq!(w.memory.entity(id).unwrap().space, w.space);
+    let again = w.memory.create_entity(w.place, key("atlantis")).unwrap();
+    assert_eq!(again, id);
+    assert_eq!(w.log.commits(), commits + 1);
+    let err = w
+        .memory
+        .define_predicate(w.space, text_draft("visits_atlantis"))
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::PredicateNotUniversal { .. }),
+        "{err}"
+    );
+}
+
+#[test]
+fn bodies_compare_by_canonical_predicate() {
+    let w = World::new();
+    let from = single_text(&w, "target");
+    let first = w.remember_one(set(&w, "anna", from, "v1"));
+    w.memory.merge_predicates(from, w.goal).unwrap();
+
+    // The same value under the canonical predicate is not a change.
+    let same = w.remember_one(set(&w, "anna", w.goal, "v1"));
+    assert_eq!(same.outcome, Outcome::Unchanged);
+    assert_eq!(same.fact, first.fact);
+
+    // An update naming the canonical predicate keeps the shape.
+    let replaced = w
+        .memory
+        .update(Update {
+            lineage: w.fact(first).lineage,
+            expected_version: v(1),
+            reason: Reason::Correction,
+            replacement: Some(Replacement {
+                body: BodyDraft::Triple {
+                    subject: w.person("anna"),
+                    predicate: w.goal,
+                    object: ObjectDraft::Value(Value::Text("v2".into())),
+                    text: None,
+                },
+                mentions: vec![],
+            }),
+            origin: origin(),
+        })
+        .unwrap();
+    assert!(
+        matches!(replaced.outcome, Outcome::Superseded { .. }),
+        "{:?}",
+        replaced.outcome
+    );
 }

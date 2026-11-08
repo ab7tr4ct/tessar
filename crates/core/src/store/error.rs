@@ -50,17 +50,6 @@ pub enum StoreError {
     #[error("unknown fact lineage {0}")]
     UnknownLineage(Lineage),
 
-    /// A record from another space was used.
-    #[error("{record} belongs to space {found}, not {expected}")]
-    WrongSpace {
-        /// The record, for example `e3`.
-        record: String,
-        /// The space of the write.
-        expected: SpaceId,
-        /// The space of the record.
-        found: SpaceId,
-    },
-
     /// The space is archived and read-only.
     #[error("space {0} is archived")]
     SpaceArchived(SpaceId),
@@ -93,8 +82,8 @@ pub enum StoreError {
         name: String,
         /// The offending word.
         word: String,
-        /// Why: "is a number", "is the name of an entity".
-        reason: String,
+        /// Why the word is not allowed.
+        reason: NotUniversal,
     },
 
     /// A predicate with a similar meaning already exists. The caller may
@@ -190,4 +179,22 @@ pub enum StoreError {
     /// A writer panicked earlier; reopen the memory.
     #[error("a writer panicked earlier; reopen the memory")]
     Poisoned,
+}
+
+/// Why a word of a predicate name is not universal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotUniversal {
+    /// The word is a number.
+    Number,
+    /// The word (or run of words) is the name of an entity.
+    EntityName,
+}
+
+impl std::fmt::Display for NotUniversal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Number => "is a number",
+            Self::EntityName => "is the name of an entity",
+        })
+    }
 }
