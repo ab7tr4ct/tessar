@@ -159,7 +159,6 @@ fn candle_vs_llama() {
         dtype,
         append_eos: env("CANDLE_EOS").as_deref() == Some("1"),
         fused: env("TESSAR_CANDLE_NO_SDPA").is_none(),
-        kernels: env("CANDLE_NO_KERNELS").is_none(),
     };
 
     let mut reference = None;

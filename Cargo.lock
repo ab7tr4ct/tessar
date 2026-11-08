@@ -2407,10 +2407,8 @@ name = "tessar-embed-candle"
 version = "0.1.0"
 dependencies = [
  "candle-core",
- "candle-metal-kernels",
  "candle-nn",
  "half",
- "objc2-metal",
  "serde",
  "serde_json",
  "tessar-core",

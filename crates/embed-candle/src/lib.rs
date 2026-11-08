@@ -2,9 +2,6 @@
 //! no C++. See `EXPERIMENT.md`.
 
 mod model;
-// Public only so that `tests/profile.rs` can time the kernels; not a stable API.
-#[doc(hidden)]
-pub mod ops;
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -49,9 +46,6 @@ pub struct Options {
     pub append_eos: bool,
     /// Use the fused Metal attention kernel (no effect on the CPU).
     pub fused: bool,
-    /// Use the custom Metal/CPU kernels (`swiglu`, `add_rmsnorm`) instead of
-    /// composed candle ops. Same math, fewer launches.
-    pub kernels: bool,
 }
 
 impl Default for Options {
@@ -64,7 +58,6 @@ impl Default for Options {
             dtype: DType::F16,
             append_eos: false,
             fused: true,
-            kernels: true,
         }
     }
 }
@@ -157,7 +150,7 @@ impl CandleEmbedder {
         let bytes = std::fs::read(dir.join("model.safetensors")).map_err(err)?;
         let vb =
             VarBuilder::from_buffered_safetensors(bytes, options.dtype, &device).map_err(err)?;
-        let model = model::Model::load(&cfg, vb, options.fused, options.kernels).map_err(err)?;
+        let model = model::Model::load(&cfg, vb, options.fused).map_err(err)?;
         Self::assemble(model, tokenizer, device, options)
     }
 
@@ -172,8 +165,7 @@ impl CandleEmbedder {
         let tokenizer = Tokenizer::from_file(tokenizer_json.as_ref()).map_err(err)?;
         let device = pick_device(options.device)?;
         let file = std::fs::File::open(gguf.as_ref()).map_err(err)?;
-        let model =
-            model::Model::load_gguf(file, &device, options.fused, options.kernels).map_err(err)?;
+        let model = model::Model::load_gguf(file, &device, options.fused).map_err(err)?;
         Self::assemble(model, tokenizer, device, options)
     }
 
@@ -218,6 +210,15 @@ impl CandleEmbedder {
     /// `voyage-4-nano` in `model_dir` with its prompts.
     pub fn voyage_nano(model_dir: impl AsRef<Path>) -> Result<Self, EmbedError> {
         Ok(Self::load(model_dir, &Options::default())?.with_prompts(Prompts::voyage()))
+    }
+
+    /// `voyage-4-nano` from a GGUF file and its `tokenizer.json`, with its
+    /// prompts. Mirrors `LlamaEmbedder::voyage_nano`.
+    pub fn voyage_nano_gguf(
+        gguf: impl AsRef<Path>,
+        tokenizer: impl AsRef<Path>,
+    ) -> Result<Self, EmbedError> {
+        Ok(Self::load_gguf(gguf, tokenizer, &Options::default())?.with_prompts(Prompts::voyage()))
     }
 
     /// Sets the instructions before queries and documents.

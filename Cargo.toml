@@ -16,8 +16,6 @@ tessar-embed-cache = { path = "crates/embed-cache" }
 tessar-embed-candle = { path = "crates/embed-candle" }
 candle-core = "0.11"
 candle-nn = "0.11"
-candle-metal-kernels = "0.11"
-objc2-metal = "0.3"
 tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
 cmake = "0.1.58"
 crc32fast = "1.5"

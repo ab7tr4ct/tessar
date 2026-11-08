@@ -375,6 +375,5 @@ medians with kernels on: p50 12.1 > 12.0, p95 13.9 > 13.2 and bulk 119 < 121 all
 better than the composed ops (about 0.3 ms on p50, 0.4 ms on p95, +1 text/s) and the
 machine itself was about 5% slower than in the first session (llama.cpp query
 10.6 / 11.7 ms against 10.1 / 10.6 ms). The rule says: record the numbers, delete the
-kernel code, keep the commit hash. The code is in commit `1e77400` (`ops.rs`,
-`kernels/*.metal`); whether to delete it is the coordinator's call, it is still in the
-tree on branch `e15c-kernels`.
+kernel code, keep the commit hash. The code has been removed from the tree; the kernels
+live in commit `1e77400` (sources in `src/kernels/`, ops in `src/ops.rs`).
