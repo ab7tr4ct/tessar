@@ -25,4 +25,4 @@ pub use error::{NotUniversal, StoreError};
 pub use memory::{Memory, Semantic};
 pub use op::Op;
 pub use purge::{PurgeReport, purge, purge_with_report};
-pub use recall::{Channels, Hit, Recall, Recalled, Why};
+pub use recall::{Channels, Fusion, Hit, Recall, Recalled, Why};

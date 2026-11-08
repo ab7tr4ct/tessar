@@ -26,9 +26,9 @@ use super::draft::View;
 use super::state::State;
 use super::text::{fact_text, name_candidates, words};
 use super::vector::Quantized;
-use crate::model::{Ending, EntityId, Fact, FactId, Interval, SpaceId, Timestamp};
+use crate::model::{Ending, EntityId, Fact, FactId, Interval, SpaceId, TimeSpan, Timestamp};
 
-/// RRF constant: how quickly the weight of lower places falls.
+/// Default RRF constant: how quickly the weight of lower places falls.
 const RRF_K: f32 = 60.0;
 /// How many candidates each channel passes to fusion.
 const CANDIDATES: usize = 100;
@@ -60,6 +60,40 @@ pub struct Recall {
     pub limit: usize,
     /// Weight of each channel in fusion.
     pub channels: Channels,
+    /// The RRF constant `k` in `1 / (k + place)`: the larger, the flatter
+    /// the weight of lower places. Default 60.
+    pub rrf_k: f32,
+    /// How the channels are combined.
+    pub fusion: Fusion,
+    /// If set, the window bonus depends on how tightly the fact's `when`
+    /// fits the window: with `span` the length of the fact's `when` and
+    /// `len` the window length, the bonus is
+    /// `1 + (WINDOW_BONUS - 1) * min(1, len / span)`, `WINDOW_BONUS`
+    /// being 1.5. A point (and a fact without `when`, which is placed by
+    /// its validity) is tight and keeps the full bonus; an open span
+    /// ([`TimeSpan::Since`], [`TimeSpan::Until`]) is infinitely wide and
+    /// gets none. Default off: any fact inside the window gets the full
+    /// bonus.
+    pub time_tightness: bool,
+}
+
+/// How the channels are combined into one score.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Fusion {
+    /// Weighted reciprocal rank fusion over all channels: every channel
+    /// can bring candidates.
+    #[default]
+    Rrf,
+    /// Candidates come only from the meaning channel; the entity and
+    /// keyword channels only re-rank them. The score is the meaning RRF
+    /// term times `1 + coverage * (entities * [entity hit] + keywords *
+    /// [keyword hit])`, where the weights are those of [`Channels`] and
+    /// coverage is the share of query concepts the fact covers. Facts
+    /// found only by the lexical channels are dropped. Mem0 calls BM25
+    /// "a boost signal, not a recall expander". Without the meaning
+    /// channel (no embedder, or weight zero) this is the same as
+    /// [`Fusion::Rrf`].
+    Boost,
 }
 
 /// Weight of each channel in fusion: its RRF term is multiplied by it.
@@ -104,6 +138,9 @@ impl Recall {
             window: None,
             limit: 10,
             channels: Channels::default(),
+            rrf_k: RRF_K,
+            fusion: Fusion::Rrf,
+            time_tightness: false,
         }
     }
 }
@@ -301,7 +338,8 @@ pub(crate) fn recall(
     near_bonus: f32,
 ) -> Recalled {
     let prepared = prepare(state, query, vector, near_bonus);
-    let rrf = |i: usize| 1.0 / (RRF_K + (i + 1) as f32);
+    let k = query.rrf_k;
+    let rrf = |i: usize| 1.0 / (k + (i + 1) as f32);
 
     let on = query.channels;
     let mut fused: HashMap<FactId, Ranks> = HashMap::new();
@@ -320,6 +358,7 @@ pub(crate) fn recall(
         run(&MeaningChannel, |r| &mut r.meaning);
     }
 
+    let boost = query.fusion == Fusion::Boost && on.meaning > 0.0 && prepared.vector.is_some();
     let concepts = prepared.concepts();
     let mut hits: Vec<Hit> = fused
         .into_iter()
@@ -332,9 +371,19 @@ pub(crate) fn recall(
             let lexical = on.entities * ranks.entity.map_or(0.0, |i| rrf(i - 1))
                 + on.keywords * ranks.keyword.map_or(0.0, |i| rrf(i - 1));
             let meaning = on.meaning * ranks.meaning.map_or(0.0, |i| rrf(i - 1));
-            let mut score = lexical * covered as f32 / concepts.max(1) as f32 + meaning;
+            let coverage = covered as f32 / concepts.max(1) as f32;
+            let mut score = if boost {
+                ranks.meaning?;
+                let hit = |rank: Option<usize>| if rank.is_some() { 1.0 } else { 0.0 };
+                meaning
+                    * (1.0
+                        + coverage
+                            * (on.entities * hit(ranks.entity) + on.keywords * hit(ranks.keyword)))
+            } else {
+                lexical * coverage + meaning
+            };
             if in_window {
-                score *= WINDOW_BONUS;
+                score *= window_bonus(fact, query);
             }
             let similarity = prepared
                 .vector
@@ -422,6 +471,26 @@ fn prepare<'q>(
         vector,
         near_bonus,
     }
+}
+
+/// The score multiplier for a fact inside the query window.
+fn window_bonus(fact: &Fact, query: &Recall) -> f32 {
+    let (Some(window), true) = (query.window, query.time_tightness) else {
+        return WINDOW_BONUS;
+    };
+    let window_len = (window.end().as_millis() - window.start().as_millis()) as f64;
+    let span_len = match fact.body.when() {
+        None | Some(TimeSpan::Point(_)) => return WINDOW_BONUS,
+        Some(TimeSpan::Range(r)) => (r.end().as_millis() - r.start().as_millis()) as f64,
+        Some(TimeSpan::Duration(d)) => d.as_millis() as f64,
+        Some(TimeSpan::Since(_) | TimeSpan::Until(_)) => f64::INFINITY,
+    };
+    let tight = if span_len <= window_len {
+        1.0
+    } else {
+        window_len / span_len
+    };
+    1.0 + (WINDOW_BONUS - 1.0) * tight as f32
 }
 
 /// Whether a fact falls inside a window: by when it happens, or else by
