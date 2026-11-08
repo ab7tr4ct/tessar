@@ -175,18 +175,26 @@ impl<'s> Planner<'s> {
                 outcome: Outcome::Closed,
             });
         };
-        let body = self.body(head.space, replacement.body)?;
+        let body = self.body(replacement.body)?;
         if !same_shape(&head.body, &body) {
             return Err(StoreError::ShapeMismatch(update.lineage));
         }
-        if body == head.body {
+        if body.same_content(&head.body) {
             return Ok(Recorded {
                 fact: head.id,
                 outcome: Outcome::Unchanged,
             });
         }
-        let mentions = self.resolve_all(head.space, &replacement.mentions)?;
-        let id = self.push_version(head, body, mentions, None, &update.origin, valid_from)?;
+        let mentions = self.resolve_all(&replacement.mentions)?;
+        let id = self.push_version(
+            head,
+            head.space,
+            body,
+            mentions,
+            None,
+            &update.origin,
+            valid_from,
+        )?;
         self.close(head.id, ending, Some(id));
         Ok(Recorded {
             fact: id,
@@ -194,6 +202,16 @@ impl<'s> Planner<'s> {
         })
     }
 
+    /// Plans one fact of a write, lying in `space`.
+    ///
+    /// For a single-valued pair, the replacement rule works across spaces:
+    /// the pair index is global, so a new value written to `space`
+    /// supersedes the current version written to another one, and the new
+    /// version lies in `space`.
+    ///
+    /// A write with the same value and another `text` is
+    /// [`Outcome::Unchanged`] and does not store the new text (see
+    /// [`FactBody::same_content`]).
     fn remember_fact(
         &mut self,
         space: SpaceId,
@@ -202,8 +220,8 @@ impl<'s> Planner<'s> {
         draft: FactDraft,
     ) -> Result<Recorded, StoreError> {
         let state = self.state;
-        let body = self.body(space, draft.body)?;
-        let mentions = self.resolve_all(space, &draft.mentions)?;
+        let body = self.body(draft.body)?;
+        let mentions = self.resolve_all(&draft.mentions)?;
         let valid_from = draft.valid_from.unwrap_or(self.at);
 
         if let FactBody::Triple {
@@ -228,15 +246,16 @@ impl<'s> Planner<'s> {
                         })?;
                         if !head.is_current() {
                             check_expected(draft.expected_version, Some(lineage), None)?;
-                            let id = self
-                                .push_version(head, body, mentions, episode, origin, valid_from)?;
+                            let id = self.push_version(
+                                head, space, body, mentions, episode, origin, valid_from,
+                            )?;
                             return Ok(Recorded {
                                 fact: id,
                                 outcome: Outcome::Created,
                             });
                         }
                         check_expected(draft.expected_version, Some(lineage), Some(head.version))?;
-                        if head.body == body {
+                        if head.body.same_content(&body) {
                             return Ok(Recorded {
                                 fact: head.id,
                                 outcome: Outcome::Unchanged,
@@ -248,8 +267,9 @@ impl<'s> Planner<'s> {
                                 valid_from: head.valid_from,
                             });
                         }
-                        let id =
-                            self.push_version(head, body, mentions, episode, origin, valid_from)?;
+                        let id = self.push_version(
+                            head, space, body, mentions, episode, origin, valid_from,
+                        )?;
                         self.close(
                             head.id,
                             Ending::Changed {
@@ -268,7 +288,7 @@ impl<'s> Planner<'s> {
                     let same = lineages
                         .iter()
                         .filter_map(|&l| state.head(l))
-                        .find(|h| h.is_current() && h.body == body);
+                        .find(|h| h.is_current() && h.body.same_content(&body));
                     if let Some(existing) = same {
                         return Ok(Recorded {
                             fact: existing.id,
@@ -318,10 +338,12 @@ impl<'s> Planner<'s> {
         Ok(id)
     }
 
-    /// Plans the next version of `head`'s lineage.
+    /// Plans the next version of `head`'s lineage, lying in `space`.
+    #[allow(clippy::too_many_arguments)]
     fn push_version(
         &mut self,
         head: &Fact,
+        space: SpaceId,
         body: FactBody,
         mentions: Vec<EntityId>,
         episode: Option<EpisodeId>,
@@ -335,7 +357,7 @@ impl<'s> Planner<'s> {
         let id = mint(&mut self.next.facts, FactId::new)?;
         self.ops.push(Op::AddFact(Fact {
             id,
-            space: head.space,
+            space,
             lineage: head.lineage,
             version,
             prev: Some(head.id),
@@ -362,7 +384,7 @@ impl<'s> Planner<'s> {
     }
 
     /// Checks a fact draft's content and resolves its entity references.
-    fn body(&mut self, space: SpaceId, draft: BodyDraft) -> Result<FactBody, StoreError> {
+    fn body(&mut self, draft: BodyDraft) -> Result<FactBody, StoreError> {
         let state = self.state;
         match draft {
             BodyDraft::Statement { text, when } => Ok(FactBody::Statement {
@@ -375,7 +397,7 @@ impl<'s> Planner<'s> {
                 when,
             } => Ok(FactBody::Event {
                 text: non_empty(text)?,
-                participants: self.resolve_all(space, &participants)?,
+                participants: self.resolve_all(&participants)?,
                 when,
             }),
             BodyDraft::Triple {
@@ -384,7 +406,7 @@ impl<'s> Planner<'s> {
                 object,
                 text,
             } => {
-                let subject = self.resolve(space, &subject)?;
+                let subject = self.resolve(&subject)?;
                 // A synonym is written under its canonical predicate; the
                 // predicate may belong to any space.
                 let predicate = state.canonical(predicate);
@@ -393,10 +415,10 @@ impl<'s> Planner<'s> {
                     .ok_or(StoreError::UnknownPredicate(predicate))?;
                 let object = match object {
                     ObjectDraft::Value(Value::Entity(id)) => {
-                        Value::Entity(self.resolve(space, &EntityRef::Id(id))?)
+                        Value::Entity(self.resolve(&EntityRef::Id(id))?)
                     }
                     ObjectDraft::Value(value) => value,
-                    ObjectDraft::Entity(entity) => Value::Entity(self.resolve(space, &entity)?),
+                    ObjectDraft::Entity(entity) => Value::Entity(self.resolve(&entity)?),
                 };
                 if !def.object.accepts(&object, |e| self.kind_of(e)) {
                     return Err(StoreError::TypeMismatch {
@@ -418,32 +440,28 @@ impl<'s> Planner<'s> {
         }
     }
 
-    fn resolve_all(
-        &mut self,
-        space: SpaceId,
-        refs: &[EntityRef],
-    ) -> Result<Vec<EntityId>, StoreError> {
-        refs.iter().map(|r| self.resolve(space, r)).collect()
+    fn resolve_all(&mut self, refs: &[EntityRef]) -> Result<Vec<EntityId>, StoreError> {
+        refs.iter().map(|r| self.resolve(r)).collect()
     }
 
     /// Finds the entity, or plans creating it. Within one transaction the
     /// same key always resolves to the same entity.
-    fn resolve(&mut self, space: SpaceId, entity: &EntityRef) -> Result<EntityId, StoreError> {
+    ///
+    /// An entity may lie in any space: the space of a fact says where the
+    /// fact lies, not what it may refer to. A new entity is created in the
+    /// space of its kind.
+    fn resolve(&mut self, entity: &EntityRef) -> Result<EntityId, StoreError> {
         let state = self.state;
         match entity {
             EntityRef::Id(id) => {
-                let e = state.entity(*id).ok_or(StoreError::UnknownEntity(*id))?;
-                if e.space != space {
-                    return Err(StoreError::WrongSpace {
-                        record: id.to_string(),
-                        expected: space,
-                        found: e.space,
-                    });
-                }
+                state.entity(*id).ok_or(StoreError::UnknownEntity(*id))?;
                 Ok(*id)
             }
             EntityRef::Key { kind, key } => {
-                self.kind_in(*kind, space)?;
+                let space = state
+                    .kind(*kind)
+                    .ok_or(StoreError::UnknownKind(*kind))?
+                    .space;
                 let name = key.normalized();
                 if let Some(id) = state.entity_named(space, *kind, &name) {
                     return Ok(id);
@@ -452,6 +470,7 @@ impl<'s> Planner<'s> {
                 if let Some(&id) = self.new_entities.get(&slot) {
                     return Ok(id);
                 }
+                self.open_space(space)?;
                 let id = mint(&mut self.next.entities, EntityId::new)?;
                 self.ops.push(Op::CreateEntity(Entity {
                     id,
@@ -473,19 +492,6 @@ impl<'s> Planner<'s> {
             .entity(entity)
             .map(|e| e.kind)
             .or_else(|| self.new_entity_kinds.get(&entity).copied())
-    }
-
-    fn kind_in(&self, kind: EntityKindId, space: SpaceId) -> Result<(), StoreError> {
-        let def = self.state.kind(kind).ok_or(StoreError::UnknownKind(kind))?;
-        if def.space == space {
-            Ok(())
-        } else {
-            Err(StoreError::WrongSpace {
-                record: kind.to_string(),
-                expected: space,
-                found: def.space,
-            })
-        }
     }
 
     pub(super) fn open_space(&self, space: SpaceId) -> Result<(), StoreError> {

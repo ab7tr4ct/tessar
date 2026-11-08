@@ -42,7 +42,9 @@ const WINDOW_BONUS: f32 = 1.5;
 pub struct Recall {
     /// The question, in natural language.
     pub text: String,
-    /// Spaces to search; empty means all.
+    /// Spaces whose facts are searched; empty means all. Entities named in
+    /// the query may lie in any space: the user, who lives in their own
+    /// space, is the subject of facts in every project.
     pub spaces: Vec<SpaceId>,
     /// Spaces close to the asker — their project, their own space. Their
     /// facts get a bonus in the meaning channel; the rest are still
@@ -391,15 +393,9 @@ fn prepare<'q>(
             query_words.push(word);
         }
     }
-    let in_scope = |e: &EntityId| {
-        query.spaces.is_empty()
-            || state
-                .entity(*e)
-                .is_some_and(|entity| query.spaces.contains(&entity.space))
-    };
     let mut entities: Vec<(EntityId, Vec<String>)> = Vec::new();
     let mut add = |e: EntityId, name: Vec<String>| {
-        if in_scope(&e) && !entities.iter().any(|(known, _)| *known == e) {
+        if !entities.iter().any(|(known, _)| *known == e) {
             entities.push((e, name));
         }
     };

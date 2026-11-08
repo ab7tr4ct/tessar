@@ -137,6 +137,31 @@ impl FactBody {
         }
     }
 
+    /// Whether both bodies say the same thing: equality that ignores the
+    /// `text` of a triple.
+    ///
+    /// The version chain records changes of value, not rephrasings: the
+    /// same value written in other words is not a new version.
+    pub fn same_content(&self, other: &FactBody) -> bool {
+        match (self, other) {
+            (
+                Self::Triple {
+                    subject: s1,
+                    predicate: p1,
+                    object: o1,
+                    ..
+                },
+                Self::Triple {
+                    subject: s2,
+                    predicate: p2,
+                    object: o2,
+                    ..
+                },
+            ) => s1 == s2 && p1 == p2 && o1 == o2,
+            _ => self == other,
+        }
+    }
+
     /// When the described thing happens in the world, if known.
     ///
     /// For a triple, only if the value itself is a span ([`Value::Span`]).
@@ -398,6 +423,45 @@ mod tests {
             "{json}"
         );
         assert_eq!(serde_json::from_str::<Fact>(&json).unwrap(), f);
+    }
+
+    #[test]
+    fn triple_text_round_trips_and_old_journals_have_none() {
+        let mut f = moscow();
+        if let FactBody::Triple { text, .. } = &mut f.body {
+            *text = Some("The user lives in Moscow".into());
+        }
+        let json = serde_json::to_string(&f).unwrap();
+        assert!(
+            json.contains(r#""text":"The user lives in Moscow""#),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<Fact>(&json).unwrap(), f);
+
+        let old = serde_json::to_string(&moscow()).unwrap();
+        assert!(!old.contains(r#""text""#), "{old}");
+        let Fact { body, .. } = serde_json::from_str(&old).unwrap();
+        assert!(matches!(body, FactBody::Triple { text: None, .. }));
+    }
+
+    #[test]
+    fn same_content_ignores_triple_text() {
+        let triple = |text: Option<&str>, n: i64| FactBody::Triple {
+            subject: e(0),
+            predicate: PredicateId::new(0),
+            object: Value::Int(n),
+            text: text.map(Into::into),
+        };
+        assert!(triple(None, 1).same_content(&triple(Some("one"), 1)));
+        assert!(triple(Some("a"), 1).same_content(&triple(Some("b"), 1)));
+        assert!(!triple(None, 1).same_content(&triple(None, 2)));
+        let statement = |t: &str| FactBody::Statement {
+            text: t.into(),
+            when: None,
+        };
+        assert!(statement("x").same_content(&statement("x")));
+        assert!(!statement("x").same_content(&statement("y")));
+        assert!(!statement("x").same_content(&triple(None, 1)));
     }
 
     #[test]

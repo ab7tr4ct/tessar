@@ -256,27 +256,255 @@ fn two_values_of_a_single_predicate_in_one_transaction_are_rejected() {
     ));
 }
 
-#[test]
-fn records_of_another_space_are_rejected() {
-    let w = World::new();
-    let other = w
-        .memory
-        .create_space(key("cortex-db"), SpaceKind::LongTerm, None)
-        .unwrap();
-    let other_kind = w.memory.define_kind(other, name("person")).unwrap();
-    let draft = FactDraft::new(BodyDraft::Triple {
-        subject: EntityRef::Key {
-            kind: other_kind,
-            key: key("Anna"),
-        },
-        predicate: w.knows,
-        object: ObjectDraft::Value(Value::Text("Rust".into())),
+fn lives_in_user(w: &World, city: &str) -> FactDraft {
+    FactDraft::new(BodyDraft::Triple {
+        subject: w.user(),
+        predicate: w.lives_in,
+        object: ObjectDraft::Entity(w.place(city)),
         text: None,
-    });
-    assert!(matches!(
-        w.try_remember(vec![draft]),
-        Err(StoreError::WrongSpace { .. })
+    })
+}
+
+#[test]
+fn a_fact_may_refer_to_an_entity_of_another_space() {
+    let w = World::new();
+    let project = w.project_space("cortex-db");
+    // By key: the entity is created in the space of its kind.
+    let by_key = w.remember_in(project, vec![lives_in_user(&w, "Moscow")])[0];
+    let user = w.memory.find_entity(w.home, w.home_person, "user").unwrap();
+    assert_eq!(user.space, w.home);
+    assert!(
+        w.memory
+            .find_entity(project, w.home_person, "user")
+            .is_none()
+    );
+    let fact = w.fact(by_key);
+    assert_eq!(fact.space, project);
+    assert!(fact.entities().contains(&user.id));
+
+    // By id, as subject and as mention.
+    let by_id = w.remember_in(
+        project,
+        vec![FactDraft {
+            mentions: vec![EntityRef::Id(user.id)],
+            ..FactDraft::new(BodyDraft::Triple {
+                subject: EntityRef::Id(user.id),
+                predicate: w.knows,
+                object: ObjectDraft::Value(Value::Text("Rust".into())),
+                text: None,
+            })
+        }],
+    )[0];
+    assert_eq!(w.fact(by_id).space, project);
+    assert_eq!(w.fact(by_id).mentions, [user.id]);
+
+    // A fact in another space about the same user.
+    w.remember_one(FactDraft::new(BodyDraft::Triple {
+        subject: w.user(),
+        predicate: w.knows,
+        object: ObjectDraft::Value(Value::Text("Go".into())),
+        text: None,
+    }));
+    let facts = w.memory.facts_about(user.id, View::Current);
+    let spaces: Vec<_> = facts.iter().map(|f| f.space).collect();
+    assert_eq!(facts.len(), 3);
+    assert!(spaces.contains(&project) && spaces.contains(&w.space));
+}
+
+#[test]
+fn one_new_cross_space_key_is_one_entity_within_a_transaction() {
+    let w = World::new();
+    let project = w.project_space("cortex-db");
+    w.remember_in(
+        project,
+        vec![
+            w.knows("Zed", "Rust"),
+            lives_in_user(&w, "Moscow"),
+            FactDraft::new(BodyDraft::Triple {
+                subject: w.user(),
+                predicate: w.knows,
+                object: ObjectDraft::Value(Value::Text("Go".into())),
+                text: None,
+            }),
+        ],
+    );
+    let user = w.memory.find_entity(w.home, w.home_person, "user").unwrap();
+    assert_eq!(w.memory.facts_about(user.id, View::Current).len(), 2);
+}
+
+#[test]
+fn a_single_valued_pair_is_replaced_from_another_space() {
+    let w = World::new();
+    let a = w.project_space("project-a");
+    let b = w.project_space("project-b");
+    w.clock.set(ts(200));
+    let first = w.remember_in(a, vec![lives_in_user(&w, "Moscow")])[0];
+    w.clock.set(ts(300));
+    let second = w.remember_in(b, vec![lives_in_user(&w, "Berlin")])[0];
+    assert_eq!(
+        second.outcome,
+        Outcome::Superseded {
+            previous: first.fact
+        }
+    );
+    let (old, new) = (w.fact(first), w.fact(second));
+    assert_eq!((old.space, new.space), (a, b));
+    assert_eq!(old.lineage, new.lineage);
+    assert_eq!(w.memory.history(new.lineage).len(), 2);
+    assert_eq!(w.memory.current(new.lineage), Some(new));
+}
+
+#[test]
+fn an_update_keeps_the_space_of_the_version() {
+    let w = World::new();
+    let a = w.project_space("project-a");
+    let first = w.remember_in(a, vec![lives_in_user(&w, "Moscow")])[0];
+    let lineage = w.fact(first).lineage;
+    let replaced = w
+        .memory
+        .update(Update {
+            lineage,
+            expected_version: v(1),
+            reason: Reason::Correction,
+            replacement: Some(Replacement {
+                body: lives_in_user(&w, "Berlin").body,
+                mentions: Vec::new(),
+            }),
+            origin: origin(),
+        })
+        .unwrap();
+    assert_eq!(w.fact(replaced).space, a);
+}
+
+fn goal_with_text(w: &World, goal: &str, text: &str) -> FactDraft {
+    FactDraft::new(BodyDraft::Triple {
+        subject: w.project("tessar"),
+        predicate: w.goal,
+        object: ObjectDraft::Value(Value::Text(goal.into())),
+        text: Some(text.into()),
+    })
+}
+
+fn stored_text(f: &tessar_core::model::Fact) -> Option<&str> {
+    match &f.body {
+        FactBody::Triple { text, .. } => text.as_deref(),
+        other => panic!("not a triple: {other:?}"),
+    }
+}
+
+#[test]
+fn the_same_value_with_another_text_is_unchanged() {
+    let w = World::new();
+    let first = w.remember_one(goal_with_text(
+        &w,
+        "memory engine",
+        "Tessar is a memory engine",
     ));
+    let again = w.remember_one(goal_with_text(&w, "memory engine", "A store of facts"));
+    assert_eq!(again.outcome, Outcome::Unchanged);
+    assert_eq!(again.fact, first.fact);
+    assert_eq!(
+        stored_text(&w.fact(again)),
+        Some("Tessar is a memory engine")
+    );
+    assert_eq!(w.memory.history(w.fact(first).lineage).len(), 1);
+
+    // Without a text it is unchanged too.
+    assert_eq!(
+        w.remember_one(w.goal("memory engine")).outcome,
+        Outcome::Unchanged
+    );
+
+    // A many-valued predicate: the same value with another text.
+    let knows = |text: &str| {
+        FactDraft::new(BodyDraft::Triple {
+            subject: w.person("Anna"),
+            predicate: w.knows,
+            object: ObjectDraft::Value(Value::Text("Rust".into())),
+            text: Some(text.into()),
+        })
+    };
+    let one = w.remember_one(knows("Anna knows Rust"));
+    let two = w.remember_one(knows("Anna writes Rust daily"));
+    assert_eq!(two.outcome, Outcome::Unchanged);
+    assert_eq!(two.fact, one.fact);
+}
+
+#[test]
+fn another_value_carries_its_own_text() {
+    let w = World::new();
+    let first = w.remember_one(goal_with_text(
+        &w,
+        "graph database",
+        "Tessar is a graph database",
+    ));
+    let second = w.remember_one(goal_with_text(
+        &w,
+        "memory engine",
+        "Tessar is a memory engine",
+    ));
+    assert_eq!(
+        second.outcome,
+        Outcome::Superseded {
+            previous: first.fact
+        }
+    );
+    assert_eq!(
+        stored_text(&w.fact(second)),
+        Some("Tessar is a memory engine")
+    );
+    assert_eq!(
+        stored_text(&w.fact(first)),
+        Some("Tessar is a graph database")
+    );
+}
+
+#[test]
+fn an_update_with_the_same_value_and_another_text_is_unchanged() {
+    let w = World::new();
+    let first = w.remember_one(goal_with_text(
+        &w,
+        "memory engine",
+        "Tessar is a memory engine",
+    ));
+    let result = w
+        .memory
+        .update(Update {
+            lineage: w.fact(first).lineage,
+            expected_version: v(1),
+            reason: Reason::Correction,
+            replacement: Some(Replacement {
+                body: goal_with_text(&w, "memory engine", "A store of facts").body,
+                mentions: Vec::new(),
+            }),
+            origin: origin(),
+        })
+        .unwrap();
+    assert_eq!(result.outcome, Outcome::Unchanged);
+    assert_eq!(result.fact, first.fact);
+    assert_eq!(
+        stored_text(&w.memory.fact(result.fact).unwrap()),
+        Some("Tessar is a memory engine")
+    );
+}
+
+#[test]
+fn a_triple_text_is_found_by_a_word_only_it_has() {
+    let w = World::new();
+    w.remember_one(goal_with_text(
+        &w,
+        "memory engine",
+        "Tessar remembers everything forever",
+    ));
+    let hits = w
+        .memory
+        .recall(&tessar_core::store::Recall::new("forever"))
+        .hits;
+    assert_eq!(hits.len(), 1);
+    assert_eq!(
+        stored_text(&hits[0].fact),
+        Some("Tessar remembers everything forever")
+    );
 }
 
 #[test]
@@ -394,11 +622,29 @@ fn replay_rebuilds_the_same_state() {
     w.remember(vec![w.knows("Anna", "Rust"), w.lives_in("Anna", "Moscow")]);
     let anna = w.entity(w.person, "anna");
     w.memory.add_alias(anna, key("my sister")).unwrap();
+    let project = w.project_space("cortex-db");
+    let cross = w.remember_in(project, vec![lives_in_user(&w, "Berlin")])[0];
+    w.clock.set(ts(300));
+    let cross2 = w.remember_in(project, vec![lives_in_user(&w, "Paris")])[0];
 
     let reopened = w.reopen();
     let lineage = w.fact(goal2).lineage;
     assert_eq!(reopened.history(lineage), w.memory.history(lineage));
     assert_eq!(reopened.fact(goal1.fact), w.memory.fact(goal1.fact));
+    assert_eq!(reopened.fact(cross2.fact), w.memory.fact(cross2.fact));
+    assert_eq!(
+        reopened.history(w.fact(cross).lineage),
+        w.memory.history(w.fact(cross).lineage)
+    );
+    let user = w
+        .memory
+        .find_entity(w.home, w.home_person, "user")
+        .unwrap()
+        .id;
+    assert_eq!(
+        reopened.facts_about(user, View::Current),
+        w.memory.facts_about(user, View::Current)
+    );
     for view in [View::Current, View::TrueAt(ts(150)), View::KnownAt(ts(150))] {
         assert_eq!(
             reopened.facts_about(anna, view),

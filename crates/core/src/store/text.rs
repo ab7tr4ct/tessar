@@ -72,8 +72,9 @@ fn is_sentence_punctuation(c: char) -> bool {
 }
 
 /// The text of a fact as the keyword index sees it: the text of a
-/// statement or event, or the subject, predicate and value of a triple,
-/// plus the keys of the entities in the content.
+/// statement or event; for a triple, its sentence (if any) followed by the
+/// subject, predicate and value; plus the keys of the entities in the
+/// content.
 pub(crate) fn fact_text(state: &State, fact: &Fact) -> String {
     fact_text_with(state, fact, &[])
 }
@@ -102,8 +103,8 @@ pub(crate) fn fact_text_with(state: &State, fact: &Fact, new: &[&Entity]) -> Str
             object,
             text,
         } => {
-            // TODO(core-A): put the sentence first, then the structured
-            // form, so both the phrase and the exact key are found.
+            // The sentence first, then the structured form, so that both
+            // the phrase and the exact key are found.
             if let Some(text) = text {
                 parts.push(text.clone());
             }
@@ -233,6 +234,92 @@ mod tests {
         let scores = index.search(&["memory".to_owned(), "rust".to_owned()]);
         assert!(scores[&FactId::new(0)] > scores[&FactId::new(1)]);
         assert!(!scores.contains_key(&FactId::new(2)));
+    }
+
+    /// The indexed text of the triple (user, leads) = "team" with the
+    /// given sentence.
+    fn triple_text(text: Option<&str>) -> String {
+        use crate::model::{
+            Cardinality, EntityId, EntityKindDef, EntityKindId, Key, Lineage, Name, Origin,
+            PredicateDef, PredicateId, Space, SpaceId, SpaceKind, SpaceState, Timestamp, ValueType,
+        };
+        use crate::store::op::Op;
+        use std::num::NonZeroU32;
+
+        let mut state = State::default();
+        let space = SpaceId::new(0);
+        let kind = EntityKindId::new(0);
+        let (user, predicate) = (EntityId::new(0), PredicateId::new(0));
+        let at = Timestamp::from_millis(1);
+        let ops = [
+            Op::CreateSpace(Space {
+                id: space,
+                name: Key::new("user").unwrap(),
+                parent: None,
+                kind: SpaceKind::LongTerm,
+                state: SpaceState::Open,
+                created_at: at,
+            }),
+            Op::DefineKind(EntityKindDef {
+                id: kind,
+                space,
+                name: Name::new("person").unwrap(),
+            }),
+            Op::DefinePredicate(PredicateDef {
+                id: predicate,
+                space,
+                name: Name::new("team_lead_of").unwrap(),
+                object: ValueType::Text,
+                cardinality: Cardinality::Single,
+                description: String::new(),
+            }),
+            Op::CreateEntity(Entity {
+                id: user,
+                space,
+                kind,
+                key: Key::new("Bob").unwrap(),
+                aliases: Vec::new(),
+                created_at: at,
+            }),
+        ];
+        for op in ops {
+            state.apply(op).unwrap();
+        }
+        let fact = Fact {
+            id: FactId::new(0),
+            space,
+            lineage: Lineage::starting_at(FactId::new(0)),
+            version: NonZeroU32::MIN,
+            prev: None,
+            body: FactBody::Triple {
+                subject: user,
+                predicate,
+                object: Value::Text("five engineers".into()),
+                text: text.map(Into::into),
+            },
+            mentions: Vec::new(),
+            episode: None,
+            origin: Origin::Asserted {
+                by: Key::new("test").unwrap(),
+            },
+            recorded_at: at,
+            valid_from: at,
+            end: None,
+        };
+        fact_text(&state, &fact)
+    }
+
+    #[test]
+    fn triple_text_has_the_sentence_first_then_the_structured_form() {
+        assert_eq!(
+            triple_text(Some("Bob manages a team")),
+            "Bob manages a team Bob team lead of five engineers"
+        );
+    }
+
+    #[test]
+    fn triple_text_without_a_sentence_is_the_structured_form() {
+        assert_eq!(triple_text(None), "Bob team lead of five engineers");
     }
 
     #[test]

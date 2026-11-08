@@ -2,7 +2,7 @@ mod common;
 
 use common::*;
 use tessar_core::model::{Fact, FactBody, Interval, SpaceKind, TimeSpan, Value};
-use tessar_core::store::{BodyDraft, EntityRef, FactDraft, Hit, Recall, View};
+use tessar_core::store::{BodyDraft, EntityRef, FactDraft, Hit, ObjectDraft, Recall, View};
 
 fn statement(text: &str, mentions: Vec<EntityRef>) -> FactDraft {
     FactDraft {
@@ -167,7 +167,14 @@ fn spaces_limit_the_search() {
     here.spaces = vec![w.space];
     let result = w.memory.recall(&here);
     assert_eq!(texts(&result.hits), ["memory engine"]);
-    assert_eq!(result.entities, [w.entity(w.project, "tessar")]);
+    // Query entities are not filtered by space, only facts are.
+    assert_eq!(
+        result.entities,
+        [
+            w.entity(w.project, "tessar"),
+            w.memory.find_entity(other, project, "tessar").unwrap().id
+        ]
+    );
 }
 
 #[test]
@@ -248,4 +255,38 @@ fn coverage_counts_each_concept_once() {
     assert_eq!(unlinked.why.covered, 2);
     assert!(goal.score < unlinked.score);
     assert_eq!(find("журнал хранит историю").why.covered, 2);
+}
+
+#[test]
+fn a_query_entity_of_another_space_finds_facts_of_the_project() {
+    let w = World::new();
+    let project = w.project_space("cortex-db");
+    w.remember_in(
+        project,
+        vec![FactDraft::new(BodyDraft::Triple {
+            subject: w.user(),
+            predicate: w.knows,
+            object: ObjectDraft::Value(Value::Text("Rust".into())),
+            text: None,
+        })],
+    );
+    let user = w
+        .memory
+        .find_entity(w.home, w.home_person, "user")
+        .unwrap()
+        .id;
+
+    let mut query = Recall::new("what does user know");
+    query.spaces = vec![project];
+    let result = w.memory.recall(&query);
+    assert!(result.entities.contains(&user));
+    assert_eq!(texts(&result.hits), ["Rust"]);
+
+    // An explicit entity of another space works as well.
+    let mut query = Recall::new("anything");
+    query.spaces = vec![project];
+    query.entities = vec![user];
+    let result = w.memory.recall(&query);
+    assert_eq!(result.entities, [user]);
+    assert_eq!(texts(&result.hits), ["Rust"]);
 }

@@ -74,6 +74,10 @@ pub struct World {
     pub person: EntityKindId,
     pub project: EntityKindId,
     pub place: EntityKindId,
+    /// The user's own space; the entity `user` lives here.
+    pub home: SpaceId,
+    /// The `person` kind of the user's space.
+    pub home_person: EntityKindId,
     /// person → place, single.
     pub lives_in: PredicateId,
     /// project → text, single.
@@ -100,6 +104,10 @@ impl World {
         let person = memory.define_kind(space, name("person")).unwrap();
         let project = memory.define_kind(space, name("project")).unwrap();
         let place = memory.define_kind(space, name("place")).unwrap();
+        let home = memory
+            .create_space(key("home"), SpaceKind::LongTerm, None)
+            .unwrap();
+        let home_person = memory.define_kind(home, name("person")).unwrap();
         let lives_in = memory
             .define_predicate(
                 space,
@@ -137,6 +145,8 @@ impl World {
             person,
             project,
             place,
+            home,
+            home_person,
             lives_in,
             goal,
             knows,
@@ -167,6 +177,34 @@ impl World {
             kind: self.place,
             key: key(k),
         }
+    }
+
+    /// The entity `user` of the user's space, by key.
+    pub fn user(&self) -> EntityRef {
+        EntityRef::Key {
+            kind: self.home_person,
+            key: key("user"),
+        }
+    }
+
+    /// A new project space.
+    pub fn project_space(&self, k: &str) -> SpaceId {
+        self.memory
+            .create_space(key(k), SpaceKind::LongTerm, None)
+            .unwrap()
+    }
+
+    /// Remembers facts into `space`.
+    pub fn remember_in(&self, space: SpaceId, facts: Vec<FactDraft>) -> Vec<Recorded> {
+        self.memory
+            .remember(Remember {
+                space,
+                origin: origin(),
+                episode: None,
+                facts,
+            })
+            .unwrap()
+            .facts
     }
 
     pub fn goal(&self, text: &str) -> FactDraft {
