@@ -294,8 +294,15 @@ impl Tessar {
                 .mem
                 .fact(recorded.fact)
                 .map_or_else(String::new, |f| self.line(&f, now, true, None));
+            let mut note = String::new();
             let verb = match recorded.outcome {
                 Outcome::Created => "created".to_owned(),
+                Outcome::Conflicting { current } => {
+                    note = format!(
+                        " (an inferred value recorded beside the asserted current value {current}; it did not replace it)"
+                    );
+                    "conflicting".to_owned()
+                }
                 Outcome::Unchanged => "unchanged (already known)".to_owned(),
                 Outcome::Closed => "closed".to_owned(),
                 Outcome::Superseded { previous } => {
@@ -309,7 +316,7 @@ impl Tessar {
                     format!("superseded{was}")
                 }
             };
-            let _ = write!(out, "\n{}. {verb}: {line}", i + 1);
+            let _ = write!(out, "\n{}. {verb}: {line}{note}", i + 1);
         }
         Ok(out)
     }
@@ -946,7 +953,11 @@ impl Tessar {
                 };
                 format!("unchanged: {id} already says that; nothing was written.{hint}")
             }
-            Outcome::Created => format!("created: {}", new_line(recorded.fact)),
+            // An update replaces or closes the head regardless of origin,
+            // so a conflict cannot happen here; report it like a new fact.
+            Outcome::Created | Outcome::Conflicting { .. } => {
+                format!("created: {}", new_line(recorded.fact))
+            }
         })
     }
 
