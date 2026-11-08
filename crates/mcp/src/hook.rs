@@ -289,7 +289,13 @@ pub fn render_briefing(project: &str, user: &[Hit], project_hits: &[Hit], budget
     );
     // The header and the closing newline come first; each list may then use
     // half of what is left, and what one leaves unused goes to the other.
-    let left = budget.saturating_sub(header.chars().count() + 1);
+    // An empty project space gets one sentence at the end; its room is kept.
+    let hint = if project_hits.is_empty() {
+        format!("\n{NO_PROJECT_FACTS}")
+    } else {
+        String::new()
+    };
+    let left = budget.saturating_sub(header.chars().count() + 1 + hint.chars().count());
     let user_lines: Vec<String> = user.iter().map(Hit::short_line).collect();
     let project_lines: Vec<String> = project_hits.iter().map(Hit::short_line).collect();
     let cost = |title: &str, lines: &[String]| {
@@ -302,8 +308,11 @@ pub fn render_briefing(project: &str, user: &[Hit], project_hits: &[Hit], budget
     let user_cap = left - cost(PROJECT_TITLE, &project_lines).min(left / 2);
     let (user_text, user_used) = section(USER_TITLE, &user_lines, user_cap);
     let (project_text, _) = section(PROJECT_TITLE, &project_lines, left - user_used);
-    format!("{header}{user_text}{project_text}\n")
+    format!("{header}{user_text}{project_text}{hint}\n")
 }
+
+const NO_PROJECT_FACTS: &str = "No facts about this repository yet: when you learn a convention, \
+     a decision or a plan, save it with remember (space project).";
 
 const USER_TITLE: &str = "About you:";
 const PROJECT_TITLE: &str = "About this project:";
@@ -784,6 +793,33 @@ mod tests {
             "the small list is whole: {text}"
         );
         assert!(text.chars().count() <= 600, "{}", text.chars().count());
+        assert!(!text.contains("No facts about this repository"), "{text}");
+    }
+
+    #[test]
+    fn briefing_nudges_when_the_project_has_no_facts() {
+        let user: Vec<Hit> = (0..40)
+            .map(|n| {
+                hit(
+                    &format!("f{n}"),
+                    None,
+                    &[],
+                    &format!("User fact number {n}."),
+                )
+            })
+            .collect();
+        let text = render_briefing("tessar", &user, &[], 600);
+        assert!(
+            text.ends_with(
+                "\nNo facts about this repository yet: when you learn a convention, a decision \
+                 or a plan, save it with remember (space project).\n"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("0 about project `tessar`"));
+        assert!(text.contains("About you:"));
+        // The sentence keeps its room inside the budget even with a long list.
+        assert!(text.chars().count() <= 600, "{}", text.chars().count());
     }
 
     #[test]
@@ -793,10 +829,12 @@ mod tests {
         assert!(text.contains("0 facts about you, 1 about project `tessar`"));
         assert!(!text.contains("About you:"));
         assert!(text.contains("About this project:\n- [2026-11-08] Uses Rust."));
+        assert!(!text.contains("No facts about this repository"), "{text}");
         let empty = render_briefing("tessar", &[], &[], 3000);
         assert!(empty.contains("empty"));
         assert!(empty.contains("`remember`"));
         assert_eq!(empty.lines().count(), 1);
+        assert!(!empty.contains("No facts about this repository"), "{empty}");
     }
 
     #[test]
