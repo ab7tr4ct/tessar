@@ -1,7 +1,7 @@
 # tessar-mcp
 
 The `tessar` binary. `tessar mcp` serves the memory as an
-[MCP](https://modelcontextprotocol.io) server on stdio, so an agent such as
+[MCP](https://modelcontextprotocol.io) server on stdio (through a [daemon](#daemon)), so an agent such as
 Claude Code can remember facts between conversations and recall them later.
 
 The memory is deterministic and local: typed facts with validity periods and
@@ -40,11 +40,42 @@ Or in `.mcp.json` (project) / `~/.claude.json` (user):
 }
 ```
 
-The server loads the model before it starts serving, so the first start takes
-a few seconds. Opening the memory also embeds every fact again (vectors are not
-stored yet), so startup grows with the journal; a vector cache is planned. It exits with status 0 when stdin closes. Only one server can
-use a journal at a time: a second one prints `another tessar is using …` and
-exits with status 1.
+`tessar mcp` is a thin proxy: it connects to the daemon, starting it if none
+runs. The first start takes a few seconds, because the daemon loads the model
+and embeds every fact again (vectors are not stored yet), so startup grows
+with the journal; a vector cache is planned. The proxy exits with status 0
+when stdin closes. As many sessions as you like can run at once.
+
+## Daemon
+
+One daemon per machine holds the memory and the model; every session shares
+them. Previously a second Claude Code session could not connect at all, since
+the journal admits one process.
+
+- **Start.** Automatically by the first `tessar mcp` (detached, in its own
+  process group, so it outlives that session), or by hand with
+  `tessar daemon [--home DIR] [--idle-exit MINUTES]`, for instance from a
+  launchd agent. A second `tessar daemon` on the same home prints `a tessar
+  daemon is already running` and exits with status 0.
+- **Socket.** `$TESSAR_HOME/tessar.sock` (default `~/.tessar/tessar.sock`),
+  mode 0600. A stale file from a daemon that died is removed on start.
+- **Protocol.** A connection starts with one JSON line,
+  `{"tessar": 1, "project": "<name>", "cwd": "<path>"}`, then speaks MCP. The
+  project is computed by the proxy as described under *Where data lives*, so
+  each session gets the space of the directory it runs in. The project space
+  is created on first use.
+- **Log.** `$TESSAR_HOME/daemon.log` when the proxy started it (appended): one
+  line when a connection opens and one when it closes.
+- **`--idle-exit N`.** Exit when no connection has been open for N minutes.
+  The default is to run until stopped.
+- **Stopping.** SIGTERM or SIGINT stops accepting, closes the sessions, drops
+  the memory, removes the socket and exits with status 0. Every write is
+  already durable, so killing it loses nothing either.
+- **`tessar mcp --standalone`** serves in the process itself, as before: it
+  takes the journal lock, loads its own model and cannot run beside a daemon.
+  Useful for tests and single-user runs.
+
+The daemon uses Unix sockets, so it is for macOS and Linux.
 
 ## Tools
 
@@ -75,7 +106,8 @@ they explain spaces, fact kinds and predicate rules.
 ## Where data lives
 
 - `$TESSAR_HOME` (or `--home DIR`), default `~/.tessar`: `journal.jsonl` is
-  the whole memory; vectors are recomputed on start.
+  the whole memory; vectors are recomputed on start. `tessar.sock` and
+  `daemon.log` are the daemon's.
 - Two spaces. `user` holds facts about the person and the entity `user`
   (kind `person`), plus the predicate vocabulary shared by every project. The
   **project space** is named after the repository: the last path component
@@ -83,7 +115,7 @@ they explain spaces, fact kinds and predicate rules.
   shares the space; `https://…/owner/repo.git` and `git@host:owner/repo.git`
   both give `repo`). Without an origin it is the name of the main checkout
   (the parent of `git rev-parse --git-common-dir`, so worktrees agree), and
-  outside git the basename of the server's working directory.
+  outside git the basename of the session's working directory.
   Claude Code starts MCP servers in the project directory. `recall` searches
   all spaces by default, including other repositories; each hit shows its
   space.
@@ -100,8 +132,13 @@ errors, go to stderr. Set `TESSAR_LLAMA_LOG=1` to see all llama.cpp output.
 ```sh
 cargo test -p tessar-mcp                                  # no model, no GPU
 cargo test -p tessar-mcp --test stdio -- --ignored        # real model, GPU
+cargo test -p tessar-mcp --test daemon_e2e -- --ignored   # real model, GPU
 ```
 
-The ignored test spawns the built binary on a temporary home, runs
-`initialize`, `tools/list`, a `remember` and a `recall`, and checks that
-stdout holds JSON-RPC lines only.
+The default tests include the daemon and the proxy over a real socket in a
+temporary directory, with a fake embedder. The ignored `stdio` test spawns
+`tessar mcp --standalone` on a temporary home, runs `initialize`,
+`tools/list`, a `remember` and a `recall`, and checks that stdout holds
+JSON-RPC lines only. The ignored `daemon_e2e` tests start `tessar daemon`
+and two concurrent `tessar mcp` proxies, then the daemon from the first
+proxy alone.

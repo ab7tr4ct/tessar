@@ -1,4 +1,5 @@
-//! Spawns the built binary and talks MCP to it over stdio.
+//! Spawns the built binary (`tessar mcp --standalone`) and talks MCP to it
+//! over stdio.
 //!
 //! Needs the real model (`~/.tessar/models/voyage-4-nano-Q8_0.gguf`, or
 //! `TESSAR_MODEL`) and uses the GPU, so it is ignored by default:
@@ -19,7 +20,7 @@ use serde_json::{Value, json};
 fn stdout_carries_only_json_rpc() {
     let home = tempfile::tempdir().unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_tessar"))
-        .arg("mcp")
+        .args(["mcp", "--standalone"])
         .env("TESSAR_HOME", home.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

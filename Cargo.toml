@@ -17,13 +17,13 @@ crc32fast = "1.5"
 cxx = "1.0.205"
 cxx-build = "1.0.205"
 proptest = "1.9"
-rmcp = { version = "3.9.0", features = ["server", "transport-io", "macros"] }
+rmcp = { version = "3.9.0", features = ["server", "client", "transport-io", "macros"] }
 schemars = "1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 tempfile = "3.23"
 thiserror = "2.0.21"
-tokio = { version = "1", features = ["rt-multi-thread", "io-std", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "io-std", "io-util", "net", "signal", "time", "sync", "macros"] }
 ureq = { version = "3.5.1", features = ["json"] }
 
 [workspace.lints.rust]

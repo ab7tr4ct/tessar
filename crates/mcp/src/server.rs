@@ -108,15 +108,19 @@ impl TessarServer {
     /// A server over `api`. The vocabulary summary is baked into the
     /// description of `remember`.
     pub fn new(api: Tessar) -> Self {
+        Self::shared(Arc::new(api))
+    }
+
+    /// A server over an `api` shared with other servers (one per daemon
+    /// connection). The vocabulary summary is read now, so each connection
+    /// sees the predicates defined so far.
+    pub fn shared(api: Arc<Tessar>) -> Self {
         let summary = api.vocabulary_summary();
         let mut tool_router = Self::tool_router();
         if let Some(route) = tool_router.map.get_mut("remember") {
             route.attr.description = Some(Cow::Owned(format!("{REMEMBER_HEAD}{summary}")));
         }
-        Self {
-            api: Arc::new(api),
-            tool_router,
-        }
+        Self { api, tool_router }
     }
 
     /// Runs a blocking call on the mapping layer off the async workers: the
