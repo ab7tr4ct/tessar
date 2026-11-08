@@ -236,6 +236,12 @@ content (N bytes); vector cache files deleted: M` and still succeeds. When it
 stopped a daemon the line starts with `stopped the daemon (it restarts with
 the next session); `.
 
+From a shell, `tessar redact f12 f13 [--purge] [--home DIR]` does both steps
+for a person: it starts the daemon if needed, redacts each handle through the
+same `update` code path and prints the tool's line for each. Every handle is
+tried; the exit status is 1 if any failed. With `--purge` it then runs
+`tessar purge` and prints its line.
+
 What stays: fact ids, the chain structure and times, entity keys and aliases
 (an entity created for a secret keeps its name; redaction does not touch
 entities). The episode a fact was taken from keeps its text: redacting the

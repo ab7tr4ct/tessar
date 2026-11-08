@@ -227,6 +227,31 @@ pub async fn open_current(
     Ok(opened)
 }
 
+/// Calls the daemon's `update` tool with `reason: "redact"` for `handle`
+/// and returns the text it answers: the success line, or the error text
+/// the tool gave.
+pub async fn redact_fact(peer: &Peer<RoleClient>, handle: &str) -> Result<String, String> {
+    let mut params = rmcp::model::CallToolRequestParams::new("update");
+    params.arguments = serde_json::json!({"fact": handle, "reason": "redact"})
+        .as_object()
+        .cloned();
+    let result = peer
+        .call_tool(params)
+        .await
+        .map_err(|e| format!("{handle}: the daemon failed the call: {e}"))?;
+    let text = result
+        .content
+        .iter()
+        .filter_map(|c| c.as_text().map(|t| t.text.as_str()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if result.is_error == Some(true) {
+        Err(format!("{handle}: {text}"))
+    } else {
+        Ok(text)
+    }
+}
+
 /// Serves `server` on `transport` until the session ends or the daemon
 /// goes away. `Ok(true)` means the session ended normally.
 pub async fn bridge<T, E, A>(

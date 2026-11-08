@@ -48,6 +48,10 @@ USAGE:
                                stop the daemon (SIGTERM to the pid in
                                DIR/tessar.pid), or print its build, pid, uptime
                                and open sessions
+    tessar redact fNN... [--purge] [--home DIR]
+                               destroy the content of facts by handle (starts
+                               the daemon if needed); with --purge also erase
+                               it from the journal file, as `tessar purge`
     tessar purge [--home DIR]  erase redacted content from the journal file and
                                drop the vector cache. Stops the daemon first;
                                the next session starts it again
@@ -131,6 +135,11 @@ enum Cli {
     Purge {
         home: PathBuf,
     },
+    Redact {
+        home: PathBuf,
+        handles: Vec<String>,
+        purge: bool,
+    },
     Hook {
         home: PathBuf,
         kind: HookKind,
@@ -168,6 +177,11 @@ fn main() -> ExitCode {
         }
         Ok(Cli::Daemon { home, idle_exit }) => run_daemon(&home, idle_exit),
         Ok(Cli::Purge { home }) => run_purge(&home),
+        Ok(Cli::Redact {
+            home,
+            handles,
+            purge,
+        }) => run_redact(&home, &handles, purge),
         Ok(Cli::Hook { home, kind }) => run_hook(&home, kind),
         Ok(Cli::Help) => {
             println!("{USAGE}");
@@ -195,6 +209,9 @@ fn parse(args: &[String], env: impl Fn(&str) -> Option<std::ffi::OsString>) -> R
     }
     if command == "hook" {
         return parse_hook(&args[1..], env);
+    }
+    if command == "redact" {
+        return parse_redact(&args[1..], env);
     }
     if command == "purge" {
         return parse_purge(&args[1..], env);
@@ -242,6 +259,43 @@ fn parse(args: &[String], env: impl Fn(&str) -> Option<std::ffi::OsString>) -> R
         (_, Some("stop")) => Cli::DaemonStop { home },
         (_, Some(_)) => Cli::DaemonStatus { home },
         _ => Cli::Daemon { home, idle_exit },
+    })
+}
+
+fn parse_redact(
+    args: &[String],
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<Cli, String> {
+    let mut home = None;
+    let mut purge = false;
+    let mut handles = Vec::new();
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--home" => {
+                home = Some(PathBuf::from(it.next().ok_or("--home needs a directory")?));
+            }
+            a if a.starts_with("--home=") => home = Some(PathBuf::from(&a["--home=".len()..])),
+            "--purge" => purge = true,
+            a if a.starts_with('-') => {
+                return Err(format!("unexpected argument `{a}`\n\n{USAGE}"));
+            }
+            handle => handles.push(handle.to_owned()),
+        }
+    }
+    if handles.is_empty() {
+        return Err(format!(
+            "`redact` wants at least one fact handle, like f12\n\n{USAGE}"
+        ));
+    }
+    let home = match home {
+        Some(home) => home,
+        None => default_home(env)?,
+    };
+    Ok(Cli::Redact {
+        home,
+        handles,
+        purge,
     })
 }
 
@@ -555,6 +609,48 @@ fn run_lifecycle(work: impl std::future::Future<Output = Result<String, String>>
 
 // ---- tessar purge --------------------------------------------------
 
+/// Redacts each handle through the daemon, then with `purge` erases the
+/// content from the files. Every handle is tried; the exit status is
+/// failure if any failed.
+fn run_redact(home: &Path, handles: &[String], purge: bool) -> ExitCode {
+    if let Err(e) = create_home(home) {
+        return fail(&e);
+    }
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let project = project_name(&cwd);
+    let runtime = match runtime() {
+        Ok(r) => r,
+        Err(e) => return fail(&e),
+    };
+    let mut failed = false;
+    let outcome: Result<(), String> = runtime.block_on(async {
+        let opened = proxy::open_current(home, &project, &cwd, DAEMON_WAIT, false).await?;
+        let (server, link) = opened.serve().await?;
+        for handle in handles {
+            match proxy::redact_fact(server.daemon(), handle).await {
+                Ok(line) => println!("{line}"),
+                Err(e) => {
+                    eprintln!("tessar: {e}");
+                    failed = true;
+                }
+            }
+        }
+        drop((server, link));
+        Ok(())
+    });
+    if let Err(e) = outcome {
+        return fail(&e);
+    }
+    if purge && run_purge(home) != ExitCode::SUCCESS {
+        return ExitCode::FAILURE;
+    }
+    if failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
 /// Stops the daemon if one runs, rewrites the journal without redacted
 /// content and drops the vector cache.
 fn run_purge(home: &Path) -> ExitCode {
@@ -709,6 +805,29 @@ mod tests {
             }
         );
         assert!(p(&["daemon", "--keep-daemon"], &[("HOME", "/u")]).is_err());
+    }
+
+    #[test]
+    fn redact_takes_handles_and_flags() {
+        assert_eq!(
+            p(&["redact", "f1", "f22", "--purge", "--home", "/d"], &[]).unwrap(),
+            Cli::Redact {
+                home: "/d".into(),
+                handles: vec!["f1".into(), "f22".into()],
+                purge: true
+            }
+        );
+        assert_eq!(
+            p(&["redact", "f3"], &[("TESSAR_HOME", "/t")]).unwrap(),
+            Cli::Redact {
+                home: "/t".into(),
+                handles: vec!["f3".into()],
+                purge: false
+            }
+        );
+        assert!(p(&["redact"], &[("HOME", "/u")]).is_err());
+        assert!(p(&["redact", "--purge"], &[("HOME", "/u")]).is_err());
+        assert!(p(&["redact", "f1", "--bogus"], &[("HOME", "/u")]).is_err());
     }
 
     #[test]

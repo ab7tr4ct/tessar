@@ -438,3 +438,35 @@ async fn the_entity_floor_keeps_out_loosely_related_facts() {
     assert_eq!(out, "", "the cosine is below the default floor: {out}");
     daemon.shutdown().await;
 }
+
+#[tokio::test]
+async fn redact_fact_goes_through_the_daemon() {
+    let (home, daemon, hook) = with_memory().await;
+    remember(&hook, "user", "The vault code is quokka7788").await;
+    let found = call(&hook, "recall", json!({"query": "vault code quokka7788"})).await;
+    let id = found.structured_content.as_ref().unwrap()["hits"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let line = proxy::redact_fact(&hook.peer, &id).await.unwrap();
+    assert!(line.starts_with(&format!("redacted: {id}")), "{line}");
+    let again = proxy::redact_fact(&hook.peer, &id).await.unwrap_err();
+    assert!(
+        again.starts_with(&format!("{id}: ")) && again.contains("already redacted"),
+        "{again}"
+    );
+    assert!(proxy::redact_fact(&hook.peer, "nonsense").await.is_err());
+
+    let after = call(&hook, "recall", json!({"query": "vault code quokka7788"})).await;
+    assert!(
+        !after
+            .structured_content
+            .unwrap()
+            .to_string()
+            .contains("quokka7788")
+    );
+    drop(hook);
+    daemon.shutdown().await;
+    drop(home);
+}
