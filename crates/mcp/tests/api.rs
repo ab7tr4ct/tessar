@@ -9,8 +9,8 @@ use serde_json::json;
 use tessar_core::clock::ManualClock;
 use tessar_core::embed::{EmbedError, Embedder};
 use tessar_core::log::MemLog;
-use tessar_core::model::Timestamp;
-use tessar_core::store::{Memory, Semantic};
+use tessar_core::model::{Key, Origin, Timestamp};
+use tessar_core::store::{BodyDraft, FactDraft, Memory, Remember, Semantic};
 use tessar_mcp::api::Tessar;
 use tessar_mcp::args::{AboutArgs, RecallArgs, RememberArgs, UpdateArgs};
 use tessar_mcp::when::{DAY_MS, days_from_civil};
@@ -955,4 +955,53 @@ fn an_attribute_replacement_keeps_subject_and_predicate() {
         out.starts_with("unchanged") && out.contains("new `value`"),
         "{out}"
     );
+}
+
+#[test]
+fn a_replacement_gets_the_default_mention_once() {
+    let f = fixture();
+    // Written before auto-mentions existed: no mentions at all.
+    let done = f
+        .mem
+        .remember(Remember {
+            space: f.mem.space_named("user").unwrap().id,
+            origin: Origin::Asserted {
+                by: Key::new("test").unwrap(),
+            },
+            episode: None,
+            facts: vec![FactDraft::new(BodyDraft::Statement {
+                text: "User prefers tea".into(),
+                when: None,
+            })],
+        })
+        .unwrap();
+    let old = done.facts[0].fact.to_string();
+    assert!(
+        !about(&f, json!({"entity": user()}))
+            .unwrap()
+            .contains("prefers tea")
+    );
+    f.clock.advance(DAY_MS);
+    let out = update(
+        &f,
+        json!({"fact": old, "reason": "changed", "text": "User prefers coffee"}),
+    )
+    .unwrap();
+    let new = handle(&out);
+    let listed = about(&f, json!({"entity": user()})).unwrap();
+    assert!(
+        listed.contains(&format!("{new} ")) && listed.contains("prefers coffee"),
+        "{listed}"
+    );
+    let id = f.mem.fact(done.facts[0].fact).unwrap().next().unwrap();
+    assert_eq!(f.mem.fact(id).unwrap().mentions.len(), 1);
+    // Updating again does not add a second one.
+    let out = update(
+        &f,
+        json!({"fact": new, "reason": "changed", "text": "User prefers juice"}),
+    )
+    .unwrap();
+    let last = f.mem.fact(f.mem.fact(id).unwrap().next().unwrap()).unwrap();
+    assert!(out.contains("juice"), "{out}");
+    assert_eq!(last.mentions.len(), 1);
 }

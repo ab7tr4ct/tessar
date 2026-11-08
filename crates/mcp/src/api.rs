@@ -819,7 +819,7 @@ impl Tessar {
         } else {
             Some(Replacement {
                 body: self.replacement_body(&fact, text, value, when_new)?,
-                mentions: fact.mentions.iter().map(|&e| EntityRef::Id(e)).collect(),
+                mentions: self.replacement_mentions(&fact),
             })
         };
         let had_replacement = replacement.is_some();
@@ -867,6 +867,31 @@ impl Tessar {
             }
             Outcome::Created => format!("created: {}", new_line(recorded.fact)),
         })
+    }
+
+    /// The mentions of a replacement: the old ones, plus the entity the
+    /// space is about (the person or the project) unless the fact already
+    /// names it. Facts of other repositories keep their mentions as they are.
+    fn replacement_mentions(&self, fact: &Fact) -> Vec<EntityRef> {
+        let mut mentions: Vec<EntityRef> =
+            fact.mentions.iter().map(|&e| EntityRef::Id(e)).collect();
+        let space = if fact.space == self.user {
+            Space::User
+        } else if fact.space == self.project {
+            Space::Project
+        } else {
+            return mentions;
+        };
+        let (kind, key) = match space {
+            Space::User => (self.user_kinds["person"], "user"),
+            Space::Project => (self.project_kinds["project"], self.project_key.as_str()),
+        };
+        if let Some(own) = self.mem.find_entity(fact.space, kind, key)
+            && !fact.entities().contains(&own.id)
+        {
+            mentions.push(EntityRef::Id(own.id));
+        }
+        mentions
     }
 
     /// The day a version stopped being true, if it was closed as changed.
