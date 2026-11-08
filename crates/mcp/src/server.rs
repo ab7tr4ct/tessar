@@ -5,10 +5,10 @@ use std::sync::Arc;
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{Implementation, ServerCapabilities, ServerConfig};
+use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig};
 use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 
-use crate::api::Tessar;
+use crate::api::{Rendered, Tessar};
 use crate::args::{AboutArgs, RecallArgs, RememberArgs, UpdateArgs};
 
 const INSTRUCTIONS: &str = "\
@@ -123,6 +123,13 @@ impl TessarServer {
         Self { api, tool_router }
     }
 
+    /// The text of `rendered` with its hits next to it as structured content.
+    fn structured(rendered: Rendered) -> CallToolResult {
+        let mut result = CallToolResult::success(vec![ContentBlock::text(rendered.text)]);
+        result.structured_content = Some(rendered.structured);
+        result
+    }
+
     /// Runs a blocking call on the mapping layer off the async workers: the
     /// embedder and the disk can take a while.
     async fn blocking<T, F>(&self, f: F) -> Result<T, String>
@@ -145,8 +152,13 @@ impl TessarServer {
     }
 
     #[tool(description = RECALL)]
-    async fn recall(&self, Parameters(args): Parameters<RecallArgs>) -> Result<String, String> {
-        self.blocking(move |api| api.recall(args)).await
+    async fn recall(
+        &self,
+        Parameters(args): Parameters<RecallArgs>,
+    ) -> Result<CallToolResult, String> {
+        self.blocking(move |api| api.recall_rendered(args))
+            .await
+            .map(Self::structured)
     }
 
     #[tool(description = VOCABULARY)]
@@ -160,8 +172,13 @@ impl TessarServer {
     }
 
     #[tool(description = ABOUT)]
-    async fn about(&self, Parameters(args): Parameters<AboutArgs>) -> Result<String, String> {
-        self.blocking(move |api| api.about(args)).await
+    async fn about(
+        &self,
+        Parameters(args): Parameters<AboutArgs>,
+    ) -> Result<CallToolResult, String> {
+        self.blocking(move |api| api.about_rendered(args))
+            .await
+            .map(Self::structured)
     }
 }
 

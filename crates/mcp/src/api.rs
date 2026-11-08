@@ -45,6 +45,17 @@ const AGENT: &str = "claude-code";
 /// The most facts `recall` returns.
 const MAX_LIMIT: usize = 50;
 
+/// A tool result: the text the agent reads, and the same hits as JSON
+/// (`{"hits": [...]}`) for programs such as the Claude Code hooks.
+#[derive(Debug, Clone)]
+pub struct Rendered {
+    /// The text, as the tool has always returned it.
+    pub text: String,
+    /// The hits: `id`, `space`, `recorded`, `text`, `kind`, `similarity`,
+    /// `channels` and `current` each.
+    pub structured: serde_json::Value,
+}
+
 /// The memory with its two spaces, ready to serve tools.
 pub struct Tessar {
     mem: Memory,
@@ -702,13 +713,25 @@ impl Tessar {
     /// `fNN [recorded] [space] sentence [current; earlier: v (date)] (tense)`.
     /// `fNN` is the handle `update` takes.
     fn line(&self, fact: &Fact, now: Timestamp, with_earlier: bool, as_of: Option<&str>) -> String {
-        let mut line = format!(
+        format!(
             "{} [{}] [{}] {}",
             fact.id,
             when::ymd(fact.recorded_at),
             self.space_name(fact.space),
-            self.sentence(fact)
-        );
+            self.detail(fact, now, with_earlier, as_of)
+        )
+    }
+
+    /// A line without the handle, date and space: the sentence and its
+    /// `[current; earlier: …]` and tense annotations.
+    fn detail(
+        &self,
+        fact: &Fact,
+        now: Timestamp,
+        with_earlier: bool,
+        as_of: Option<&str>,
+    ) -> String {
+        let mut line = self.sentence(fact);
         if with_earlier && matches!(fact.body, FactBody::Triple { .. }) {
             let earlier: Vec<String> = self
                 .mem
@@ -739,6 +762,40 @@ impl Tessar {
             let _ = write!(line, " ({}: {})", Tense::word(tense), when::span_text(span));
         }
         line
+    }
+
+    /// One hit as JSON: `id`, `space`, `recorded`, `text` (the line without
+    /// handle, date and space), `kind`, `similarity`, `channels`, `current`.
+    fn hit_json(&self, fact: &Fact, text: String, why: Option<&Why>) -> serde_json::Value {
+        let kind = match fact.body {
+            FactBody::Statement { .. } => "statement",
+            FactBody::Triple { .. } => "attribute",
+            FactBody::Event { .. } => "event",
+        };
+        let mut channels = Vec::new();
+        let mut similarity = None;
+        if let Some(why) = why {
+            if why.entity_rank.is_some() {
+                channels.push("entity");
+            }
+            if why.keyword_rank.is_some() {
+                channels.push("words");
+            }
+            if why.meaning_rank.is_some() {
+                channels.push("meaning");
+                similarity = why.similarity;
+            }
+        }
+        serde_json::json!({
+            "id": fact.id.to_string(),
+            "space": self.space_name(fact.space),
+            "recorded": when::ymd(fact.recorded_at),
+            "text": text,
+            "kind": kind,
+            "similarity": similarity.map(|s| (f64::from(s) * 1000.0).round() / 1000.0),
+            "channels": channels,
+            "current": fact.is_current(),
+        })
     }
 
     fn why(&self, why: &Why) -> String {
@@ -951,6 +1008,11 @@ impl Tessar {
 
     /// The `recall` tool.
     pub fn recall(&self, args: RecallArgs) -> Result<String, String> {
+        self.recall_rendered(args).map(|r| r.text)
+    }
+
+    /// The `recall` tool with its hits as JSON too.
+    pub fn recall_rendered(&self, args: RecallArgs) -> Result<Rendered, String> {
         let query = args.query.trim();
         if query.is_empty() {
             return Err("`query` is empty".to_owned());
@@ -979,10 +1041,16 @@ impl Tessar {
         });
         let now = self.clock.now();
         let mut out = String::new();
+        let mut hits = Vec::new();
         if recalled.hits.is_empty() {
             out.push_str("Nothing found.");
         }
         for (i, hit) in recalled.hits.iter().enumerate() {
+            hits.push(self.hit_json(
+                &hit.fact,
+                self.detail(&hit.fact, now, true, day),
+                Some(&hit.why),
+            ));
             if i > 0 {
                 out.push('\n');
             }
@@ -1000,7 +1068,10 @@ impl Tessar {
                 "\nWarning: {degraded}. Results come from the other channels only."
             );
         }
-        Ok(out)
+        Ok(Rendered {
+            text: out,
+            structured: serde_json::json!({ "hits": hits }),
+        })
     }
 
     /// Every version of every fact about an entity, closed and corrected
@@ -1015,6 +1086,11 @@ impl Tessar {
 
     /// The `about` tool.
     pub fn about(&self, args: AboutArgs) -> Result<String, String> {
+        self.about_rendered(args).map(|r| r.text)
+    }
+
+    /// The `about` tool with its facts as JSON too, oldest first.
+    pub fn about_rendered(&self, args: AboutArgs) -> Result<Rendered, String> {
         let e = &args.entity;
         let spaces: Vec<Space> = if is_user(e) {
             vec![Space::User]
@@ -1032,11 +1108,10 @@ impl Tessar {
             }
         }
         let Some(entity) = found else {
-            return Ok(format!(
-                "No {} named {:?} is known.",
-                e.kind.trim(),
-                e.key.trim()
-            ));
+            return Ok(Rendered {
+                text: format!("No {} named {:?} is known.", e.kind.trim(), e.key.trim()),
+                structured: serde_json::json!({ "hits": [] }),
+            });
         };
         let now = self.clock.now();
         let history = args.history.unwrap_or(false);
@@ -1054,27 +1129,38 @@ impl Tessar {
             self.space_name(entity.space),
             facts.len()
         );
+        let mut hits = Vec::new();
         for f in &facts {
-            let mut line = self.line(f, now, !history, None);
+            let mut detail = self.detail(f, now, !history, None);
             if history {
                 let _ = match f.end.map(|end| end.ending) {
-                    None => write!(line, " [version {}, current]", f.version),
+                    None => write!(detail, " [version {}, current]", f.version),
                     Some(tessar_core::model::Ending::Changed { valid_to }) => {
                         write!(
-                            line,
+                            detail,
                             " [version {}, until {}]",
                             f.version,
                             when::ymd(valid_to)
                         )
                     }
                     Some(tessar_core::model::Ending::Corrected) => {
-                        write!(line, " [version {}, corrected]", f.version)
+                        write!(detail, " [version {}, corrected]", f.version)
                     }
                 };
             }
-            let _ = write!(out, "\n- {line}");
+            let _ = write!(
+                out,
+                "\n- {} [{}] [{}] {detail}",
+                f.id,
+                when::ymd(f.recorded_at),
+                self.space_name(f.space)
+            );
+            hits.push(self.hit_json(f, detail, None));
         }
-        Ok(out)
+        Ok(Rendered {
+            text: out,
+            structured: serde_json::json!({ "hits": hits }),
+        })
     }
 }
 

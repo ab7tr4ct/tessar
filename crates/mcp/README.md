@@ -77,6 +77,77 @@ the journal admits one process.
 
 The daemon uses Unix sockets, so it is for macOS and Linux.
 
+## Hooks
+
+Hooks put memory in front of the model without the model having to ask.
+`recall` and `about` return their hits as structured content next to the
+text (`{"hits": [{id, space, recorded, text, kind, similarity, channels,
+current}]}`), and `tessar hook` uses it. Hooks are Claude Code settings,
+not part of the MCP server: add them to `~/.claude/settings.json` (or use the
+`/hooks` menu). `tessar hook config` prints the snippet with the absolute
+path of the running binary and writes nothing:
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          { "type": "command", "command": "/ABSOLUTE/PATH/tessar hook prompt", "timeout": 20 }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          { "type": "command", "command": "/ABSOLUTE/PATH/tessar hook session", "timeout": 60 }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Both hooks read the hook's JSON from stdin, use the project of its `cwd`, and
+talk to the daemon (starting it if none runs). Whatever goes wrong, they print
+nothing, log to stderr and exit with status 0, so a memory that is down never
+blocks a prompt.
+
+- **`tessar hook prompt`** (`UserPromptSubmit`). Skips prompts of fewer than
+  three words and slash commands. Otherwise it calls `recall` with the prompt
+  (limit 8) and keeps the hits whose similarity is at least the threshold
+  **or** that the entity channel found, since an entity named in the prompt is
+  a strong signal whatever the cosine. Facts already shown in this session are
+  dropped; the ids printed are appended to `$TESSAR_HOME/hooks/<session_id>.shown`.
+  The rest, best first, is cut to the budget and printed, or nothing if no hit
+  passes:
+
+  ```
+  Memory (tessar) relevant to this message; call `recall` for more:
+  - [2026-11-08] [user] User prefers to be talked to in Russian
+  ```
+
+  It gives up after 15 s (a daemon that has to load the model first is not
+  waited for; the next prompt finds it running).
+- **`tessar hook session`** (`SessionStart`). Deletes the session's `.shown`
+  file, since the context is fresh, and prints a briefing: a line with the
+  counts and the tools, then `About you:` and `About this project:` with the
+  newest current facts of each, cut to the budget (each list gets half, and
+  what one leaves unused goes to the other). An empty memory gives one line
+  saying so and that `remember` saves facts. It waits up to 60 s for a daemon.
+- **`tessar hook config`** prints the snippet above.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `TESSAR_HOOK_MIN_SIMILARITY` | `0.45` | Smallest similarity of a hit the `prompt` hook shows, unless the entity channel found it. |
+| `TESSAR_HOOK_BUDGET` | `1500` | Characters the `prompt` hook may print. |
+| `TESSAR_HOOK_SESSION_BUDGET` | `3000` | Characters the `session` hook may print. |
+
+The threshold 0.45 is a first guess; it is to be calibrated on real prompts
+(experiment E13). The hooks use `$TESSAR_HOME` (default `~/.tessar`) for the
+socket and the `hooks/` directory, or `--home DIR`.
+
 ## Tools
 
 | Tool         | What it does |

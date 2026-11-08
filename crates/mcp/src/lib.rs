@@ -8,11 +8,13 @@
 //! - [`daemon`] serves that handler to many sessions over a Unix socket, one
 //!   project space per connection.
 //! - [`proxy`] is the stdio side: it forwards a session to the daemon.
+//! - [`hook`] is the logic of the Claude Code hooks (`tessar hook`).
 //! - `main.rs` opens the journal and the model and picks a mode.
 
 pub mod api;
 pub mod args;
 pub mod daemon;
+pub mod hook;
 pub mod project;
 pub mod proxy;
 pub mod server;

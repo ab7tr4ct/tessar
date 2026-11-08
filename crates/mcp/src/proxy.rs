@@ -3,6 +3,8 @@
 
 use std::borrow::Cow;
 use std::path::Path;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, ErrorData, Implementation, ListToolsResult,
@@ -11,8 +13,11 @@ use rmcp::model::{
 use rmcp::service::{RequestContext, RunningService};
 use rmcp::{Peer, RoleClient, RoleServer, ServerHandler, ServiceError, ServiceExt};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::net::UnixStream;
 
-use crate::daemon::Header;
+use crate::daemon::{Header, LOG_FILE, socket_path};
+
+const DAEMON_POLL: Duration = Duration::from_millis(200);
 
 /// A server whose tools are the daemon's: lists and calls are forwarded
 /// verbatim, and `initialize` reports what the daemon reported.
@@ -118,4 +123,67 @@ where
         _ = session.waiting() => Ok(true),
         _ = link.waiting() => Ok(false),
     }
+}
+
+/// Connects to the daemon's socket, starting a daemon first if none answers
+/// and waiting up to `wait` for it to listen (the model loads first).
+pub async fn connect_or_start(home: &Path, wait: Duration) -> Result<UnixStream, String> {
+    let socket = socket_path(home);
+    if let Ok(stream) = UnixStream::connect(&socket).await {
+        return Ok(stream);
+    }
+    let log = home.join(LOG_FILE);
+    let mut child = spawn_daemon(home, &log)?;
+    eprintln!("tessar: starting the daemon (log: {})", log.display());
+    let started = Instant::now();
+    loop {
+        tokio::time::sleep(DAEMON_POLL).await;
+        if let Ok(stream) = UnixStream::connect(&socket).await {
+            return Ok(stream);
+        }
+        // A daemon that failed (no model, say) will never listen. One that
+        // exited cleanly found another daemon holding the journal, which
+        // is about to listen.
+        if let Ok(Some(status)) = child.try_wait()
+            && !status.success()
+        {
+            return Err(format!(
+                "the daemon exited with {status}; see {}",
+                log.display()
+            ));
+        }
+        if started.elapsed() > wait {
+            return Err(format!(
+                "no daemon answered on {} within {}s; see {}",
+                socket.display(),
+                wait.as_secs(),
+                log.display()
+            ));
+        }
+    }
+}
+
+/// Starts `tessar daemon` in its own process group, so it outlives this
+/// proxy and the terminal's signals, with its output appended to `log`.
+fn spawn_daemon(home: &Path, log: &Path) -> Result<std::process::Child, String> {
+    use std::os::unix::process::CommandExt;
+    let exe = std::env::current_exe().map_err(|e| format!("cannot find my own binary: {e}"))?;
+    let out = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log)
+        .map_err(|e| format!("cannot open {}: {e}", log.display()))?;
+    let err = out
+        .try_clone()
+        .map_err(|e| format!("cannot open {}: {e}", log.display()))?;
+    Command::new(exe)
+        .arg("daemon")
+        .arg("--home")
+        .arg(home)
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(out)
+        .stderr(err)
+        .spawn()
+        .map_err(|e| format!("cannot start the daemon: {e}"))
 }

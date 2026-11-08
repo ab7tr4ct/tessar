@@ -9,9 +9,9 @@
 //! meant for a human goes to stderr.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode, Stdio};
+use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use rmcp::ServiceExt;
 use rmcp::transport::stdio;
@@ -20,7 +20,8 @@ use tessar_core::log::LogError;
 use tessar_core::store::{Memory, Op, Semantic};
 use tessar_embed_llama::{LlamaEmbedder, voyage_nano_path};
 use tessar_journal::FileJournal;
-use tessar_mcp::daemon::{self, LOG_FILE, Projects, socket_path};
+use tessar_mcp::daemon::{self, Projects, socket_path};
+use tessar_mcp::hook;
 use tessar_mcp::project::project_name;
 use tessar_mcp::proxy;
 use tessar_mcp::server::TessarServer;
@@ -37,6 +38,10 @@ USAGE:
     tessar daemon [--home DIR] [--idle-exit MINUTES]
                                hold the memory and the model and serve every
                                session on DIR/tessar.sock
+    tessar hook prompt|session [--home DIR]
+                               Claude Code hooks: read the hook JSON on stdin,
+                               print context for the model on stdout
+    tessar hook config         print the hooks snippet for ~/.claude/settings.json
     tessar --help              show this text
 
 The memory lives in DIR (default: $TESSAR_HOME, else ~/.tessar): journal.jsonl,
@@ -52,7 +57,6 @@ const MODEL_FILE: &str = "voyage-4-nano-Q8_0.gguf";
 
 /// How long the proxy waits for a freshly started daemon (the model loads).
 const DAEMON_WAIT: Duration = Duration::from_secs(60);
-const DAEMON_POLL: Duration = Duration::from_millis(200);
 
 /// What the command line asked for.
 #[derive(Debug, PartialEq)]
@@ -65,7 +69,19 @@ enum Cli {
         home: PathBuf,
         idle_exit: Option<Duration>,
     },
+    Hook {
+        home: PathBuf,
+        kind: HookKind,
+    },
     Help,
+}
+
+/// Which hook.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum HookKind {
+    Prompt,
+    Session,
+    Config,
 }
 
 fn main() -> ExitCode {
@@ -80,6 +96,7 @@ fn main() -> ExitCode {
             standalone: true,
         }) => run_standalone(&home),
         Ok(Cli::Daemon { home, idle_exit }) => run_daemon(&home, idle_exit),
+        Ok(Cli::Hook { home, kind }) => run_hook(&home, kind),
         Ok(Cli::Help) => {
             println!("{USAGE}");
             ExitCode::SUCCESS
@@ -100,6 +117,9 @@ fn parse(args: &[String], env: impl Fn(&str) -> Option<std::ffi::OsString>) -> R
     };
     if matches!(command, "--help" | "-h" | "help") {
         return Ok(Cli::Help);
+    }
+    if command == "hook" {
+        return parse_hook(&args[1..], env);
     }
     if !matches!(command, "mcp" | "daemon") {
         return Err(format!("unknown command `{command}`\n\n{USAGE}"));
@@ -133,6 +153,36 @@ fn parse(args: &[String], env: impl Fn(&str) -> Option<std::ffi::OsString>) -> R
     } else {
         Cli::Daemon { home, idle_exit }
     })
+}
+
+fn parse_hook(
+    args: &[String],
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<Cli, String> {
+    let kind = match args.first().map(String::as_str) {
+        Some("prompt") => HookKind::Prompt,
+        Some("session") => HookKind::Session,
+        Some("config") => HookKind::Config,
+        _ => return Err(format!("`hook` wants prompt, session or config\n\n{USAGE}")),
+    };
+    let mut home = None;
+    let mut it = args[1..].iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--home" => {
+                home = Some(PathBuf::from(it.next().ok_or("--home needs a directory")?));
+            }
+            a if a.starts_with("--home=") => home = Some(PathBuf::from(&a["--home=".len()..])),
+            other => return Err(format!("unexpected argument `{other}`\n\n{USAGE}")),
+        }
+    }
+    let home = match (home, kind) {
+        (Some(home), _) => home,
+        // The snippet needs no memory directory.
+        (None, HookKind::Config) => PathBuf::new(),
+        (None, _) => default_home(env)?,
+    };
+    Ok(Cli::Hook { home, kind })
 }
 
 fn minutes(text: &str) -> Result<Duration, String> {
@@ -367,6 +417,46 @@ async fn termination() {
     }
 }
 
+// ---- tessar hook ---------------------------------------------------
+
+/// Runs a hook. Whatever goes wrong, the status is 0 and stdout is empty:
+/// memory being down must not block the user's prompt (status 2 would).
+fn run_hook(home: &Path, kind: HookKind) -> ExitCode {
+    use std::io::{Read, Write};
+    if kind == HookKind::Config {
+        return match std::env::current_exe() {
+            Ok(exe) => {
+                print!("{}", hook::config_snippet(&exe));
+                ExitCode::SUCCESS
+            }
+            Err(e) => fail(&format!("cannot find my own binary: {e}")),
+        };
+    }
+    let mut stdin = String::new();
+    if let Err(e) = std::io::stdin().read_to_string(&mut stdin) {
+        eprintln!("tessar hook: cannot read stdin: {e}");
+        return ExitCode::SUCCESS;
+    }
+    let settings = hook::Settings::from_env(|name| std::env::var(name).ok());
+    let result = runtime().and_then(|rt| {
+        rt.block_on(async {
+            match kind {
+                HookKind::Prompt => hook::run_prompt(home, &stdin, &settings).await,
+                _ => hook::run_session(home, &stdin, &settings).await,
+            }
+        })
+    });
+    match result {
+        Ok(text) => {
+            let mut out = std::io::stdout().lock();
+            let _ = out.write_all(text.as_bytes());
+            let _ = out.flush();
+        }
+        Err(e) => eprintln!("tessar hook: {e}"),
+    }
+    ExitCode::SUCCESS
+}
+
 // ---- tessar mcp ----------------------------------------------------
 
 fn run_proxy(home: &Path) -> ExitCode {
@@ -380,7 +470,7 @@ fn run_proxy(home: &Path) -> ExitCode {
         Err(e) => return fail(&e),
     };
     let result = runtime.block_on(async {
-        let stream = connect_or_start(home).await?;
+        let stream = proxy::connect_or_start(home, DAEMON_WAIT).await?;
         let (server, link) = proxy::connect(stream, &project, &cwd).await?;
         eprintln!("tessar: connected to the daemon (project space `{project}`)");
         proxy::bridge(server, link, stdio()).await
@@ -390,68 +480,6 @@ fn run_proxy(home: &Path) -> ExitCode {
         Ok(false) => fail("the daemon closed the connection"),
         Err(e) => fail(&e),
     }
-}
-
-/// Connects to the daemon's socket, starting a daemon first if none answers.
-async fn connect_or_start(home: &Path) -> Result<UnixStream, String> {
-    let socket = socket_path(home);
-    if let Ok(stream) = UnixStream::connect(&socket).await {
-        return Ok(stream);
-    }
-    let log = home.join(LOG_FILE);
-    let mut child = spawn_daemon(home, &log)?;
-    eprintln!("tessar: starting the daemon (log: {})", log.display());
-    let started = Instant::now();
-    loop {
-        tokio::time::sleep(DAEMON_POLL).await;
-        if let Ok(stream) = UnixStream::connect(&socket).await {
-            return Ok(stream);
-        }
-        // A daemon that failed (no model, say) will never listen. One that
-        // exited cleanly found another daemon holding the journal, which
-        // is about to listen.
-        if let Ok(Some(status)) = child.try_wait()
-            && !status.success()
-        {
-            return Err(format!(
-                "the daemon exited with {status}; see {}",
-                log.display()
-            ));
-        }
-        if started.elapsed() > DAEMON_WAIT {
-            return Err(format!(
-                "no daemon answered on {} within {}s; see {}",
-                socket.display(),
-                DAEMON_WAIT.as_secs(),
-                log.display()
-            ));
-        }
-    }
-}
-
-/// Starts `tessar daemon` in its own process group, so it outlives this
-/// proxy and the terminal's signals, with its output appended to `log`.
-fn spawn_daemon(home: &Path, log: &Path) -> Result<std::process::Child, String> {
-    use std::os::unix::process::CommandExt;
-    let exe = std::env::current_exe().map_err(|e| format!("cannot find my own binary: {e}"))?;
-    let out = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log)
-        .map_err(|e| format!("cannot open {}: {e}", log.display()))?;
-    let err = out
-        .try_clone()
-        .map_err(|e| format!("cannot open {}: {e}", log.display()))?;
-    Command::new(exe)
-        .arg("daemon")
-        .arg("--home")
-        .arg(home)
-        .process_group(0)
-        .stdin(Stdio::null())
-        .stdout(out)
-        .stderr(err)
-        .spawn()
-        .map_err(|e| format!("cannot start the daemon: {e}"))
 }
 
 #[cfg(test)]
@@ -519,6 +547,35 @@ mod tests {
         assert!(p(&["daemon", "--idle-exit", "0"], &[("HOME", "/u")]).is_err());
         assert!(p(&["daemon", "--idle-exit", "soon"], &[("HOME", "/u")]).is_err());
         assert!(p(&["daemon", "--standalone"], &[("HOME", "/u")]).is_err());
+    }
+
+    #[test]
+    fn hook_commands() {
+        assert_eq!(
+            p(&["hook", "prompt"], &[("HOME", "/u")]).unwrap(),
+            Cli::Hook {
+                home: "/u/.tessar".into(),
+                kind: HookKind::Prompt
+            }
+        );
+        assert_eq!(
+            p(&["hook", "session", "--home", "/h"], &[]).unwrap(),
+            Cli::Hook {
+                home: "/h".into(),
+                kind: HookKind::Session
+            }
+        );
+        // The snippet works without a home.
+        assert!(matches!(
+            p(&["hook", "config"], &[]).unwrap(),
+            Cli::Hook {
+                kind: HookKind::Config,
+                ..
+            }
+        ));
+        assert!(p(&["hook"], &[("HOME", "/u")]).is_err());
+        assert!(p(&["hook", "other"], &[("HOME", "/u")]).is_err());
+        assert!(p(&["hook", "prompt"], &[]).is_err());
     }
 
     #[test]
