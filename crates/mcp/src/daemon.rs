@@ -1,13 +1,39 @@
 //! The daemon: one process per machine holds the memory and the model and
 //! serves MCP to many sessions over a Unix socket.
 //!
-//! A connection starts with one line of JSON, the [`Header`], naming the
-//! project the session runs in. The rest of the stream is plain MCP,
-//! served by a [`TessarServer`] whose project space is the header's.
+//! # Protocol
+//!
+//! A connection starts with one line of JSON from the client, the
+//! [`Header`], naming the project the session runs in and the client's
+//! build id:
+//!
+//! ```text
+//! {"tessar":1,"project":"repo","cwd":"/work/repo","build":"0.1.0+3ff4d59.1731100000"}
+//! ```
+//!
+//! The daemon answers with one line, the [`Hello`], naming itself, before
+//! any MCP traffic:
+//!
+//! ```text
+//! {"tessar":1,"build":"0.1.0+3ff4d59.1731100000","pid":4242}
+//! ```
+//!
+//! Then the rest of the stream is plain MCP, served by a [`TessarServer`]
+//! whose project space is the header's. The client compares the build ids.
+//! If they differ, a proxy retires the daemon (SIGTERM to `pid`, see
+//! [`crate::lifecycle`]) and starts a new one; a hook uses the daemon as
+//! it is.
+//!
+//! A header `{"tessar":1,"status":true}` asks for the daemon's state
+//! instead: the daemon answers one hello line extended with `uptime_secs`
+//! and `sessions` (open MCP sessions) and closes the connection. A daemon
+//! older than the handshake sends no hello and never answers; clients give
+//! up on it after a few seconds.
 
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -15,11 +41,12 @@ use rmcp::ServiceExt;
 use serde::{Deserialize, Serialize};
 use tessar_core::clock::Clock;
 use tessar_core::store::{Memory, StoreError};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 
+use crate::BUILD_ID;
 use crate::api::Tessar;
 use crate::server::TessarServer;
 
@@ -48,11 +75,19 @@ pub fn socket_path(home: &Path) -> PathBuf {
 pub struct Header {
     /// The header protocol version, [`PROTOCOL`].
     pub tessar: u32,
-    /// The project name, as `tessar mcp` computed it.
+    /// The project name, as `tessar mcp` computed it. Empty for a status
+    /// request.
+    #[serde(default)]
     pub project: String,
     /// The session's working directory, for the log.
     #[serde(default)]
     pub cwd: String,
+    /// The client's build id; empty from clients that predate it.
+    #[serde(default)]
+    pub build: String,
+    /// Ask for the daemon's state instead of opening a session.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub status: bool,
 }
 
 impl Header {
@@ -62,6 +97,19 @@ impl Header {
             tessar: PROTOCOL,
             project: project.to_owned(),
             cwd: cwd.display().to_string(),
+            build: BUILD_ID.to_owned(),
+            status: false,
+        }
+    }
+
+    /// A header asking for the daemon's state.
+    pub fn status_request() -> Self {
+        Self {
+            tessar: PROTOCOL,
+            project: String::new(),
+            cwd: String::new(),
+            build: BUILD_ID.to_owned(),
+            status: true,
         }
     }
 
@@ -82,10 +130,103 @@ impl Header {
                 header.tessar
             ));
         }
-        if header.project.trim().is_empty() {
+        if !header.status && header.project.trim().is_empty() {
             return Err("bad connection header: empty project".to_owned());
         }
         Ok(header)
+    }
+}
+
+/// The daemon's first line on a connection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Hello {
+    /// The header protocol version, [`PROTOCOL`].
+    pub tessar: u32,
+    /// The daemon's build id.
+    pub build: String,
+    /// The daemon's process id.
+    pub pid: u32,
+    /// Seconds since the daemon started; status answers only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uptime_secs: Option<u64>,
+    /// Open MCP sessions; status answers only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sessions: Option<usize>,
+}
+
+impl Hello {
+    /// The hello line, newline included.
+    pub fn line(&self) -> String {
+        let mut line = serde_json::to_string(self).expect("a hello is plain data");
+        line.push('\n');
+        line
+    }
+
+    /// Parses one hello line.
+    pub fn parse(line: &str) -> Result<Self, String> {
+        let hello: Self =
+            serde_json::from_str(line.trim()).map_err(|e| format!("bad daemon hello: {e}"))?;
+        if hello.tessar != PROTOCOL {
+            return Err(format!(
+                "the daemon speaks protocol {}, this binary {PROTOCOL}",
+                hello.tessar
+            ));
+        }
+        Ok(hello)
+    }
+}
+
+/// Who the daemon is, and what it is doing.
+pub struct State {
+    build: String,
+    pid: u32,
+    started: std::time::Instant,
+    sessions: AtomicUsize,
+}
+
+impl State {
+    /// The state of a daemon that has just started, with build id `build`.
+    pub fn new(build: &str) -> Self {
+        Self {
+            build: build.to_owned(),
+            pid: std::process::id(),
+            started: std::time::Instant::now(),
+            sessions: AtomicUsize::new(0),
+        }
+    }
+
+    fn hello(&self) -> Hello {
+        Hello {
+            tessar: PROTOCOL,
+            build: self.build.clone(),
+            pid: self.pid,
+            uptime_secs: None,
+            sessions: None,
+        }
+    }
+
+    fn status(&self) -> Hello {
+        Hello {
+            uptime_secs: Some(self.started.elapsed().as_secs()),
+            sessions: Some(self.sessions.load(Ordering::Relaxed)),
+            ..self.hello()
+        }
+    }
+}
+
+/// Counts an open MCP session while alive.
+struct SessionGuard<'a>(&'a AtomicUsize);
+
+impl<'a> SessionGuard<'a> {
+    fn new(counter: &'a AtomicUsize) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Self(counter)
+    }
+}
+
+impl Drop for SessionGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -127,18 +268,20 @@ impl Projects {
     }
 }
 
-/// Reads the header line, then serves MCP on the rest of `stream` until the
-/// peer closes it or `stop` fires. Returns the header's project name.
+/// Reads the header line, answers with the hello, then serves MCP on the
+/// rest of `stream` until the peer closes it or `stop` fires. A status
+/// request gets the extended hello and nothing more.
 pub async fn serve_connection<S>(
     stream: S,
     projects: Arc<Projects>,
+    state: Arc<State>,
     stop: tokio::sync::watch::Receiver<bool>,
     peer: u64,
 ) -> Result<(), String>
 where
     S: AsyncRead + AsyncWrite + Send + 'static,
 {
-    let (reader, writer) = tokio::io::split(stream);
+    let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
     // `take` bounds a peer that never sends a newline.
@@ -151,10 +294,29 @@ where
         return Err("closed before the header".to_owned());
     }
     let header = Header::parse(&line)?;
+    if header.status {
+        writer
+            .write_all(state.status().line().as_bytes())
+            .await
+            .map_err(|e| format!("cannot answer the status request: {e}"))?;
+        return writer.shutdown().await.map_err(|e| e.to_string());
+    }
+    writer
+        .write_all(state.hello().line().as_bytes())
+        .await
+        .and(writer.flush().await)
+        .map_err(|e| format!("cannot write the hello: {e}"))?;
     eprintln!(
-        "tessar: #{peer} opened: project `{}` in {}",
-        header.project, header.cwd
+        "tessar: #{peer} opened: project `{}` in {} (client build {})",
+        header.project,
+        header.cwd,
+        if header.build.is_empty() {
+            "unknown"
+        } else {
+            &header.build
+        }
     );
+    let _session = SessionGuard::new(&state.sessions);
     let project = header.project.clone();
     let api = {
         let projects = Arc::clone(&projects);
@@ -190,6 +352,20 @@ pub async fn run<F>(
 ) where
     F: Future<Output = ()>,
 {
+    run_as(BUILD_ID, listener, projects, idle_exit, shutdown).await;
+}
+
+/// [`run`] announcing build id `build`, so tests can play an older daemon.
+pub async fn run_as<F>(
+    build: &str,
+    listener: UnixListener,
+    projects: Arc<Projects>,
+    idle_exit: Option<Duration>,
+    shutdown: F,
+) where
+    F: Future<Output = ()>,
+{
+    let state = Arc::new(State::new(build));
     tokio::pin!(shutdown);
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let mut tasks: JoinSet<()> = JoinSet::new();
@@ -213,9 +389,10 @@ pub async fn run<F>(
                     next_id += 1;
                     let id = next_id;
                     let projects = Arc::clone(&projects);
+                    let state = Arc::clone(&state);
                     let stop = stop_rx.clone();
                     tasks.spawn(async move {
-                        match serve_connection(stream, projects, stop, id).await {
+                        match serve_connection(stream, projects, state, stop, id).await {
                             Ok(()) => eprintln!("tessar: #{id} closed"),
                             Err(e) => eprintln!("tessar: #{id} closed: {e}"),
                         }
@@ -280,6 +457,38 @@ mod tests {
         ] {
             assert!(Header::parse(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn header_carries_the_build_and_the_status_flag() {
+        let h = Header::new("repo", Path::new("/x"));
+        assert_eq!(h.build, BUILD_ID);
+        assert!(!h.line().contains("status"));
+        let h = Header::parse(&Header::status_request().line()).unwrap();
+        assert!(h.status);
+        assert!(h.project.is_empty());
+        // Headers from before the build id still parse.
+        let h = Header::parse(r#"{"tessar":1,"project":"repo"}"#).unwrap();
+        assert_eq!(h.build, "");
+    }
+
+    #[test]
+    fn hello_round_trip_and_documented_form() {
+        let hello = State::new("1.2+abc.99").hello();
+        let line = hello.line();
+        assert_eq!(
+            line,
+            format!(
+                "{{\"tessar\":1,\"build\":\"1.2+abc.99\",\"pid\":{}}}\n",
+                hello.pid
+            )
+        );
+        assert_eq!(Hello::parse(&line).unwrap(), hello);
+        let status = State::new("b").status();
+        assert_eq!(status.sessions, Some(0));
+        assert_eq!(Hello::parse(&status.line()).unwrap(), status);
+        assert!(Hello::parse(r#"{"tessar":2,"build":"b","pid":1}"#).is_err());
+        assert!(Hello::parse("").is_err());
     }
 
     #[test]

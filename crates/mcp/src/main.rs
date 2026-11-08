@@ -22,6 +22,7 @@ use tessar_embed_llama::{LlamaEmbedder, voyage_nano_path};
 use tessar_journal::FileJournal;
 use tessar_mcp::daemon::{self, Projects, socket_path};
 use tessar_mcp::hook;
+use tessar_mcp::lifecycle;
 use tessar_mcp::project::project_name;
 use tessar_mcp::proxy;
 use tessar_mcp::server::TessarServer;
@@ -31,21 +32,28 @@ const USAGE: &str = "\
 tessar: a memory engine for AI agents
 
 USAGE:
-    tessar mcp [--home DIR] [--standalone]
+    tessar mcp [--home DIR] [--standalone] [--keep-daemon]
                                serve the memory as an MCP server on stdio. By
                                default a proxy to the daemon, which is started
-                               when none runs; --standalone serves in process
+                               when none runs and restarted when it is another
+                               build than this binary (--keep-daemon: never
+                               restart it); --standalone serves in process
     tessar daemon [--home DIR] [--idle-exit MINUTES]
                                hold the memory and the model and serve every
                                session on DIR/tessar.sock
+    tessar daemon stop|status [--home DIR]
+                               stop the daemon (SIGTERM to the pid in
+                               DIR/tessar.pid), or print its build, pid, uptime
+                               and open sessions
     tessar hook prompt|session [--home DIR]
                                Claude Code hooks: read the hook JSON on stdin,
                                print context for the model on stdout
     tessar hook config         print the hooks snippet for ~/.claude/settings.json
+    tessar --version           print the build id
     tessar --help              show this text
 
 The memory lives in DIR (default: $TESSAR_HOME, else ~/.tessar): journal.jsonl,
-tessar.sock and daemon.log, and the embedding model in
+tessar.sock, tessar.pid and daemon.log, and the embedding model in
 models/voyage-4-nano-Q8_0.gguf. Set TESSAR_MODEL to use a model file from
 elsewhere.";
 
@@ -64,15 +72,23 @@ enum Cli {
     Mcp {
         home: PathBuf,
         standalone: bool,
+        keep_daemon: bool,
     },
     Daemon {
         home: PathBuf,
         idle_exit: Option<Duration>,
     },
+    DaemonStop {
+        home: PathBuf,
+    },
+    DaemonStatus {
+        home: PathBuf,
+    },
     Hook {
         home: PathBuf,
         kind: HookKind,
     },
+    Version,
     Help,
 }
 
@@ -90,11 +106,19 @@ fn main() -> ExitCode {
         Ok(Cli::Mcp {
             home,
             standalone: false,
-        }) => run_proxy(&home),
+            keep_daemon,
+        }) => run_proxy(&home, keep_daemon),
         Ok(Cli::Mcp {
             home,
             standalone: true,
+            ..
         }) => run_standalone(&home),
+        Ok(Cli::DaemonStop { home }) => run_lifecycle(lifecycle::stop(&home)),
+        Ok(Cli::DaemonStatus { home }) => run_lifecycle(lifecycle::status(&home)),
+        Ok(Cli::Version) => {
+            println!("tessar {}", tessar_mcp::BUILD_ID);
+            ExitCode::SUCCESS
+        }
         Ok(Cli::Daemon { home, idle_exit }) => run_daemon(&home, idle_exit),
         Ok(Cli::Hook { home, kind }) => run_hook(&home, kind),
         Ok(Cli::Help) => {
@@ -118,16 +142,25 @@ fn parse(args: &[String], env: impl Fn(&str) -> Option<std::ffi::OsString>) -> R
     if matches!(command, "--help" | "-h" | "help") {
         return Ok(Cli::Help);
     }
+    if matches!(command, "--version" | "-V" | "version") {
+        return Ok(Cli::Version);
+    }
     if command == "hook" {
         return parse_hook(&args[1..], env);
     }
     if !matches!(command, "mcp" | "daemon") {
         return Err(format!("unknown command `{command}`\n\n{USAGE}"));
     }
+    // `daemon stop` and `daemon status` control a running daemon.
+    let (control, rest) = match args.get(1).map(String::as_str) {
+        Some(c @ ("stop" | "status")) if command == "daemon" => (Some(c), &args[2..]),
+        _ => (None, &args[1..]),
+    };
     let mut home = None;
     let mut standalone = false;
+    let mut keep_daemon = false;
     let mut idle_exit = None;
-    let mut it = args[1..].iter();
+    let mut it = rest.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--home" => {
@@ -135,10 +168,11 @@ fn parse(args: &[String], env: impl Fn(&str) -> Option<std::ffi::OsString>) -> R
             }
             a if a.starts_with("--home=") => home = Some(PathBuf::from(&a["--home=".len()..])),
             "--standalone" if command == "mcp" => standalone = true,
-            "--idle-exit" if command == "daemon" => {
+            "--keep-daemon" if command == "mcp" => keep_daemon = true,
+            "--idle-exit" if command == "daemon" && control.is_none() => {
                 idle_exit = Some(minutes(it.next().ok_or("--idle-exit needs minutes")?)?);
             }
-            a if a.starts_with("--idle-exit=") && command == "daemon" => {
+            a if a.starts_with("--idle-exit=") && command == "daemon" && control.is_none() => {
                 idle_exit = Some(minutes(&a["--idle-exit=".len()..])?);
             }
             other => return Err(format!("unexpected argument `{other}`\n\n{USAGE}")),
@@ -148,10 +182,15 @@ fn parse(args: &[String], env: impl Fn(&str) -> Option<std::ffi::OsString>) -> R
         Some(home) => home,
         None => default_home(env)?,
     };
-    Ok(if command == "mcp" {
-        Cli::Mcp { home, standalone }
-    } else {
-        Cli::Daemon { home, idle_exit }
+    Ok(match (command, control) {
+        ("mcp", _) => Cli::Mcp {
+            home,
+            standalone,
+            keep_daemon,
+        },
+        (_, Some("stop")) => Cli::DaemonStop { home },
+        (_, Some(_)) => Cli::DaemonStatus { home },
+        _ => Cli::Daemon { home, idle_exit },
     })
 }
 
@@ -368,11 +407,20 @@ fn run_daemon(home: &Path, idle_exit: Option<Duration>) -> ExitCode {
             home.display(),
             socket.display()
         );
+        if let Err(e) = lifecycle::write_pid_file(home) {
+            eprintln!("tessar: cannot write the pid file: {e}");
+        }
+        eprintln!(
+            "tessar: build {}, pid {}",
+            tessar_mcp::BUILD_ID,
+            std::process::id()
+        );
         let projects = Arc::new(Projects::new(memory, clock));
         daemon::run(listener, projects, idle_exit, termination()).await;
         Ok::<(), String>(())
     });
     let _ = std::fs::remove_file(&socket);
+    lifecycle::remove_pid_file(home);
     match served {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => fail(&e),
@@ -414,6 +462,20 @@ async fn termination() {
     tokio::select! {
         _ = term.recv() => {}
         _ = int.recv() => {}
+    }
+}
+
+// ---- tessar daemon stop|status --------------------------------------
+
+/// Runs `work` to completion and prints its message.
+fn run_lifecycle(work: impl std::future::Future<Output = Result<String, String>>) -> ExitCode {
+    let result = runtime().and_then(|rt| rt.block_on(work));
+    match result {
+        Ok(message) => {
+            println!("{message}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => fail(&e),
     }
 }
 
@@ -459,7 +521,7 @@ fn run_hook(home: &Path, kind: HookKind) -> ExitCode {
 
 // ---- tessar mcp ----------------------------------------------------
 
-fn run_proxy(home: &Path) -> ExitCode {
+fn run_proxy(home: &Path, keep_daemon: bool) -> ExitCode {
     if let Err(e) = create_home(home) {
         return fail(&e);
     }
@@ -470,8 +532,8 @@ fn run_proxy(home: &Path) -> ExitCode {
         Err(e) => return fail(&e),
     };
     let result = runtime.block_on(async {
-        let stream = proxy::connect_or_start(home, DAEMON_WAIT).await?;
-        let (server, link) = proxy::connect(stream, &project, &cwd).await?;
+        let opened = proxy::open_current(home, &project, &cwd, DAEMON_WAIT, keep_daemon).await?;
+        let (server, link) = opened.serve().await?;
         eprintln!("tessar: connected to the daemon (project space `{project}`)");
         proxy::bridge(server, link, stdio()).await
     });
@@ -503,7 +565,8 @@ mod tests {
             p(&["mcp"], &[("TESSAR_HOME", "/t")]).unwrap(),
             Cli::Mcp {
                 home: "/t".into(),
-                standalone: false
+                standalone: false,
+                keep_daemon: false
             }
         );
         assert_eq!(
@@ -514,18 +577,45 @@ mod tests {
             .unwrap(),
             Cli::Mcp {
                 home: "/x".into(),
-                standalone: true
+                standalone: true,
+                keep_daemon: false
             }
         );
         assert_eq!(
             p(&["mcp"], &[("HOME", "/u")]).unwrap(),
             Cli::Mcp {
                 home: "/u/.tessar".into(),
-                standalone: false
+                standalone: false,
+                keep_daemon: false
             }
         );
         assert!(p(&["mcp"], &[]).is_err());
         assert!(p(&["mcp", "--idle-exit", "5"], &[("HOME", "/u")]).is_err());
+        assert_eq!(
+            p(&["mcp", "--keep-daemon"], &[("HOME", "/u")]).unwrap(),
+            Cli::Mcp {
+                home: "/u/.tessar".into(),
+                standalone: false,
+                keep_daemon: true
+            }
+        );
+        assert!(p(&["daemon", "--keep-daemon"], &[("HOME", "/u")]).is_err());
+    }
+
+    #[test]
+    fn daemon_stop_status_and_version() {
+        assert_eq!(
+            p(&["daemon", "stop", "--home", "/d"], &[]).unwrap(),
+            Cli::DaemonStop { home: "/d".into() }
+        );
+        assert_eq!(
+            p(&["daemon", "status"], &[("TESSAR_HOME", "/t")]).unwrap(),
+            Cli::DaemonStatus { home: "/t".into() }
+        );
+        assert!(p(&["daemon", "stop", "--idle-exit", "5"], &[("HOME", "/u")]).is_err());
+        assert_eq!(p(&["--version"], &[]).unwrap(), Cli::Version);
+        assert!(!tessar_mcp::BUILD_ID.is_empty());
+        assert!(tessar_mcp::BUILD_ID.starts_with(env!("CARGO_PKG_VERSION")));
     }
 
     #[test]

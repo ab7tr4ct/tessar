@@ -9,13 +9,27 @@
 //!   project space per connection.
 //! - [`proxy`] is the stdio side: it forwards a session to the daemon.
 //! - [`hook`] is the logic of the Claude Code hooks (`tessar hook`).
+//! - [`lifecycle`] is the daemon's pid file, its retirement when the binary
+//!   changed, and `tessar daemon stop|status`.
 //! - `main.rs` opens the journal and the model and picks a mode.
 
 pub mod api;
 pub mod args;
 pub mod daemon;
 pub mod hook;
+pub mod lifecycle;
 pub mod project;
 pub mod proxy;
 pub mod server;
 pub mod when;
+
+/// Identifies this build: the crate version, the commit it was built from
+/// and the unix time of the build. A daemon and a proxy with different ids
+/// are different binaries.
+pub const BUILD_ID: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    "+",
+    env!("TESSAR_GIT_HASH"),
+    ".",
+    env!("TESSAR_BUILD_ID")
+);

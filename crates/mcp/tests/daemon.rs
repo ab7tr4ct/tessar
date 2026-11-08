@@ -294,3 +294,91 @@ async fn idle_daemon_exits_after_the_last_session() {
         .expect("did not exit when idle")
         .unwrap();
 }
+
+#[tokio::test]
+async fn daemon_greets_with_its_build_and_pid_before_mcp() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let home = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(home.path(), None);
+    let mut stream = UnixStream::connect(socket_path(home.path())).await.unwrap();
+    stream
+        .write_all(b"{\"tessar\":1,\"project\":\"alpha\",\"build\":\"x\"}\n")
+        .await
+        .unwrap();
+    let mut line = String::new();
+    BufReader::new(&mut stream)
+        .read_line(&mut line)
+        .await
+        .unwrap();
+    assert_eq!(
+        line,
+        format!(
+            "{{\"tessar\":1,\"build\":\"{}\",\"pid\":{}}}\n",
+            tessar_mcp::BUILD_ID,
+            std::process::id()
+        )
+    );
+    drop(stream);
+    daemon.shutdown().await;
+}
+
+#[tokio::test]
+async fn open_reports_the_daemons_build_and_a_session_still_works() {
+    let home = tempfile::tempdir().unwrap();
+    let (stop, rx) = oneshot::channel::<()>();
+    let listener = UnixListener::bind(socket_path(home.path())).unwrap();
+    let task = tokio::spawn(daemon::run_as(
+        "0.0.1+old.1",
+        listener,
+        projects(),
+        None,
+        async {
+            let _ = rx.await;
+        },
+    ));
+    let stream = UnixStream::connect(socket_path(home.path())).await.unwrap();
+    let opened = proxy::open(stream, "alpha", Path::new("/work/x"))
+        .await
+        .unwrap();
+    assert_eq!(opened.hello().build, "0.0.1+old.1");
+    assert_eq!(opened.hello().pid, std::process::id());
+    assert!(proxy::needs_restart(
+        tessar_mcp::BUILD_ID,
+        &opened.hello().build,
+        false
+    ));
+    let (_server, link) = opened.serve().await.unwrap();
+
+    // Status while a session is open.
+    let stream = UnixStream::connect(socket_path(home.path())).await.unwrap();
+    let status = proxy::status(stream).await.unwrap();
+    assert_eq!(status.build, "0.0.1+old.1");
+    assert_eq!(status.sessions, Some(1));
+    assert!(status.uptime_secs.is_some());
+
+    drop(link);
+    let _ = stop.send(());
+    tokio::time::timeout(Duration::from_secs(15), task)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn open_gives_up_on_a_daemon_without_a_hello() {
+    let home = tempfile::tempdir().unwrap();
+    let listener = UnixListener::bind(socket_path(home.path())).unwrap();
+    // An old daemon: accepts, reads, says nothing.
+    let silent = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        drop(stream);
+    });
+    let stream = UnixStream::connect(socket_path(home.path())).await.unwrap();
+    let err = proxy::open(stream, "alpha", Path::new("/work/x"))
+        .await
+        .err()
+        .expect("no hello");
+    assert!(err.contains("predates the build handshake"), "{err}");
+    silent.abort();
+}

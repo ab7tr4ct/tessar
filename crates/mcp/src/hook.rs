@@ -501,7 +501,15 @@ where
         std::fs::create_dir_all(home)
             .map_err(|e| format!("cannot create {}: {e}", home.display()))?;
         let stream = proxy::connect_or_start(home, wait).await?;
-        let (server, link) = proxy::connect(stream, &project, &cwd).await?;
+        let opened = proxy::open(stream, &project, &cwd).await?;
+        if opened.hello().build != crate::BUILD_ID {
+            eprintln!(
+                "tessar hook: daemon build differs (daemon {}, hook {}); using it as it is",
+                opened.hello().build,
+                crate::BUILD_ID
+            );
+        }
+        let (server, link) = opened.serve().await?;
         let out = work(server.daemon().clone(), project).await;
         drop(link);
         out

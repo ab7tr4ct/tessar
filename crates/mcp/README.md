@@ -59,11 +59,32 @@ the journal admits one process.
   daemon is already running` and exits with status 0.
 - **Socket.** `$TESSAR_HOME/tessar.sock` (default `~/.tessar/tessar.sock`),
   mode 0600. A stale file from a daemon that died is removed on start.
-- **Protocol.** A connection starts with one JSON line,
-  `{"tessar": 1, "project": "<name>", "cwd": "<path>"}`, then speaks MCP. The
-  project is computed by the proxy as described under *Where data lives*, so
-  each session gets the space of the directory it runs in. The project space
-  is created on first use.
+- **Protocol.** A connection starts with one JSON line from the client,
+  `{"tessar": 1, "project": "<name>", "cwd": "<path>", "build": "<id>"}`.
+  The daemon answers with one line, `{"tessar": 1, "build": "<id>", "pid":
+  <pid>}`, and then both sides speak MCP. The project is computed by the
+  proxy as described under *Where data lives*, so each session gets the
+  space of the directory it runs in. The project space is created on first
+  use.
+- **Build id.** Every binary carries `<version>+<git hash>.<build time>`;
+  `tessar --version` prints it. A daemon keeps serving the code it was
+  started with, so after `cargo build` the proxy compares ids on connect.
+  If the daemon's differs, `tessar mcp` sends it SIGTERM, waits up to 15 s
+  for it to go, starts a new one from the current binary and connects to
+  that. The daemon's other sessions are closed by the shutdown, and Claude
+  Code shows tessar as disconnected in those sessions until you reconnect
+  (`/mcp`). `tessar mcp --keep-daemon` never restarts the daemon, for
+  debugging. Hooks never restart anything: on a different build they use the
+  daemon as it is and write `daemon build differs` to stderr.
+- **Upgrading from a daemon without the handshake.** Such a daemon sends no
+  hello, so the proxy and the hooks give up after 5 s with an error. Stop it
+  once by hand (`pkill -f 'tessar daemon'`); from then on it restarts itself.
+- **`tessar daemon stop`.** Sends SIGTERM to the pid in
+  `$TESSAR_HOME/tessar.pid` (written on start, removed on shutdown) and waits
+  for the daemon to go. It says so if none runs.
+- **`tessar daemon status`.** Connects with `{"tessar": 1, "status": true}`
+  and prints the daemon's build id, pid, uptime and number of open sessions.
+  Exits with failure if no daemon answers.
 - **Log.** `$TESSAR_HOME/daemon.log` when the proxy started it (appended): one
   line when a connection opens and one when it closes.
 - **`--idle-exit N`.** Exit when no connection has been open for N minutes.
