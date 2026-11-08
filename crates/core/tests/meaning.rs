@@ -279,6 +279,25 @@ fn reopening_rebuilds_the_same_vectors() {
 }
 
 #[test]
+fn reopening_keeps_vectors_aligned_across_embedding_batches() {
+    // Opening embeds facts in batches; with more facts than one batch,
+    // every fact must still get its own vector (a zip over a shared id
+    // iterator once lost one id per batch boundary).
+    let (w, _) = world();
+    for i in 0..150 {
+        w.remember_one(statement(&format!("note number {i} about topic {}", i % 7)));
+    }
+    w.remember_one(statement("Anna moved to Berlin"));
+    let query = Recall::new("Куда переехала Аня?");
+    let before = w.memory.recall(&query).hits;
+    assert!(before[0].why.similarity.is_some());
+
+    let reopened = w.reopen();
+    let after = reopened.recall(&query).hits;
+    assert_eq!(before, after);
+}
+
+#[test]
 fn opening_fails_if_the_embedder_fails() {
     let (w, concepts) = world();
     w.remember_one(statement("The journal is append-only"));

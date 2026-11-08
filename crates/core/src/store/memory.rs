@@ -146,11 +146,13 @@ impl Memory {
                 .iter()
                 .map(|f| (f.id, fact_text(&state, f)))
                 .unzip();
-            let mut ids = ids.into_iter();
-            for batch in texts.chunks(EMBED_BATCH) {
-                for (fact, vector) in ids.by_ref().zip(embed_texts(semantic, batch)?) {
+            // Chunk ids and texts together: zipping a shared iterator over
+            // ids with each batch of vectors would consume one id per
+            // batch boundary.
+            for (ids, texts) in ids.chunks(EMBED_BATCH).zip(texts.chunks(EMBED_BATCH)) {
+                for (fact, vector) in ids.iter().zip(embed_texts(semantic, texts)?) {
                     state
-                        .push_vector(fact, vector)
+                        .push_vector(*fact, vector)
                         .map_err(StoreError::Internal)?;
                 }
             }
