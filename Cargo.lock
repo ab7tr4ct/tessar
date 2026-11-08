@@ -2453,6 +2453,7 @@ dependencies = [
  "tempfile",
  "tessar-core",
  "tessar-embed-cache",
+ "tessar-embed-candle",
  "tessar-embed-llama",
  "tessar-journal",
  "tokio",

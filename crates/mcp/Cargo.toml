@@ -10,16 +10,33 @@ publish.workspace = true
 name = "tessar"
 path = "src/main.rs"
 
+[features]
+default = ["candle"]
+# Pure-Rust embedder (Metal on macOS, CPU elsewhere); no C++ toolchain.
+candle = ["dep:tessar-embed-candle"]
+# llama.cpp embedder; needs cmake, a C++ toolchain and the submodule.
+llama = ["dep:tessar-embed-llama"]
+
 [dependencies]
+tessar-embed-llama = { workspace = true, optional = true }
 tessar-core.workspace = true
 tessar-journal.workspace = true
-tessar-embed-llama.workspace = true
 tessar-embed-cache.workspace = true
 rmcp.workspace = true
 tokio.workspace = true
 serde.workspace = true
 schemars.workspace = true
 serde_json.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+tessar-embed-candle = { workspace = true, features = ["metal"], optional = true }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+tessar-embed-candle = { workspace = true, optional = true }
+
+[[example]]
+name = "library"
+required-features = ["llama"]
 
 [dev-dependencies]
 tessar-core = { workspace = true, features = ["testing"] }

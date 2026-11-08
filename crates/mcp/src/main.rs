@@ -20,7 +20,6 @@ use tessar_core::embed::Embedder;
 use tessar_core::log::LogError;
 use tessar_core::store::{Memory, Op, Semantic};
 use tessar_embed_cache::CachedEmbedder;
-use tessar_embed_llama::{LlamaEmbedder, voyage_nano_path};
 use tessar_journal::FileJournal;
 use tessar_mcp::daemon::{self, Projects, socket_path};
 use tessar_mcp::hook;
@@ -30,6 +29,9 @@ use tessar_mcp::proxy;
 use tessar_mcp::purge;
 use tessar_mcp::server::TessarServer;
 use tokio::net::{UnixListener, UnixStream};
+
+#[cfg(not(any(feature = "candle", feature = "llama")))]
+compile_error!("enable at least one embedder feature of tessar-mcp: `candle` (default) or `llama`");
 
 const USAGE: &str = "\
 tessar: a memory engine for AI agents
@@ -64,8 +66,10 @@ USAGE:
 
 The memory lives in DIR (default: $TESSAR_HOME, else ~/.tessar): journal.jsonl,
 tessar.sock, tessar.pid and daemon.log, and the embedding model in
-models/voyage-4-nano-Q8_0.gguf. Set TESSAR_MODEL to use a model file from
-elsewhere.";
+models/voyage-4-nano-Q8_0.gguf (and models/voyage-4-nano/tokenizer.json for
+the candle embedder). Set TESSAR_MODEL or TESSAR_TOKENIZER to use files from
+elsewhere. TESSAR_EMBEDDER=candle|llama picks the embedder (default: candle,
+else llama, whichever this build has).";
 
 /// Vector length in the index.
 const INDEX_DIMS: usize = 1024;
@@ -371,6 +375,12 @@ fn default_home(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Result<Path
     Ok(PathBuf::from(user_home).join(".tessar"))
 }
 
+/// The default model directory, `~/.tessar/models`.
+fn default_models_dir() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").filter(|h| !h.is_empty())?;
+    Some(PathBuf::from(home).join(".tessar").join("models"))
+}
+
 /// The model: `$TESSAR_MODEL`, else `<home>/models/…`, else the default
 /// `~/.tessar/models/…`.
 fn model_path(home: &Path) -> Result<PathBuf, String> {
@@ -381,7 +391,7 @@ fn model_path(home: &Path) -> Result<PathBuf, String> {
     if local.is_file() {
         return Ok(local);
     }
-    match voyage_nano_path() {
+    match default_models_dir().map(|d| d.join(MODEL_FILE)) {
         Some(default) if default.is_file() => Ok(default),
         Some(default) => Err(format!(
             "embedding model not found: expected {} (download voyage-4-nano in Q8_0 GGUF there, \
@@ -393,6 +403,104 @@ fn model_path(home: &Path) -> Result<PathBuf, String> {
             local.display()
         )),
     }
+}
+
+/// The tokenizer of the candle embedder: `$TESSAR_TOKENIZER`, else
+/// `<home>/models/voyage-4-nano/tokenizer.json`, else the same under
+/// `~/.tessar`.
+#[cfg(feature = "candle")]
+fn tokenizer_path(home: &Path) -> Result<PathBuf, String> {
+    if let Some(path) = std::env::var_os("TESSAR_TOKENIZER").filter(|p| !p.is_empty()) {
+        return Ok(PathBuf::from(path));
+    }
+    let local = home.join("models").join(MODEL_NAME).join("tokenizer.json");
+    if local.is_file() {
+        return Ok(local);
+    }
+    let default = default_models_dir()
+        .map(|d| d.join(MODEL_NAME).join("tokenizer.json"))
+        .filter(|p| p.is_file());
+    default.ok_or_else(|| {
+        format!(
+            "tokenizer not found: expected {} (it is `tokenizer.json` from the \
+             `voyageai/voyage-4-nano` repository on Hugging Face; or set TESSAR_TOKENIZER)",
+            local.display()
+        )
+    })
+}
+
+/// Which embedder to build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Backend {
+    Candle,
+    Llama,
+}
+
+/// `$TESSAR_EMBEDDER` (`candle` or `llama`), else candle if compiled in,
+/// else llama. Asking for a backend this build lacks is an error.
+fn choose_backend(requested: Option<&str>) -> Result<Backend, String> {
+    let compiled = |b: Backend| match b {
+        Backend::Candle => cfg!(feature = "candle"),
+        Backend::Llama => cfg!(feature = "llama"),
+    };
+    match requested.map(str::trim).filter(|r| !r.is_empty()) {
+        None => Ok(if compiled(Backend::Candle) {
+            Backend::Candle
+        } else {
+            Backend::Llama
+        }),
+        Some("candle") if compiled(Backend::Candle) => Ok(Backend::Candle),
+        Some("llama") if compiled(Backend::Llama) => Ok(Backend::Llama),
+        Some(f @ ("candle" | "llama")) => Err(format!(
+            "TESSAR_EMBEDDER={f} is not compiled into this binary; rebuild with \
+             `cargo build --release -p tessar-mcp --features {f}` \
+             (add `--no-default-features` to drop the other embedder)"
+        )),
+        Some(other) => Err(format!(
+            "TESSAR_EMBEDDER={other:?} is unknown; use `candle` or `llama`"
+        )),
+    }
+}
+
+/// A loaded embedder with what the logs say about it.
+struct Loaded {
+    embedder: Arc<dyn Embedder>,
+    dims: usize,
+    description: String,
+}
+
+#[cfg(feature = "candle")]
+fn load_candle(home: &Path, model: &Path) -> Result<Loaded, String> {
+    let tokenizer = tokenizer_path(home)?;
+    let e = tessar_embed_candle::CandleEmbedder::voyage_nano_gguf(model, &tokenizer)
+        .map_err(|e| format!("cannot load the model: {e}"))?;
+    let device = if e.is_metal() { "Metal" } else { "CPU" };
+    Ok(Loaded {
+        dims: e.dims(),
+        description: format!("candle ({device})"),
+        embedder: Arc::new(e),
+    })
+}
+
+#[cfg(not(feature = "candle"))]
+fn load_candle(_: &Path, _: &Path) -> Result<Loaded, String> {
+    unreachable!("choose_backend refuses candle when it is not compiled")
+}
+
+#[cfg(feature = "llama")]
+fn load_llama(model: &Path) -> Result<Loaded, String> {
+    let e = tessar_embed_llama::LlamaEmbedder::voyage_nano(model)
+        .map_err(|e| format!("cannot load the model: {e}"))?;
+    Ok(Loaded {
+        dims: e.dims(),
+        description: "llama.cpp".to_string(),
+        embedder: Arc::new(e),
+    })
+}
+
+#[cfg(not(feature = "llama"))]
+fn load_llama(_: &Path) -> Result<Loaded, String> {
+    unreachable!("choose_backend refuses llama when it is not compiled")
 }
 
 /// Opens the journal, which takes its file lock.
@@ -408,18 +516,21 @@ fn open_memory(
     clock: Arc<dyn Clock>,
 ) -> Result<Memory, String> {
     let model = model_path(home)?;
-    let embedder = LlamaEmbedder::voyage_nano(&model)
-        .map(Arc::new)
-        .map_err(|e| format!("cannot load the model: {e}"))?;
+    let backend = choose_backend(std::env::var("TESSAR_EMBEDDER").ok().as_deref())?;
+    let loaded = match backend {
+        Backend::Candle => load_candle(home, &model)?,
+        Backend::Llama => load_llama(&model)?,
+    };
+    eprintln!("tessar: embedder {}", loaded.description);
     // The index holds 1024 components per vector; a shorter model cannot fill it.
-    if embedder.dims() < INDEX_DIMS {
+    if loaded.dims < INDEX_DIMS {
         return Err(format!(
             "the model at {} gives {} dimensions per vector, at least {INDEX_DIMS} are needed",
             model.display(),
-            embedder.dims()
+            loaded.dims
         ));
     }
-    let embedder = cached(home, embedder);
+    let embedder = cached(home, loaded.embedder);
     Memory::open_with(
         journal,
         clock,
@@ -743,6 +854,23 @@ fn run_proxy(home: &Path, keep_daemon: bool) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn embedder_choice_follows_the_compiled_features() {
+        assert!(choose_backend(Some("bogus")).is_err());
+        assert!(choose_backend(None).is_ok());
+        assert_eq!(choose_backend(Some("")), choose_backend(None));
+        let candle = choose_backend(Some("candle"));
+        assert_eq!(candle.is_ok(), cfg!(feature = "candle"));
+        if let Err(e) = candle {
+            assert!(e.contains("--features candle"), "{e}");
+        }
+        let llama = choose_backend(Some("llama"));
+        assert_eq!(llama.is_ok(), cfg!(feature = "llama"));
+        if let Err(e) = llama {
+            assert!(e.contains("--features llama"), "{e}");
+        }
+    }
     use super::*;
 
     fn p(args: &[&str], env: &[(&str, &str)]) -> Result<Cli, String> {
