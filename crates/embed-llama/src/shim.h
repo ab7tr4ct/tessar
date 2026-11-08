@@ -27,11 +27,11 @@ struct FreeContext {
 using Model = std::unique_ptr<llama_model, FreeModel>;
 using Context = std::unique_ptr<llama_context, FreeContext>;
 
-// A model with one context in embeddings mode. Not thread-safe: the Rust
-// side serializes calls.
+// A model with one context in embeddings mode. Calls are serialized by an
+// internal mutex; the Rust side also keeps the object behind a Mutex.
 class Embedder {
 public:
-    Embedder(Model model, Context context);
+    Embedder(Model model, Context context, bool truncate);
     ~Embedder();
     Embedder(const Embedder &) = delete;
     Embedder & operator=(const Embedder &) = delete;
@@ -41,8 +41,9 @@ public:
 
     // Appends one L2-normalized vector per text to `out`, in order. Texts
     // are packed several to a decode while they fit in the context.
-    // Throws if a text is longer than the context or llama.cpp fails;
-    // `out` may then hold vectors of the texts before the failing batch.
+    // A text longer than the context is cut to fit if the embedder was
+    // loaded with `truncate`, and is an error otherwise. Throws if
+    // llama.cpp fails; `out` may then hold vectors of earlier batches.
     void embed(rust::Slice<const rust::String> texts, rust::Vec<float> & out);
 
     // Frees the model and context; later calls to embed() throw. Runs at
@@ -59,6 +60,8 @@ private:
     // The most tokens and texts one decode takes.
     std::size_t max_tokens_;
     std::size_t max_texts_;
+    // Cut texts longer than max_tokens_ instead of failing.
+    bool truncate_;
 };
 
 // Loads a GGUF embedding model. Throws if the file cannot be loaded or

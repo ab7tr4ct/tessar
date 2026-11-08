@@ -8,7 +8,7 @@ use std::sync::OnceLock;
 use std::thread;
 
 use tessar_core::embed::{Embedder, Prompts};
-use tessar_embed_llama::{LlamaEmbedder, voyage_nano_path};
+use tessar_embed_llama::{LlamaEmbedder, Options, voyage_nano_path};
 
 fn model_path() -> PathBuf {
     std::env::var_os("TESSAR_TEST_MODEL")
@@ -27,6 +27,18 @@ fn embedder() -> &'static LlamaEmbedder {
         LlamaEmbedder::voyage_nano(&path)
             .unwrap_or_else(|e| panic!("cannot load {}: {e}", path.display()))
     })
+}
+
+/// A small extra copy without prompts: a 64-token context, so packing and
+/// cutting show up with short texts. Costs the weights plus small buffers.
+fn small(truncate: bool) -> LlamaEmbedder {
+    let options = Options {
+        context: 64,
+        batch: 4,
+        gpu: true,
+        truncate,
+    };
+    LlamaEmbedder::load(model_path(), &options).unwrap()
 }
 
 fn cos(a: &[f32], b: &[f32]) -> f32 {
@@ -89,9 +101,7 @@ fn queries_and_documents_get_their_own_prompts() {
     let c = cos(&query, &document);
     assert!(c < 0.999, "the prompts changed nothing: cosine {c}");
     // Without prompts both sides embed the same string.
-    let plain = LlamaEmbedder::voyage_nano(model_path())
-        .unwrap()
-        .with_prompts(Prompts::none());
+    let plain = small(true).with_prompts(Prompts::none());
     let q = plain.embed_query(text).unwrap();
     let d = plain.embed_documents(&texts(&[text])).unwrap().remove(0);
     assert!(cos(&q, &d) > 0.9999);
@@ -122,17 +132,44 @@ fn queries_find_their_notes_in_russian_and_english() {
 
 #[test]
 #[ignore = "needs the model; see the module docs"]
-fn a_text_longer_than_the_context_is_an_error() {
-    let long = "memory ".repeat(20_000);
-    let err = embedder().embed_documents(&[long]).unwrap_err();
+fn a_long_text_is_cut_to_the_context_by_default() {
+    let e = small(true);
+    let long = e.embed_documents(&["memory ".repeat(1000)]).unwrap();
+    assert_eq!(long[0].len(), 2048);
+    // What is left is about 64 of the same word.
+    let cut = e.embed_documents(&["memory ".repeat(64)]).unwrap();
+    let c = cos(&long[0], &cut[0]);
+    assert!(c > 0.99, "cosine {c}");
+}
+
+#[test]
+#[ignore = "needs the model; see the module docs"]
+fn without_truncation_a_long_text_is_an_error() {
+    let err = small(false)
+        .embed_documents(&["memory ".repeat(1000)])
+        .unwrap_err();
     assert!(err.0.contains("the context holds"), "{err}");
+}
+
+#[test]
+#[ignore = "needs the model; see the module docs"]
+fn texts_packed_by_the_token_budget_match_texts_alone() {
+    // 64 tokens hold two or three of these notes, so batches end on the
+    // token budget, not on the text limit of 4.
+    let e = small(true);
+    let packed = e.embed_documents(&texts(&NOTES)).unwrap();
+    for (i, note) in NOTES.iter().enumerate() {
+        let alone = e.embed_documents(&texts(&[note])).unwrap().remove(0);
+        let c = cos(&alone, &packed[i]);
+        assert!(c > 0.9999, "text {i}: cosine {c}");
+    }
 }
 
 #[test]
 #[ignore = "needs the model; see the module docs"]
 fn many_texts_span_several_batches() {
     let e = embedder();
-    // More texts than one decode takes (256 sequences).
+    // Many more texts than one decode takes (8 with default options).
     let many: Vec<String> = (0..300).map(|i| format!("note number {i}")).collect();
     let vectors = e.embed_documents(&many).unwrap();
     assert_eq!(vectors.len(), 300);

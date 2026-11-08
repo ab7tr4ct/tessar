@@ -2,6 +2,7 @@
 #include "tessar-embed-llama/src/lib.rs.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <climits>
 #include <cmath>
@@ -26,6 +27,9 @@ namespace {
 thread_local std::string errors;
 thread_local bool in_error = false;
 bool verbose = false;
+// Set when the exit handler starts. The exiting thread's thread_locals are
+// already destroyed by then, so llama.cpp's last log lines are dropped.
+std::atomic<bool> exiting{false};
 
 void log_errors(ggml_log_level level, const char * text, void *) {
     if (text == nullptr) {
@@ -38,7 +42,7 @@ void log_errors(ggml_log_level level, const char * text, void *) {
     if (level != GGML_LOG_LEVEL_CONT) {
         in_error = level == GGML_LOG_LEVEL_ERROR;
     }
-    if (in_error) {
+    if (in_error && !exiting.load(std::memory_order_relaxed)) {
         errors += text;
     }
 }
@@ -71,6 +75,11 @@ void init_once() {
 // An embedder still alive then (in a Rust static, leaked, or in use while
 // some thread calls exit()) would abort the process. So live embedders
 // are tracked here and released by an exit handler that runs first.
+//
+// Not covered: exit() while another thread is inside load(). Statics that
+// load() builds are destroyed under it, which no handler order can
+// prevent (undefined behavior in C++). Applications must not exit while a
+// model is loading.
 struct Live {
     std::mutex mutex;
     std::unordered_set<Embedder *> embedders;
@@ -83,6 +92,7 @@ Live & live() {
 }
 
 void release_live() {
+    exiting.store(true, std::memory_order_relaxed);
     Live & l = live();
     std::lock_guard<std::mutex> lock(l.mutex);
     for (Embedder * embedder : l.embedders) {
@@ -106,6 +116,20 @@ struct Batch {
     Batch(const Batch &) = delete;
     Batch & operator=(const Batch &) = delete;
 };
+
+// Cuts a text to `max` tokens. Keeps the last token when the model appends
+// one (EOS or SEP): models that pool the last token read it.
+void truncate(const llama_vocab * vocab, std::vector<llama_token> & tokens, std::size_t max) {
+    if (tokens.size() <= max) {
+        return;
+    }
+    const bool keep_last = llama_vocab_get_add_eos(vocab) || llama_vocab_get_add_sep(vocab);
+    const llama_token last = tokens.back();
+    tokens.resize(max);
+    if (keep_last && max > 0) {
+        tokens.back() = last;
+    }
+}
 
 std::vector<llama_token> tokenize(const llama_vocab * vocab, const rust::String & text) {
     if (text.size() > static_cast<std::size_t>(INT32_MAX)) {
@@ -137,8 +161,8 @@ void FreeModel::operator()(llama_model * model) const { llama_model_free(model);
 
 void FreeContext::operator()(llama_context * context) const { llama_free(context); }
 
-Embedder::Embedder(Model model, Context context)
-    : model_(std::move(model)), context_(std::move(context)) {
+Embedder::Embedder(Model model, Context context, bool truncate)
+    : model_(std::move(model)), context_(std::move(context)), truncate_(truncate) {
     dims_ = static_cast<std::size_t>(llama_model_n_embd_out(model_.get()));
     // llama.cpp pads the context; a batch must fit the context, the
     // logical batch and the physical batch at once.
@@ -186,8 +210,11 @@ void Embedder::embed(rust::Slice<const rust::String> texts, rust::Vec<float> & o
             fail("text " + std::to_string(i) + " has no tokens");
         }
         if (n > max_tokens_) {
-            fail("text " + std::to_string(i) + " takes " + std::to_string(n) +
-                 " tokens; the context holds " + std::to_string(max_tokens_));
+            if (!truncate_) {
+                fail("text " + std::to_string(i) + " takes " + std::to_string(n) +
+                     " tokens; the context holds " + std::to_string(max_tokens_));
+            }
+            truncate(vocab, tokens.back(), max_tokens_);
         }
     }
 
@@ -291,7 +318,7 @@ std::unique_ptr<Embedder> load(rust::Str path, const LoadOptions & options) {
     if (pooling == LLAMA_POOLING_TYPE_NONE || pooling == LLAMA_POOLING_TYPE_RANK) {
         fail("the model does not pool tokens into one vector per text; is it an embedding model?");
     }
-    return std::make_unique<Embedder>(std::move(model), std::move(context));
+    return std::make_unique<Embedder>(std::move(model), std::move(context), options.truncate);
 }
 
 }  // namespace tessar

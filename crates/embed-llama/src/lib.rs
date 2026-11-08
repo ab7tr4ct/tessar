@@ -29,7 +29,9 @@
 //! [`EmbedError`]s. Set `TESSAR_LLAMA_LOG=1` to see all of it on stderr.
 //! Embedders still alive when the process exits (in a static, or in use
 //! by another thread) are released by an exit handler before ggml shuts
-//! its Metal backend down; calls after that fail.
+//! its Metal backend down; calls after that fail. Exiting while another
+//! thread is still inside [`LlamaEmbedder::load`] is not supported and may
+//! crash: join the loading thread before the process exits.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
@@ -51,12 +53,14 @@ mod ffi {
         n_seq_max: u32,
         /// Layers to offload to the GPU; negative means all.
         gpu_layers: i32,
+        /// Cut texts longer than the context instead of failing.
+        truncate: bool,
     }
 
     unsafe extern "C++" {
         include!("tessar-embed-llama/src/shim.h");
 
-        /// A loaded model with its context. Not thread-safe.
+        /// A loaded model with its context; calls are serialized inside.
         type Embedder;
 
         /// Loads a GGUF embedding model.
@@ -84,22 +88,29 @@ unsafe impl Send for ffi::Embedder {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Options {
     /// Tokens in one batch, and so the most one text may take, prompt
-    /// included; a longer text is an error.
+    /// included. A longer text is cut or rejected, see `truncate`.
     pub context: u32,
     /// Texts in one batch, at least 1 and at most 256.
     pub batch: u32,
     /// Put all layers on the GPU (Metal on macOS); otherwise the CPU.
     pub gpu: bool,
+    /// Cut a text longer than `context` to its first tokens instead of
+    /// failing, as embedding APIs do. On by default: the store embeds
+    /// every fact again when a memory is opened, and one fact that no
+    /// longer fits (after `context` was lowered) must not keep the whole
+    /// memory closed.
+    pub truncate: bool,
 }
 
 impl Default for Options {
     /// 8192 tokens — a long memory note with room to spare — in batches
-    /// of up to 8 texts, on the GPU.
+    /// of up to 8 texts, on the GPU; longer texts are cut.
     fn default() -> Self {
         Self {
             context: 8192,
             batch: 8,
             gpu: true,
+            truncate: true,
         }
     }
 }
@@ -133,6 +144,7 @@ impl LlamaEmbedder {
             n_seq_max: options.batch,
             // A negative count means all layers.
             gpu_layers: if options.gpu { -1 } else { 0 },
+            truncate: options.truncate,
         };
         let inner = ffi::load(utf8, &options)
             .map_err(|e| EmbedError(format!("{}: {}", path.display(), e.what())))?;
