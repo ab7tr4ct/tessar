@@ -450,6 +450,63 @@ async fn a_lost_daemon_fails_calls_one_by_one_and_the_proxy_reconnects() {
     second.shutdown().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_daemon_that_drops_every_session_is_not_hammered() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let home = tempfile::tempdir().unwrap();
+    let dir = home.path().to_path_buf();
+    let first = Daemon::start(&dir, None);
+    let stream = UnixStream::connect(socket_path(&dir)).await.unwrap();
+    let (server, link) = proxy::connect(stream, "alpha", Path::new("/work/x"))
+        .await
+        .unwrap();
+    let reconnect: proxy::Reconnect = {
+        let dir = dir.clone();
+        Arc::new(move || {
+            let dir = dir.clone();
+            Box::pin(async move {
+                let stream = UnixStream::connect(socket_path(&dir))
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let (server, link) = proxy::connect(stream, "alpha", Path::new("/work/x")).await?;
+                Ok((server.daemon(), link))
+            })
+        })
+    };
+    let (agent, stdio) = tokio::io::duplex(1 << 20);
+    let bridge = tokio::spawn(proxy::bridge_reconnecting(server, link, stdio, reconnect));
+    let client: Client = ().serve(agent).await.unwrap();
+
+    // Replace the daemon with one that greets and hangs up at once.
+    first.shutdown().await;
+    let _ = std::fs::remove_file(socket_path(&dir));
+    let listener = UnixListener::bind(socket_path(&dir)).unwrap();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&accepted);
+    let fake = tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            count.fetch_add(1, Ordering::SeqCst);
+            let (r, mut w) = tokio::io::split(stream);
+            let mut line = String::new();
+            let _ = BufReader::new(r).read_line(&mut line).await;
+            let _ = w
+                .write_all(b"{\"tessar\":1,\"build\":\"x\",\"pid\":1}\n")
+                .await;
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let attempts = accepted.load(Ordering::SeqCst);
+    assert!(attempts <= 2, "{attempts} reconnects in 1.2 s");
+
+    fake.abort();
+    drop(client);
+    assert!(bridge.await.unwrap().unwrap());
+}
+
 /// The real `tessar mcp` binary on stdio, in front of the in-process daemon,
 /// with two `tools/call` requests written back to back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

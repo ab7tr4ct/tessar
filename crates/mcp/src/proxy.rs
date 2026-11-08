@@ -67,6 +67,9 @@ pub type Reconnect = Arc<
 /// How long to wait between attempts to reach a lost daemon.
 const RECONNECT_PAUSE: Duration = Duration::from_secs(2);
 
+/// The longest wait between attempts after repeated failures.
+const RECONNECT_CAP: Duration = Duration::from_secs(30);
+
 /// The daemon connection a [`ProxyServer`] forwards to. Dropping it closes
 /// the connection.
 pub type DaemonLink = RunningService<RoleClient, ()>;
@@ -228,10 +231,11 @@ fn build_stamp(id: &str) -> Option<u64> {
     id.rsplit_once('.')?.1.parse().ok()
 }
 
-/// Whether a daemon of build `daemon` is newer than `ours`, by build time.
-/// False when the ids cannot be ordered.
+/// Whether a daemon of build `daemon` is at least as new as `ours`, by build
+/// time (builds in the same second count as equal). False when the ids
+/// cannot be ordered.
 pub fn daemon_is_newer(ours: &str, daemon: &str) -> bool {
-    matches!((build_stamp(ours), build_stamp(daemon)), (Some(o), Some(d)) if d > o)
+    matches!((build_stamp(ours), build_stamp(daemon)), (Some(o), Some(d)) if d >= o)
 }
 
 /// Whether a proxy should retire the daemon: only when the builds differ,
@@ -356,6 +360,8 @@ where
     let session = session.waiting();
     tokio::pin!(session);
     let mut watcher = tokio::spawn(link.waiting());
+    let mut linked_at = Instant::now();
+    let mut backoff = RECONNECT_PAUSE;
     loop {
         tokio::select! {
             _ = &mut session => {
@@ -368,6 +374,17 @@ where
             return Ok(false);
         };
         eprintln!("tessar: the daemon connection was lost; reconnecting");
+        // A link that lived a while is a fresh loss: try again at once. One
+        // that died young means the daemon drops sessions: back off.
+        if linked_at.elapsed() < RECONNECT_PAUSE {
+            tokio::select! {
+                _ = &mut session => return Ok(true),
+                () = tokio::time::sleep(backoff) => {}
+            }
+            backoff = (backoff * 2).min(RECONNECT_CAP);
+        } else {
+            backoff = RECONNECT_PAUSE;
+        }
         let link = loop {
             tokio::select! {
                 _ = &mut session => return Ok(true),
@@ -382,9 +399,11 @@ where
             }
             tokio::select! {
                 _ = &mut session => return Ok(true),
-                () = tokio::time::sleep(RECONNECT_PAUSE) => {}
+                () = tokio::time::sleep(backoff) => {}
             }
+            backoff = (backoff * 2).min(RECONNECT_CAP);
         };
+        linked_at = Instant::now();
         watcher = tokio::spawn(link.waiting());
     }
 }
@@ -467,6 +486,12 @@ mod tests {
         assert!(!needs_restart(old, new, false));
         assert!(!needs_restart(new, new, false));
         assert!(daemon_is_newer(old, new) && !daemon_is_newer(new, old));
+        // Same second, different commits (parallel worktrees): hands off.
+        let (a, b) = ("0.1.0+aaa.1500", "0.1.0+bbb.1500");
+        assert!(!needs_restart(a, b, false));
+        assert!(!needs_restart(b, a, false));
+        // No stamp on the daemon's side counts as older.
+        assert!(needs_restart(a, "0.1.0+ccc", false));
         // --keep-daemon never restarts.
         assert!(!needs_restart("a", "b", true));
         assert!(!needs_restart("a", "a", true));

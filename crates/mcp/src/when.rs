@@ -127,12 +127,19 @@ fn day_start_ms<Tz: TimeZone>(tz: &Tz, day: i64) -> i64 {
     };
     match tz.from_local_datetime(&midnight) {
         LocalResult::Single(t) | LocalResult::Ambiguous(t, _) => t.timestamp_millis(),
-        // A zone that skips midnight: read it with the offset in force then.
+        // A zone that skips midnight: the day begins at the transition, which
+        // is read with the offset in force a day before.
         LocalResult::None => {
             let as_utc = midnight.and_utc().timestamp_millis();
-            as_utc - offset_ms(tz, as_utc)
+            skipped_midnight_ms(as_utc, offset_ms(tz, as_utc - DAY_MS))
         }
     }
+}
+
+/// The instant of the transition that skips local midnight, given that
+/// midnight read as UTC (`midnight_as_utc`) and the offset before the jump.
+fn skipped_midnight_ms(midnight_as_utc: i64, offset_before: i64) -> i64 {
+    midnight_as_utc - offset_before
 }
 
 /// `YYYY-MM-DD` of a timestamp in `tz`.
@@ -452,6 +459,25 @@ mod tests {
         assert_eq!(
             span_text(&tz, parse_when(&tz, "2026-11-09").unwrap()),
             "2026-11-09"
+        );
+    }
+
+    #[test]
+    fn a_skipped_midnight_starts_the_day_at_the_transition() {
+        let hour = 3_600_000;
+        let midnight = days_from_civil(2026, 3, 29) * DAY_MS;
+        // Offset +3 before the jump: local 00:00 is 21:00Z the day before,
+        // not the 22:00Z that the offset after the jump (+4) would give.
+        assert_eq!(skipped_midnight_ms(midnight, 3 * hour), midnight - 3 * hour);
+        // The same for a zone west of UTC (-3 before the jump).
+        assert_eq!(
+            skipped_midnight_ms(midnight, -3 * hour),
+            midnight + 3 * hour
+        );
+        // A fixed zone never skips: the plain path gives the same instant.
+        assert_eq!(
+            day_start_ms(&plus(3), days_from_civil(2026, 3, 29)),
+            midnight - 3 * hour
         );
     }
 
