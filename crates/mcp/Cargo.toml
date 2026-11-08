@@ -1,0 +1,28 @@
+[package]
+name = "tessar-mcp"
+description = "MCP server for tessar: memory for Claude Code and other agents over stdio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "tessar"
+path = "src/main.rs"
+
+[dependencies]
+tessar-core.workspace = true
+tessar-journal.workspace = true
+tessar-embed-llama.workspace = true
+rmcp.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+schemars.workspace = true
+
+[dev-dependencies]
+tessar-core = { workspace = true, features = ["testing"] }
+tempfile.workspace = true
+
+[lints]
+workspace = true
