@@ -273,3 +273,39 @@ dispatches), or fuse norm + cast; merge Q/K/V into one `QMatMul` by
 concatenating the quantized rows (needs `QTensor` concatenation, which is not
 a public op, so repacking Q8_0 blocks by hand); reduce dispatch count
 (about 16 ms floor per forward pass is what bounds the query).
+
+## E15b step 2: fewer dispatches
+
+Raw rows: `evals/runs/e15b/step2-fusion.md`. Setup as in step 1 (200 texts).
+
+| step | GGUF Q8 query p50 / p95 | GGUF Q8 bulk | f16 query p50 / p95 | f16 bulk |
+| --- | --- | --- | --- | --- |
+| llama.cpp | 10.3 / 11.0 ms | 241 texts/s | same | same |
+| step 1 | 17.6 / 20.2 | 81 | 16.0 / 17.8 | 106 |
+| 2a `CANDLE_METAL_COMPUTE_PER_BUFFER` 200-5000 | no change (noise) | no change | no change | no change |
+| **2b copies removed, fused norm and rope** | **13.2 / 14.4** | **123** | **11.8 / 13.1** | **153-157** |
+| 2c+2d joined qkv, gate/up | 14.5 / 16.4 | 93 | 13.5 / 15.7 | 110 |
+| 2e f16 activations (Q8 only) | 13.3 / 14.4 | 122 | - | - |
+
+- 2a: the default is 50 ops per command buffer (candle-metal-kernels 0.11.1
+  `commands.rs`). Raising it does nothing. It is read with `std::env::var`
+  when the device is created and there is no API; setting it from our code
+  would need `unsafe` `set_var` (forbidden), so it is not adopted.
+- 2b gave the whole win. The main cause was not the launch count but that
+  `q_norm`/`k_norm` ran on transposed (non-contiguous) views and so fell
+  back to candle's composite `LayerNorm::forward` (9 small kernels each in f16).
+  Applying them in the contiguous `(b, l, heads, d)` layout uses the fused
+  `rms_norm`, then `rope_thd` needs no copy, and `sdpa` takes strided k and v
+  (only q must be contiguous). Dispatches per layer: about 37 -> 20.
+- 2c+2d: exact (Q8_0 blocks are joined byte for byte, cosine unchanged) and
+  slower. After 2b the model is not launch-bound; the `narrow` copies and
+  strided kernels cost more than the saved launches. Kept as
+  `Options.joins`, off.
+- 2e: `QMatMul` on Metal asserts f32 input, so casts are required; they cost
+  as much as the f16 element-wise work saves. Kept as
+  `Options.f16_activations`, off.
+
+Verdict against the fixed criteria (GGUF Q8, 2b): cosine 1.00000 (pass), RSS
+676 MB (pass), query p95 1.31x (pass), bulk 1.96x slower (pass, barely).
+Remaining ideas, none cheap: a fused SwiGLU or residual+norm custom op; sdpa
+that accepts a strided q; a single command buffer per forward pass.

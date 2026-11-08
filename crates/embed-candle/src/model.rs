@@ -100,7 +100,15 @@ impl Lin {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         match self {
             Self::Dense(l) => l.forward(x),
-            Self::Quant(q) => q.forward(x),
+            Self::Quant(q) => {
+                // `QMatMul` on Metal only takes and returns f32.
+                let dtype = x.dtype();
+                if dtype == DType::F32 {
+                    q.forward(x)
+                } else {
+                    q.forward(&x.to_dtype(DType::F32)?)?.to_dtype(dtype)
+                }
+            }
         }
     }
 }
@@ -148,6 +156,8 @@ enum Source {
         content: Content,
         file: File,
         device: Device,
+        /// Dtype of the activations between the quantized matmuls.
+        act: DType,
     },
 }
 
@@ -179,6 +189,7 @@ impl Source {
                 content,
                 file,
                 device,
+                ..
             } => {
                 let join = parts.len() > 1;
                 let mut bytes = Vec::new();
@@ -219,9 +230,11 @@ impl Source {
                 content,
                 file,
                 device,
+                act,
             } => content
                 .tensor(file, &format!("{gg}.weight"), device)?
-                .dequantize(device)?,
+                .dequantize(device)?
+                .to_dtype(*act)?,
         };
         Ok(RmsNorm::new(w, eps))
     }
@@ -259,8 +272,7 @@ impl Source {
     fn dtype(&self) -> DType {
         match self {
             Self::Safetensors(vb) => vb.dtype(),
-            // QMatMul takes and returns f32.
-            Self::Gguf { .. } => DType::F32,
+            Self::Gguf { act, .. } => *act,
         }
     }
 }
@@ -495,13 +507,20 @@ impl Model {
         Self::build(c, &mut Source::Safetensors(vb), fused, joins)
     }
 
-    pub fn load_gguf(mut file: File, device: &Device, fused: bool, joins: Joins) -> Result<Self> {
+    pub fn load_gguf(
+        mut file: File,
+        device: &Device,
+        fused: bool,
+        joins: Joins,
+        act: DType,
+    ) -> Result<Self> {
         let content = Content::read(&mut file)?;
         let c = Config::from_gguf(&content)?;
         let mut src = Source::Gguf {
             content,
             file,
             device: device.clone(),
+            act,
         };
         Self::build(&c, &mut src, fused, joins)
     }

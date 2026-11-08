@@ -158,6 +158,7 @@ fn candle_vs_llama() {
         dtype,
         append_eos: env("CANDLE_EOS").as_deref() == Some("1"),
         fused: env("TESSAR_CANDLE_NO_SDPA").is_none(),
+        f16_activations: env("CANDLE_F16ACT").is_some(),
         joins: Joins {
             qkv: env("CANDLE_JOIN_QKV").is_some(),
             gate_up: env("CANDLE_JOIN_GU").is_some(),
