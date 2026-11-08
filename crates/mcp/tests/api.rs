@@ -13,7 +13,7 @@ use tessar_core::model::{Key, Origin, Timestamp};
 use tessar_core::store::{BodyDraft, FactDraft, Memory, Remember, Semantic};
 use tessar_mcp::api::Tessar;
 use tessar_mcp::args::{AboutArgs, RecallArgs, RememberArgs, UpdateArgs};
-use tessar_mcp::when::{DAY_MS, days_from_civil};
+use tessar_mcp::when::{Calendar, DAY_MS, days_from_civil};
 
 const DIMS: usize = 64;
 const STOP: [&str; 9] = ["the", "a", "an", "of", "in", "to", "is", "where", "subject"];
@@ -69,7 +69,9 @@ fn fixture() -> Fixture {
         },
     )
     .unwrap();
-    let api = Tessar::bootstrap(mem.clone(), clock.clone(), "tessar", &|w| panic!("{w}")).unwrap();
+    let api = Tessar::bootstrap(mem.clone(), clock.clone(), "tessar", &|w| panic!("{w}"))
+        .unwrap()
+        .with_calendar(Calendar::utc());
     Fixture { api, mem, clock }
 }
 
@@ -108,8 +110,9 @@ fn user() -> serde_json::Value {
 fn bootstrap_is_idempotent() {
     let f = fixture();
     let before = f.api.vocabulary();
-    let again =
-        Tessar::bootstrap(f.mem.clone(), f.clock.clone(), "tessar", &|w| panic!("{w}")).unwrap();
+    let again = Tessar::bootstrap(f.mem.clone(), f.clock.clone(), "tessar", &|w| panic!("{w}"))
+        .unwrap()
+        .with_calendar(Calendar::utc());
     assert_eq!(again.vocabulary(), before);
     assert!(f.mem.space_named("user").is_some());
     assert!(f.mem.space_named("tessar").is_some());
@@ -1120,4 +1123,25 @@ fn redacting_twice_explains_itself() {
     assert!(err.contains("redacted"), "{err}");
     let err = update(&f, json!({"fact": "f999", "reason": "redact"})).unwrap_err();
     assert!(err.contains("no fact"), "{err}");
+}
+
+#[test]
+fn dates_follow_the_calendar_zone_not_utc() {
+    use chrono::FixedOffset;
+    let mut f = fixture();
+    // 2026-11-08T22:00Z is already the 9th at UTC+3.
+    f.clock.advance(10 * 3_600_000);
+    f.api = Tessar::bootstrap(f.mem.clone(), f.clock.clone(), "tessar", &|w| panic!("{w}"))
+        .unwrap()
+        .with_calendar(Calendar::Fixed(FixedOffset::east_opt(3 * 3600).unwrap()));
+    remember(
+        &f,
+        json!({"facts": [{"kind": "event", "text": "Quarterly planning session",
+            "when": "2026-11-09"}]}),
+    )
+    .unwrap();
+    let out = recall(&f, json!({"query": "Quarterly planning session"})).unwrap();
+    assert!(out.contains("(now: 2026-11-09)"), "{out}");
+    assert!(!out.contains("future"), "{out}");
+    assert!(!out.contains("2026-11-08"), "{out}");
 }

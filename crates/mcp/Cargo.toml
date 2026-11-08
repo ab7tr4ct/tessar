@@ -20,6 +20,7 @@ llama = ["dep:tessar-embed-llama"]
 [dependencies]
 tessar-embed-llama = { workspace = true, optional = true }
 tessar-core.workspace = true
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 tessar-journal.workspace = true
 tessar-embed-cache.workspace = true
 rmcp.workspace = true

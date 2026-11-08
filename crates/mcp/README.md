@@ -205,6 +205,10 @@ never was. For a single-valued attribute with a new value, `remember` with the
 same subject and predicate already supersedes the old one; `update` is for the
 rest.
 
+Dates are days in the local time zone of the daemon process: the date shown for
+a recorded moment, "today" for `past` / `now` / `future`, and the days in `when`
+and `as_of`. The journal itself stores UTC milliseconds.
+
 Every fact also mentions the person (`user` space) or the project entity
 (project space), unless it is already its subject or mentioned, so `about`
 finds statements that name no entity. Explicit `mentions` are kept.

@@ -25,7 +25,7 @@ use crate::args::{
     AboutArgs, Entity, Fact as FactArgs, FactKind, RecallArgs, RecallSpace, RememberArgs, Space,
     UpdateArgs, UpdateReason,
 };
-use crate::when::{self, Tense};
+use crate::when::{Calendar, Tense};
 
 /// The entity kinds defined in both spaces.
 pub const KINDS: [&str; 8] = [
@@ -69,6 +69,8 @@ pub struct Tessar {
     project_key: Key,
     user_kinds: HashMap<String, EntityKindId>,
     project_kinds: HashMap<String, EntityKindId>,
+    /// The calendar dates are shown and read in: the local zone.
+    calendar: Calendar,
 }
 
 impl Tessar {
@@ -123,7 +125,15 @@ impl Tessar {
             project_key,
             user_kinds,
             project_kinds,
+            calendar: Calendar::Local,
         })
+    }
+
+    /// Reads and shows dates in `calendar` instead of the local zone.
+    #[must_use]
+    pub fn with_calendar(mut self, calendar: Calendar) -> Self {
+        self.calendar = calendar;
+        self
     }
 
     fn space_id(&self, space: Space) -> SpaceId {
@@ -309,7 +319,7 @@ impl Tessar {
                         format!(
                             " (was: {}, recorded {})",
                             self.value_of(&p.body),
-                            when::ymd(p.recorded_at)
+                            self.calendar.ymd(p.recorded_at)
                         )
                     });
                     (format!("superseded{was}"), String::new())
@@ -339,7 +349,9 @@ impl Tessar {
         let when = match f.when.as_deref().map(str::trim).filter(|w| !w.is_empty()) {
             Some(w) => ok(
                 &mut problems,
-                when::parse_when(w).map_err(|e| format!("`when`: {e}")),
+                self.calendar
+                    .parse_when(w)
+                    .map_err(|e| format!("`when`: {e}")),
             ),
             None => None,
         };
@@ -590,8 +602,8 @@ impl Tessar {
                 .to_owned(),
             StoreError::ChangeBeforeValid { at, valid_from } => format!(
                 "`since` {} is before the fact became true ({}); use a later date or leave `since` out",
-                when::ymd(*at),
-                when::ymd(*valid_from)
+                self.calendar.ymd(*at),
+                self.calendar.ymd(*valid_from)
             ),
             StoreError::EmptyText => "a text field is empty".to_owned(),
             StoreError::Embed(e) => format!("the embedder failed ({e}); try again"),
@@ -697,8 +709,8 @@ impl Tessar {
             Value::Int(n) => n.to_string(),
             Value::Float(x) => x.get().to_string(),
             Value::Bool(b) => b.to_string(),
-            Value::Time(t) => when::ymd(*t),
-            Value::Span(s) => when::span_text(*s),
+            Value::Time(t) => self.calendar.ymd(*t),
+            Value::Span(s) => self.calendar.span_text(*s),
         }
     }
 
@@ -736,7 +748,7 @@ impl Tessar {
         format!(
             "{} [{}] [{}] {}",
             fact.id,
-            when::ymd(fact.recorded_at),
+            self.calendar.ymd(fact.recorded_at),
             self.space_name(fact.space),
             self.detail(fact, now, with_earlier, as_of)
         )
@@ -759,7 +771,13 @@ impl Tessar {
                 .iter()
                 .filter(|h| h.version < fact.version && !h.is_redacted())
                 .rev()
-                .map(|h| format!("{} ({})", self.value_of(&h.body), when::ymd(h.recorded_at)))
+                .map(|h| {
+                    format!(
+                        "{} ({})",
+                        self.value_of(&h.body),
+                        self.calendar.ymd(h.recorded_at)
+                    )
+                })
                 .collect();
             let state = if fact.is_current() {
                 "current".to_owned()
@@ -777,9 +795,14 @@ impl Tessar {
             }
         }
         if let Some(span) = fact.body.when()
-            && let Some(tense) = when::tense(span, now)
+            && let Some(tense) = self.calendar.tense(span, now)
         {
-            let _ = write!(line, " ({}: {})", Tense::word(tense), when::span_text(span));
+            let _ = write!(
+                line,
+                " ({}: {})",
+                Tense::word(tense),
+                self.calendar.span_text(span)
+            );
         }
         line
     }
@@ -810,7 +833,7 @@ impl Tessar {
         serde_json::json!({
             "id": fact.id.to_string(),
             "space": self.space_name(fact.space),
-            "recorded": when::ymd(fact.recorded_at),
+            "recorded": self.calendar.ymd(fact.recorded_at),
             "text": text,
             "kind": kind,
             "similarity": similarity.map(|s| (f64::from(s) * 1000.0).round() / 1000.0),
@@ -881,9 +904,12 @@ impl Tessar {
         let reason = match (args.reason, since) {
             (UpdateReason::Changed, None) => Reason::Change { at: None },
             (UpdateReason::Changed, Some(day)) => {
-                let end = when::parse_as_of(&day).map_err(|e| format!("`since`: {e}"))?;
+                let end = self
+                    .calendar
+                    .parse_as_of(&day)
+                    .map_err(|e| format!("`since`: {e}"))?;
                 Reason::Change {
-                    at: Some(when::day_start(end)),
+                    at: Some(self.calendar.day_start(end)),
                 }
             }
             (UpdateReason::Wrong, None) => Reason::Correction,
@@ -898,7 +924,11 @@ impl Tessar {
         };
         let when_new = when_arg
             .as_deref()
-            .map(|w| when::parse_when(w).map_err(|e| format!("`when`: {e}")))
+            .map(|w| {
+                self.calendar
+                    .parse_when(w)
+                    .map_err(|e| format!("`when`: {e}"))
+            })
             .transpose()?;
 
         let replacement = if text.is_none() && value.is_none() && when_new.is_none() {
@@ -942,7 +972,7 @@ impl Tessar {
             Outcome::Closed if wrong => format!("corrected: {id} (was never true)"),
             Outcome::Closed => format!(
                 "closed: {id} (true until {})",
-                self.valid_to(id).unwrap_or_else(|| when::ymd(now))
+                self.valid_to(id).unwrap_or_else(|| self.calendar.ymd(now))
             ),
             Outcome::Unchanged => {
                 let hint = if matches!(fact.body, FactBody::Triple { .. }) && had_replacement {
@@ -1025,7 +1055,7 @@ impl Tessar {
     /// The day a version stopped being true, if it was closed as changed.
     fn valid_to(&self, id: FactId) -> Option<String> {
         match self.mem.fact(id)?.end?.ending {
-            Ending::Changed { valid_to } => Some(when::ymd(valid_to)),
+            Ending::Changed { valid_to } => Some(self.calendar.ymd(valid_to)),
             Ending::Corrected => None,
         }
     }
@@ -1097,7 +1127,11 @@ impl Tessar {
             .map(str::trim)
             .filter(|s| !s.is_empty());
         let view = match day {
-            Some(day) => View::TrueAt(when::parse_as_of(day).map_err(|e| format!("`as_of`: {e}"))?),
+            Some(day) => View::TrueAt(
+                self.calendar
+                    .parse_as_of(day)
+                    .map_err(|e| format!("`as_of`: {e}"))?,
+            ),
             None => View::Current,
         };
         let spaces = match args.space.unwrap_or_default() {
@@ -1228,7 +1262,7 @@ impl Tessar {
                             detail,
                             " [version {}, until {}]",
                             f.version,
-                            when::ymd(valid_to)
+                            self.calendar.ymd(valid_to)
                         )
                     }
                     Some(tessar_core::model::Ending::Corrected) => {
@@ -1240,7 +1274,7 @@ impl Tessar {
                 out,
                 "\n- {} [{}] [{}] {detail}",
                 f.id,
-                when::ymd(f.recorded_at),
+                self.calendar.ymd(f.recorded_at),
                 self.space_name(f.space)
             );
             hits.push(self.hit_json(f, detail, None));

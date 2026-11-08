@@ -13,7 +13,7 @@ use tessar_journal::FileJournal;
 use tessar_mcp::api::Tessar;
 use tessar_mcp::args::{AboutArgs, RecallArgs, RememberArgs, UpdateArgs};
 use tessar_mcp::purge::{journal_path, purge_home, summary};
-use tessar_mcp::when::{DAY_MS, days_from_civil};
+use tessar_mcp::when::{Calendar, DAY_MS, days_from_civil};
 
 const DIMS: usize = 64;
 
@@ -63,7 +63,9 @@ fn open(home: &std::path::Path) -> Tessar {
         },
     )
     .unwrap();
-    Tessar::bootstrap(mem, clock, "tessar", &|w| panic!("{w}")).unwrap()
+    Tessar::bootstrap(mem, clock, "tessar", &|w| panic!("{w}"))
+        .unwrap()
+        .with_calendar(Calendar::utc())
 }
 
 fn handle(out: &str) -> String {
