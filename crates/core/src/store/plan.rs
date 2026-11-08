@@ -23,6 +23,34 @@ use crate::model::{
     SpaceState, Timestamp, Value,
 };
 
+/// The parts of a write of a single-valued fact that do not depend on the
+/// current state.
+#[derive(Clone, Copy)]
+struct SingleWrite<'a> {
+    space: SpaceId,
+    origin: &'a Origin,
+    episode: Option<EpisodeId>,
+    expected_version: Option<NonZeroU32>,
+    valid_from: Timestamp,
+}
+
+/// What a write of a single-valued fact came to.
+enum Resolved {
+    /// Planned and finished.
+    Done(Recorded),
+    /// Starts a lineage of its own, beside the asserted current head.
+    Beside { asserted: FactId },
+    /// Starts a lineage of its own; nothing was current.
+    Fresh,
+}
+
+fn is_asserted(origin: &Origin) -> bool {
+    match origin {
+        Origin::Asserted { .. } => true,
+        Origin::Inferred { .. } => false,
+    }
+}
+
 /// Planning of predicate definitions and merges lives in
 /// [`super::predicate`]; it shares these fields.
 pub(crate) struct Planner<'s> {
@@ -254,7 +282,8 @@ impl<'s> Planner<'s> {
     /// inferred head if there is one (closing only that), and otherwise
     /// starts a lineage of its own beside the asserted value
     /// ([`Outcome::Conflicting`]). An asserted write closes all current
-    /// heads as above.
+    /// heads as above, and continues the latest asserted one if there is
+    /// one.
     ///
     /// A write with the same value and another `text` is
     /// [`Outcome::Unchanged`] and does not store the new text (see
@@ -280,135 +309,29 @@ impl<'s> Planner<'s> {
             let def = state
                 .predicate(predicate)
                 .ok_or(StoreError::UnknownPredicate(predicate))?;
-            let lineages = state.lineages_of_pair(subject, predicate);
             match def.cardinality {
                 Cardinality::Single => {
                     if !self.single_pairs.insert((subject, predicate)) {
                         return Err(StoreError::DuplicatePair { subject, predicate });
                     }
-                    // Normally a single-valued pair has one lineage and the
-                    // new value becomes its next version. After a merge it
-                    // may have several current heads; this write resolves
-                    // them (see the method docs).
-                    let heads: Vec<&Fact> = lineages
-                        .iter()
-                        .map(|&l| {
-                            state
-                                .head(l)
-                                .ok_or_else(|| StoreError::Internal(format!("{l} has no head")))
-                        })
-                        .collect::<Result<_, _>>()?;
-                    let current: Vec<&Fact> =
-                        heads.iter().copied().filter(|h| h.is_current()).collect();
-                    let latest = |facts: &[&'s Fact]| {
-                        facts.iter().copied().max_by_key(|h| (h.recorded_at, h.id))
+                    let write = SingleWrite {
+                        space,
+                        origin,
+                        episode,
+                        expected_version: draft.expected_version,
+                        valid_from,
                     };
-                    if current.is_empty() {
-                        if let Some(head) = latest(&heads) {
-                            check_expected(draft.expected_version, Some(head.lineage), None)?;
-                            let id = self.push_version(
-                                head, space, body, mentions, episode, origin, valid_from,
-                            )?;
-                            return Ok(Recorded {
-                                fact: id,
-                                outcome: Outcome::Created,
-                            });
+                    match self.resolve_single(subject, predicate, &write, &body, &mentions)? {
+                        Resolved::Done(recorded) => return Ok(recorded),
+                        Resolved::Beside { asserted } => {
+                            outcome = Outcome::Conflicting { current: asserted };
                         }
-                    } else if let Some(head) = latest(&current) {
-                        check_expected(
-                            draft.expected_version,
-                            Some(head.lineage),
-                            Some(head.version),
-                        )?;
-                        if let Some(same) =
-                            current.iter().find(|h| self.same_content(&h.body, &body))
-                        {
-                            return Ok(Recorded {
-                                fact: same.id,
-                                outcome: Outcome::Unchanged,
-                            });
-                        }
-                        if matches!(origin, Origin::Inferred { .. }) {
-                            let asserted = current
-                                .iter()
-                                .copied()
-                                .filter(|h| matches!(h.origin, Origin::Asserted { .. }))
-                                .max_by_key(|h| (h.recorded_at, h.id));
-                            if let Some(asserted) = asserted {
-                                // An inferred value never replaces an
-                                // asserted one. It continues an inferred
-                                // current head beside it, or else starts
-                                // a lineage of its own.
-                                let inferred = current
-                                    .iter()
-                                    .copied()
-                                    .filter(|h| matches!(h.origin, Origin::Inferred { .. }))
-                                    .max_by_key(|h| (h.recorded_at, h.id));
-                                match inferred {
-                                    Some(prev) => {
-                                        if valid_from < prev.valid_from {
-                                            return Err(StoreError::ChangeBeforeValid {
-                                                at: valid_from,
-                                                valid_from: prev.valid_from,
-                                            });
-                                        }
-                                        let id = self.push_version(
-                                            prev, space, body, mentions, episode, origin,
-                                            valid_from,
-                                        )?;
-                                        self.close(
-                                            prev.id,
-                                            Ending::Changed {
-                                                valid_to: valid_from,
-                                            },
-                                            Some(id),
-                                        );
-                                        return Ok(Recorded {
-                                            fact: id,
-                                            outcome: Outcome::Superseded { previous: prev.id },
-                                        });
-                                    }
-                                    None => {
-                                        outcome = Outcome::Conflicting {
-                                            current: asserted.id,
-                                        };
-                                    }
-                                }
-                            }
-                        }
-                        if matches!(outcome, Outcome::Conflicting { .. }) {
-                            // Falls through to a new lineage below.
-                        } else if let Some(late) =
-                            current.iter().find(|h| valid_from < h.valid_from)
-                        {
-                            return Err(StoreError::ChangeBeforeValid {
-                                at: valid_from,
-                                valid_from: late.valid_from,
-                            });
-                        }
-                        if !matches!(outcome, Outcome::Conflicting { .. }) {
-                            let id = self.push_version(
-                                head, space, body, mentions, episode, origin, valid_from,
-                            )?;
-                            let ending = Ending::Changed {
-                                valid_to: valid_from,
-                            };
-                            for other in current.iter().filter(|h| h.id != head.id) {
-                                self.close(other.id, ending, None);
-                            }
-                            self.close(head.id, ending, Some(id));
-                            return Ok(Recorded {
-                                fact: id,
-                                outcome: Outcome::Superseded { previous: head.id },
-                            });
-                        }
-                    }
-                    if !matches!(outcome, Outcome::Conflicting { .. }) {
-                        check_expected(draft.expected_version, None, None)?;
+                        Resolved::Fresh => {}
                     }
                 }
                 Cardinality::Many => {
-                    let same = lineages
+                    let same = state
+                        .lineages_of_pair(subject, predicate)
                         .iter()
                         .filter_map(|&l| state.head(l))
                         .find(|h| h.is_current() && self.same_content(&h.body, &body));
@@ -438,6 +361,124 @@ impl<'s> Planner<'s> {
             end: None,
         }));
         Ok(Recorded { fact: id, outcome })
+    }
+
+    /// Resolves a write of a value to a single-valued pair against its
+    /// current heads (see [`Self::remember_fact`] for the rules).
+    fn resolve_single(
+        &mut self,
+        subject: EntityId,
+        predicate: PredicateId,
+        write: &SingleWrite<'_>,
+        body: &FactBody,
+        mentions: &[EntityId],
+    ) -> Result<Resolved, StoreError> {
+        let state = self.state;
+        let SingleWrite {
+            space,
+            origin,
+            episode,
+            expected_version,
+            valid_from,
+        } = *write;
+        let heads: Vec<&'s Fact> = state
+            .lineages_of_pair(subject, predicate)
+            .iter()
+            .map(|&l| {
+                state
+                    .head(l)
+                    .ok_or_else(|| StoreError::Internal(format!("{l} has no head")))
+            })
+            .collect::<Result<_, _>>()?;
+        let latest =
+            |facts: &[&'s Fact]| facts.iter().copied().max_by_key(|h| (h.recorded_at, h.id));
+        let current: Vec<&'s Fact> = heads.iter().copied().filter(|h| h.is_current()).collect();
+
+        if current.is_empty() {
+            // No current value: the latest lineage continues, if any.
+            let Some(head) = latest(&heads) else {
+                check_expected(expected_version, None, None)?;
+                return Ok(Resolved::Fresh);
+            };
+            check_expected(expected_version, Some(head.lineage), None)?;
+            let id = self.push_version(
+                head,
+                space,
+                body.clone(),
+                mentions.to_vec(),
+                episode,
+                origin,
+                valid_from,
+            )?;
+            return Ok(Resolved::Done(Recorded {
+                fact: id,
+                outcome: Outcome::Created,
+            }));
+        }
+
+        let (asserted, inferred): (Vec<&'s Fact>, Vec<&'s Fact>) = current
+            .iter()
+            .copied()
+            .partition(|h| is_asserted(&h.origin));
+        // An inferred write never replaces an asserted value: it closes
+        // only the inferred heads, and if there are none it starts a
+        // lineage of its own. Any other write closes all current heads
+        // and continues the latest asserted one (else the latest of all).
+        let (closing, target) = match origin {
+            Origin::Inferred { .. } if !asserted.is_empty() => {
+                let target = latest(&inferred);
+                (inferred, target)
+            }
+            Origin::Inferred { .. } | Origin::Asserted { .. } => {
+                let target = latest(&asserted).or_else(|| latest(&current));
+                (current.clone(), target)
+            }
+        };
+
+        if let Some(head) = target {
+            check_expected(expected_version, Some(head.lineage), Some(head.version))?;
+        }
+        if let Some(same) = current.iter().find(|h| self.same_content(&h.body, body)) {
+            return Ok(Resolved::Done(Recorded {
+                fact: same.id,
+                outcome: Outcome::Unchanged,
+            }));
+        }
+        if let Some(late) = closing.iter().find(|h| valid_from < h.valid_from) {
+            return Err(StoreError::ChangeBeforeValid {
+                at: valid_from,
+                valid_from: late.valid_from,
+            });
+        }
+        let Some(head) = target else {
+            // Only reachable for an inferred write beside asserted heads.
+            check_expected(expected_version, None, None)?;
+            let beside = latest(&asserted)
+                .ok_or_else(|| StoreError::Internal("conflict without an asserted head".into()))?;
+            return Ok(Resolved::Beside {
+                asserted: beside.id,
+            });
+        };
+        let id = self.push_version(
+            head,
+            space,
+            body.clone(),
+            mentions.to_vec(),
+            episode,
+            origin,
+            valid_from,
+        )?;
+        let ending = Ending::Changed {
+            valid_to: valid_from,
+        };
+        for other in closing.iter().filter(|h| h.id != head.id) {
+            self.close(other.id, ending, None);
+        }
+        self.close(head.id, ending, Some(id));
+        Ok(Resolved::Done(Recorded {
+            fact: id,
+            outcome: Outcome::Superseded { previous: head.id },
+        }))
     }
 
     fn add_episode(

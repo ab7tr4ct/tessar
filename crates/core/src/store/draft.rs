@@ -151,7 +151,7 @@ pub enum Outcome {
     /// An inferred value contradicting the asserted `current` one of a
     /// single-valued pair: written beside the asserted current value; it
     /// did not replace it. Both are current until an asserted write or an
-    /// explicit update resolves the pair (see `Memory::values_of`).
+    /// explicit update resolves the pair (see [`Memory::values_of`](super::Memory::values_of)).
     Conflicting {
         /// The asserted version that stays current.
         current: FactId,

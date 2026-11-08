@@ -16,6 +16,11 @@
 //! The meaning part is not multiplied: a fact in another language covers
 //! no query words and still answers it.
 //!
+//! With [`Fusion::Boost`] the channels are not fused: the candidates come
+//! only from the meaning channel, and the entity and keyword channels
+//! only re-rank them by a multiplier of at least 1 (so a fact that covers
+//! none of the query's concepts is never penalised for it).
+//!
 //! **Near spaces** ([`Recall::near`]) — the asking project, the user's
 //! space — get a bonus in the meaning channel. Other spaces are still
 //! searched: a strong match elsewhere wins over a weak one nearby.
@@ -61,7 +66,8 @@ pub struct Recall {
     /// Weight of each channel in fusion.
     pub channels: Channels,
     /// The RRF constant `k` in `1 / (k + place)`: the larger, the flatter
-    /// the weight of lower places. Default 60.
+    /// the weight of lower places. Default 60. Must be at least 0; a
+    /// negative value is treated as 0.
     pub rrf_k: f32,
     /// How the channels are combined.
     pub fusion: Fusion,
@@ -69,8 +75,9 @@ pub struct Recall {
     /// fits the window: with `span` the length of the fact's `when` and
     /// `len` the window length, the bonus is
     /// `1 + (WINDOW_BONUS - 1) * min(1, len / span)`, `WINDOW_BONUS`
-    /// being 1.5. A point (and a fact without `when`, which is placed by
-    /// its validity) is tight and keeps the full bonus; an open span
+    /// being 1.5. A point, a fact without `when` (placed by its validity)
+    /// and a duration (which has no position, so never falls inside a
+    /// window) are tight and keep the full bonus; an open span
     /// ([`TimeSpan::Since`], [`TimeSpan::Until`]) is infinitely wide and
     /// gets none. Default off: any fact inside the window gets the full
     /// bonus.
@@ -85,9 +92,9 @@ pub enum Fusion {
     #[default]
     Rrf,
     /// Candidates come only from the meaning channel; the entity and
-    /// keyword channels only re-rank them. The score is the meaning RRF
-    /// term times `1 + coverage * (entities * [entity hit] + keywords *
-    /// [keyword hit])`, where the weights are those of [`Channels`] and
+    /// keyword channels only re-rank them. The score is the weighted
+    /// meaning RRF term times `1 + coverage * (entities * [entity hit] + keywords *
+    /// [keyword hit])` (at least 1), where the weights are those of [`Channels`] and
     /// coverage is the share of query concepts the fact covers. Facts
     /// found only by the lexical channels are dropped. Mem0 calls BM25
     /// "a boost signal, not a recall expander". Without the meaning
@@ -338,7 +345,7 @@ pub(crate) fn recall(
     near_bonus: f32,
 ) -> Recalled {
     let prepared = prepare(state, query, vector, near_bonus);
-    let k = query.rrf_k;
+    let k = query.rrf_k.max(0.0);
     let rrf = |i: usize| 1.0 / (k + (i + 1) as f32);
 
     let on = query.channels;
@@ -358,11 +365,17 @@ pub(crate) fn recall(
         run(&MeaningChannel, |r| &mut r.meaning);
     }
 
-    let boost = query.fusion == Fusion::Boost && on.meaning > 0.0 && prepared.vector.is_some();
+    let boost = query.fusion == Fusion::Boost
+        && on.meaning > 0.0
+        && prepared.vector.is_some()
+        && state.vectors().is_some();
     let concepts = prepared.concepts();
     let mut hits: Vec<Hit> = fused
         .into_iter()
         .filter_map(|(id, ranks)| {
+            if boost && ranks.meaning.is_none() {
+                return None;
+            }
             let fact = state.fact(id).filter(|f| !f.is_redacted())?;
             let fact_entities = fact.entities();
             let fact_words: HashSet<String> = words(&fact_text(state, fact)).collect();
@@ -373,14 +386,13 @@ pub(crate) fn recall(
             let meaning = on.meaning * ranks.meaning.map_or(0.0, |i| rrf(i - 1));
             let coverage = covered as f32 / concepts.max(1) as f32;
             let mut score = if boost {
-                ranks.meaning?;
                 let hit = |rank: Option<usize>| if rank.is_some() { 1.0 } else { 0.0 };
                 meaning
                     * (1.0
                         + coverage
                             * (on.entities * hit(ranks.entity) + on.keywords * hit(ranks.keyword)))
             } else {
-                lexical * coverage + meaning
+                lexical * covered as f32 / concepts.max(1) as f32 + meaning
             };
             if in_window {
                 score *= window_bonus(fact, query);
@@ -478,11 +490,14 @@ fn window_bonus(fact: &Fact, query: &Recall) -> f32 {
     let (Some(window), true) = (query.window, query.time_tightness) else {
         return WINDOW_BONUS;
     };
-    let window_len = (window.end().as_millis() - window.start().as_millis()) as f64;
+    let window_len = window
+        .end()
+        .as_millis()
+        .abs_diff(window.start().as_millis()) as f64;
     let span_len = match fact.body.when() {
-        None | Some(TimeSpan::Point(_)) => return WINDOW_BONUS,
-        Some(TimeSpan::Range(r)) => (r.end().as_millis() - r.start().as_millis()) as f64,
-        Some(TimeSpan::Duration(d)) => d.as_millis() as f64,
+        // A duration has no position, so it is never inside a window.
+        None | Some(TimeSpan::Point(_) | TimeSpan::Duration(_)) => return WINDOW_BONUS,
+        Some(TimeSpan::Range(r)) => r.end().as_millis().abs_diff(r.start().as_millis()) as f64,
         Some(TimeSpan::Since(_) | TimeSpan::Until(_)) => f64::INFINITY,
     };
     let tight = if span_len <= window_len {

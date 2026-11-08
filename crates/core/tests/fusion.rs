@@ -87,7 +87,8 @@ fn rrf_k_changes_the_order() {
         w.clock.set(ts(200 + i));
         w.remember_one(statement(&format!("alpha filler{i}")));
     }
-    // Best by meaning, but covers only one of the two query concepts.
+    // Same vector as the next fact, so it ties on meaning and wins by id,
+    // but it covers only one of the two query concepts.
     w.remember_one(statement("deadline"));
     w.remember_one(statement("deadline alpha"));
     let mut q = Recall::new("alpha deadline");
@@ -165,4 +166,51 @@ fn time_tightness_prefers_the_tighter_fact() {
     let hits = w.memory.recall(&q).hits;
     assert_eq!(hits[0].fact.entities(), [anna]);
     assert!(hits[0].score > hits[1].score);
+}
+
+#[test]
+fn open_spans_get_no_bonus_under_time_tightness() {
+    let w = World::new();
+    let open = |text: &str, when: TimeSpan| {
+        FactDraft::new(BodyDraft::Statement {
+            text: text.into(),
+            when: Some(when),
+        })
+    };
+    w.remember_one(open("release planned", TimeSpan::Point(ts(110_000))));
+    w.clock.set(ts(200));
+    w.remember_one(open("release planned", TimeSpan::Since(ts(0))));
+    w.clock.set(ts(300));
+    w.remember_one(open("release planned", TimeSpan::Until(ts(500_000))));
+    let mut q = Recall::new("release");
+    let plain = w.memory.recall(&q).hits;
+    q.window = Some(Interval::new(ts(100_000), ts(130_000)).unwrap());
+    q.time_tightness = true;
+    let hits = w.memory.recall(&q).hits;
+    assert_eq!(hits.len(), 3);
+    assert!(hits.iter().all(|h| h.why.in_window));
+    // Compare each fact with its own score without a window.
+    let ratio = |when: fn(&TimeSpan) -> bool| {
+        let find = |hits: &[Hit]| {
+            hits.iter()
+                .find(|h| h.fact.body.when().is_some_and(|t| when(&t)))
+                .unwrap()
+                .score
+        };
+        find(&hits) / find(&plain)
+    };
+    assert!((ratio(|t| matches!(t, TimeSpan::Point(_))) - 1.5).abs() < 1e-5);
+    assert!((ratio(|t| matches!(t, TimeSpan::Since(_))) - 1.0).abs() < 1e-5);
+    assert!((ratio(|t| matches!(t, TimeSpan::Until(_))) - 1.0).abs() < 1e-5);
+}
+
+#[test]
+fn a_negative_rrf_k_is_treated_as_zero() {
+    let w = World::new();
+    w.remember_one(statement("alpha beta"));
+    let mut q = Recall::new("alpha");
+    q.rrf_k = 0.0;
+    let zero = w.memory.recall(&q);
+    q.rrf_k = -5.0;
+    assert_eq!(w.memory.recall(&q), zero);
 }

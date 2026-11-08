@@ -294,17 +294,16 @@ impl Tessar {
                 .mem
                 .fact(recorded.fact)
                 .map_or_else(String::new, |f| self.line(&f, now, true, None));
-            let mut note = String::new();
-            let verb = match recorded.outcome {
-                Outcome::Created => "created".to_owned(),
-                Outcome::Conflicting { current } => {
-                    note = format!(
+            let (verb, note) = match recorded.outcome {
+                Outcome::Created => ("created".to_owned(), String::new()),
+                Outcome::Conflicting { current } => (
+                    "conflicting".to_owned(),
+                    format!(
                         " (an inferred value recorded beside the asserted current value {current}; it did not replace it)"
-                    );
-                    "conflicting".to_owned()
-                }
-                Outcome::Unchanged => "unchanged (already known)".to_owned(),
-                Outcome::Closed => "closed".to_owned(),
+                    ),
+                ),
+                Outcome::Unchanged => ("unchanged (already known)".to_owned(), String::new()),
+                Outcome::Closed => ("closed".to_owned(), String::new()),
                 Outcome::Superseded { previous } => {
                     let was = self.mem.fact(previous).map_or_else(String::new, |p| {
                         format!(
@@ -313,7 +312,7 @@ impl Tessar {
                             when::ymd(p.recorded_at)
                         )
                     });
-                    format!("superseded{was}")
+                    (format!("superseded{was}"), String::new())
                 }
             };
             let _ = write!(out, "\n{}. {verb}: {line}{note}", i + 1);
