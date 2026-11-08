@@ -764,7 +764,7 @@ fn run_redact(home: &Path, handles: &[String], purge: bool) -> ExitCode {
         let opened = proxy::open_current(home, &project, &cwd, DAEMON_WAIT, false).await?;
         let (server, link) = opened.serve().await?;
         for handle in handles {
-            match proxy::redact_fact(server.daemon(), handle).await {
+            match proxy::redact_fact(&server.daemon(), handle).await {
                 Ok(line) => println!("{line}"),
                 Err(e) => {
                     eprintln!("tessar: {e}");
@@ -869,7 +869,20 @@ fn run_proxy(home: &Path, keep_daemon: bool) -> ExitCode {
         let opened = proxy::open_current(home, &project, &cwd, DAEMON_WAIT, keep_daemon).await?;
         let (server, link) = opened.serve().await?;
         eprintln!("tessar: connected to the daemon (project space `{project}`)");
-        proxy::bridge(server, link, stdio()).await
+        let reconnect: proxy::Reconnect = {
+            let (home, project, cwd) = (home.to_path_buf(), project.clone(), cwd.clone());
+            Arc::new(move || {
+                let (home, project, cwd) = (home.clone(), project.clone(), cwd.clone());
+                Box::pin(async move {
+                    let opened =
+                        proxy::open_current(&home, &project, &cwd, DAEMON_WAIT, keep_daemon)
+                            .await?;
+                    let (server, link) = opened.serve().await?;
+                    Ok((server.daemon(), link))
+                })
+            })
+        };
+        proxy::bridge_reconnecting(server, link, stdio(), reconnect).await
     });
     match result {
         Ok(true) => ExitCode::SUCCESS,

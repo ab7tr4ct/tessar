@@ -382,3 +382,164 @@ async fn open_gives_up_on_a_daemon_without_a_hello() {
     assert!(err.contains("predates the build handshake"), "{err}");
     silent.abort();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lost_daemon_fails_calls_one_by_one_and_the_proxy_reconnects() {
+    let home = tempfile::tempdir().unwrap();
+    let dir = home.path().to_path_buf();
+    let first = Daemon::start(&dir, None);
+    let stream = UnixStream::connect(socket_path(&dir)).await.unwrap();
+    let (server, link) = proxy::connect(stream, "alpha", Path::new("/work/x"))
+        .await
+        .unwrap();
+    let reconnect: proxy::Reconnect = {
+        let dir = dir.clone();
+        Arc::new(move || {
+            let dir = dir.clone();
+            Box::pin(async move {
+                let stream = UnixStream::connect(socket_path(&dir))
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let (server, link) = proxy::connect(stream, "alpha", Path::new("/work/x")).await?;
+                Ok((server.daemon(), link))
+            })
+        })
+    };
+    let (agent, stdio) = tokio::io::duplex(1 << 20);
+    let bridge = tokio::spawn(proxy::bridge_reconnecting(server, link, stdio, reconnect));
+    let client: Client = ().serve(agent).await.unwrap();
+
+    let remember = |text: &'static str| {
+        let mut params = CallToolRequestParams::new("remember");
+        params.arguments = json!({"facts": [{"kind": "statement", "text": text}]})
+            .as_object()
+            .cloned();
+        params
+    };
+    client
+        .peer()
+        .call_tool(remember("Before the restart"))
+        .await
+        .unwrap();
+
+    first.shutdown().await;
+    // The call fails for itself; the session and the proxy stay up.
+    let lost = client.peer().call_tool(remember("While it is down")).await;
+    assert!(lost.is_err(), "{lost:?}");
+    assert!(!bridge.is_finished(), "the proxy exited with the daemon");
+
+    let _ = std::fs::remove_file(socket_path(&dir));
+    let second = Daemon::start(&dir, None);
+    let mut healed = false;
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if client
+            .peer()
+            .call_tool(remember("After the restart"))
+            .await
+            .is_ok()
+        {
+            healed = true;
+            break;
+        }
+    }
+    assert!(healed, "the proxy did not reconnect");
+
+    drop(client);
+    assert!(bridge.await.unwrap().unwrap(), "the session ended normally");
+    second.shutdown().await;
+}
+
+/// The real `tessar mcp` binary on stdio, in front of the in-process daemon,
+/// with two `tools/call` requests written back to back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stdio_proxy_survives_back_to_back_calls() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let home = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(home.path(), None);
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_tessar"))
+        .args(["mcp", "--keep-daemon"])
+        .env("TESSAR_HOME", home.path())
+        .current_dir(home.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut out = BufReader::new(child.stdout.take().unwrap()).lines();
+    let call = |id: u64, space: &str, n: usize| {
+        let facts: Vec<Value> = (0..n)
+            .map(|i| {
+                json!({"kind": "statement", "space": space,
+                    "text": format!("Stdio {space} fact number {i}")})
+            })
+            .collect();
+        json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {
+            "name": "remember", "arguments": {"facts": facts}, "_meta": {"progressToken": id}}})
+    };
+    let lines = [
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-06-18", "capabilities": {},
+            "clientInfo": {"name": "test", "version": "0"}}}),
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        call(2, "project", 5),
+        call(3, "user", 2),
+    ];
+    // One write, as a client that does not wait would produce.
+    let burst: String = lines.iter().map(|l| format!("{l}\n")).collect();
+    stdin.write_all(burst.as_bytes()).await.unwrap();
+    stdin.flush().await.unwrap();
+
+    let mut seen = std::collections::BTreeMap::new();
+    while seen.len() < 3 {
+        let line = tokio::time::timeout(Duration::from_secs(20), out.next_line())
+            .await
+            .expect("no response from the proxy")
+            .unwrap()
+            .expect("the proxy closed stdout before answering both calls");
+        let v: Value = serde_json::from_str(&line).unwrap();
+        seen.insert(v["id"].as_u64().unwrap(), v);
+    }
+    for id in [2, 3] {
+        assert!(seen[&id]["error"].is_null(), "{}", seen[&id]);
+        assert_eq!(seen[&id]["result"]["isError"], false, "{}", seen[&id]);
+    }
+    drop(stdin);
+    let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
+        .await
+        .expect("the proxy did not exit on stdin EOF")
+        .unwrap();
+    assert!(status.success(), "{status}");
+    daemon.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn parallel_remember_calls_in_two_spaces_both_succeed() {
+    let home = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(home.path(), None);
+    let alpha = session(home.path(), "alpha").await;
+
+    let facts = |space: &str, n: usize| {
+        let facts: Vec<Value> = (0..n)
+            .map(|i| {
+                json!({"kind": "statement", "space": space,
+                    "text": format!("Parallel {space} fact number {i}")})
+            })
+            .collect();
+        json!({ "facts": facts })
+    };
+    let (a, b) = tokio::join!(
+        call(&alpha, "remember", facts("project", 5)),
+        call(&alpha, "remember", facts("user", 2)),
+    );
+    assert_ne!(a.is_error, Some(true), "{}", text(&a));
+    assert_ne!(b.is_error, Some(true), "{}", text(&b));
+    let recalled = call(&alpha, "recall", json!({"query": "Parallel fact number"})).await;
+    let out = text(&recalled);
+    assert!(out.contains("Parallel project fact"), "{out}");
+    assert!(out.contains("Parallel user fact"), "{out}");
+
+    drop(alpha);
+    daemon.shutdown().await;
+}

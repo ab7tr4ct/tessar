@@ -2,8 +2,11 @@
 //! and forwards every tool call to the daemon through an MCP client.
 
 use std::borrow::Cow;
+use std::future::Future;
 use std::path::Path;
+use std::pin::Pin;
 use std::process::{Command, Stdio};
+use std::sync::{Arc, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use rmcp::model::{
@@ -35,25 +38,52 @@ const MAX_HELLO: u64 = 4096;
 /// verbatim, and `initialize` reports what the daemon reported.
 #[derive(Clone)]
 pub struct ProxyServer {
-    daemon: Peer<RoleClient>,
+    /// The current daemon connection; replaced when the proxy reconnects.
+    daemon: Arc<RwLock<Peer<RoleClient>>>,
     info: ServerConfig,
 }
 
 impl ProxyServer {
-    /// The daemon's peer, for tests.
-    pub fn daemon(&self) -> &Peer<RoleClient> {
-        &self.daemon
+    /// The daemon's current peer.
+    pub fn daemon(&self) -> Peer<RoleClient> {
+        self.daemon
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    fn replace_peer(&self, peer: Peer<RoleClient>) {
+        *self.daemon.write().unwrap_or_else(PoisonError::into_inner) = peer;
     }
 }
+
+/// Opens a new daemon connection for a proxy whose old one is gone.
+pub type Reconnect = Arc<
+    dyn Fn() -> Pin<Box<dyn Future<Output = Result<(Peer<RoleClient>, DaemonLink), String>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// How long to wait between attempts to reach a lost daemon.
+const RECONNECT_PAUSE: Duration = Duration::from_secs(2);
 
 /// The daemon connection a [`ProxyServer`] forwards to. Dropping it closes
 /// the connection.
 pub type DaemonLink = RunningService<RoleClient, ()>;
 
-fn forwarded(e: ServiceError) -> ErrorData {
+/// Turns a failure of the forwarding path into the JSON-RPC error for the
+/// one request that hit it, and says so on stderr. `what` names the request.
+fn forwarded(what: &str, e: ServiceError) -> ErrorData {
     match e {
+        // The daemon's own answer: pass it on as it is.
         ServiceError::McpError(e) => e,
-        other => ErrorData::internal_error(Cow::Owned(format!("tessar daemon: {other}")), None),
+        other => {
+            eprintln!("tessar: forwarding {what} to the daemon failed: {other}");
+            ErrorData::internal_error(
+                Cow::Owned(format!("tessar daemon: {what} failed: {other}")),
+                None,
+            )
+        }
     }
 }
 
@@ -67,7 +97,10 @@ impl ServerHandler for ProxyServer {
         request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
-        self.daemon.list_tools(request).await.map_err(forwarded)
+        self.daemon()
+            .list_tools(request)
+            .await
+            .map_err(|e| forwarded("tools/list", e))
     }
 
     async fn call_tool(
@@ -75,7 +108,11 @@ impl ServerHandler for ProxyServer {
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
-        self.daemon.call_tool_once(request).await.map_err(forwarded)
+        let what = format!("tools/call `{}`", request.name);
+        self.daemon()
+            .call_tool_once(request)
+            .await
+            .map_err(|e| forwarded(&what, e))
     }
 }
 
@@ -114,7 +151,7 @@ where
             .unwrap_or_else(|| Implementation::new("tessar", env!("CARGO_PKG_VERSION")));
         info.instructions.clone_from(&peer.instructions);
         let server = ProxyServer {
-            daemon: link.peer().clone(),
+            daemon: Arc::new(RwLock::new(link.peer().clone())),
             info,
         };
         Ok((server, link))
@@ -263,13 +300,73 @@ where
     T: rmcp::transport::IntoTransport<RoleServer, E, A>,
     E: std::error::Error + Send + Sync + 'static,
 {
+    bridge_with(server, link, transport, None).await
+}
+
+/// Like [`bridge`], but when the daemon goes away it keeps the session open,
+/// answers calls with errors meanwhile and reconnects through `reconnect`.
+/// It returns only when the session ends.
+pub async fn bridge_reconnecting<T, E, A>(
+    server: ProxyServer,
+    link: DaemonLink,
+    transport: T,
+    reconnect: Reconnect,
+) -> Result<bool, String>
+where
+    T: rmcp::transport::IntoTransport<RoleServer, E, A>,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    bridge_with(server, link, transport, Some(reconnect)).await
+}
+
+async fn bridge_with<T, E, A>(
+    server: ProxyServer,
+    link: DaemonLink,
+    transport: T,
+    reconnect: Option<Reconnect>,
+) -> Result<bool, String>
+where
+    T: rmcp::transport::IntoTransport<RoleServer, E, A>,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    let handle = server.clone();
     let session = server
         .serve(transport)
         .await
         .map_err(|e| format!("cannot serve the session: {e}"))?;
-    tokio::select! {
-        _ = session.waiting() => Ok(true),
-        _ = link.waiting() => Ok(false),
+    let session = session.waiting();
+    tokio::pin!(session);
+    let mut watcher = tokio::spawn(link.waiting());
+    loop {
+        tokio::select! {
+            _ = &mut session => {
+                watcher.abort();
+                return Ok(true);
+            }
+            _ = &mut watcher => {}
+        }
+        let Some(reconnect) = &reconnect else {
+            return Ok(false);
+        };
+        eprintln!("tessar: the daemon connection was lost; reconnecting");
+        let link = loop {
+            tokio::select! {
+                _ = &mut session => return Ok(true),
+                attempt = reconnect() => match attempt {
+                    Ok((peer, link)) => {
+                        handle.replace_peer(peer);
+                        eprintln!("tessar: reconnected to the daemon");
+                        break link;
+                    }
+                    Err(e) => eprintln!("tessar: cannot reconnect to the daemon: {e}"),
+                },
+            }
+            tokio::select! {
+                _ = &mut session => return Ok(true),
+                () = tokio::time::sleep(RECONNECT_PAUSE) => {}
+            }
+        };
+        watcher = tokio::spawn(link.waiting());
     }
 }
 
