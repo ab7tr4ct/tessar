@@ -6,7 +6,7 @@ use super::draft::{PredicateDraft, Recorded, Remember, Remembered, Update, View}
 use super::error::StoreError;
 use super::op::Op;
 use super::plan::Planner;
-use super::predicate::PredicateCheck;
+use super::predicate::{PredicateCheck, predicate_text};
 use super::recall::{Recall, Recalled, recall};
 use super::state::State;
 use super::text::{fact_text, fact_text_with};
@@ -37,6 +37,7 @@ pub struct Semantic {
     /// Cosine similarity at which a new predicate counts as a duplicate
     /// of an existing one and [`Memory::define_predicate`] rejects it. In
     /// the model's cosine units; calibrated per model on known synonyms.
+    /// 1.0 or more turns the similarity check off.
     pub predicate_threshold: f32,
 }
 
@@ -126,6 +127,20 @@ impl Memory {
         }
         if let Some(semantic) = &semantic {
             state.enable_vectors(semantic.dims);
+            let predicates: Vec<String> = state
+                .all_predicates()
+                .iter()
+                .map(|p| predicate_text(&p.name, &p.description))
+                .collect();
+            let mut next = 0;
+            for batch in predicates.chunks(EMBED_BATCH) {
+                for vector in embed_texts(semantic, batch)? {
+                    state
+                        .push_predicate_vector(PredicateId::new(next), vector)
+                        .map_err(StoreError::Internal)?;
+                    next += 1;
+                }
+            }
             let texts: Vec<(FactId, String)> = state
                 .facts()
                 .iter()
@@ -176,24 +191,38 @@ impl Memory {
     /// ([`Memory::alias_predicate`]); with the name existing with another
     /// type or cardinality, [`StoreError::PredicateConflict`].
     ///
-    /// TODO(core-B): embed `predicate_text(name, description)` before
-    /// taking the writer lock and pass it in `PredicateCheck::Full`.
+    /// Without the meaning channel the similarity check is skipped (the
+    /// format and universality checks still run). With it, the draft is
+    /// embedded before the writer lock is taken, so a slow embedder does
+    /// not block other writers.
     pub fn define_predicate(
         &self,
         space: SpaceId,
         draft: PredicateDraft,
     ) -> Result<PredicateId, StoreError> {
-        let threshold = self
-            .inner
-            .semantic
-            .as_ref()
-            .map_or(1.0, |s| s.predicate_threshold);
-        self.write(|p| {
+        let Some(semantic) = &self.inner.semantic else {
+            return self.write(|p| {
+                p.define_predicate(
+                    space,
+                    draft,
+                    PredicateCheck::Full {
+                        vector: None,
+                        threshold: 1.0,
+                    },
+                )
+            });
+        };
+        let text = predicate_text(&draft.name, &draft.description);
+        let vector = embed_texts(semantic, std::slice::from_ref(&text))?
+            .pop()
+            .ok_or_else(|| EmbedError("no vector for the predicate".to_owned()))?;
+        let threshold = semantic.predicate_threshold;
+        self.write_with(Some((&text, &vector)), |p| {
             p.define_predicate(
                 space,
                 draft,
                 PredicateCheck::Full {
-                    vector: None,
+                    vector: Some(&vector),
                     threshold,
                 },
             )
@@ -243,10 +272,8 @@ impl Memory {
 
     /// The vocabulary: every canonical predicate, in id order. Synonyms are
     /// left out.
-    ///
-    /// TODO(core-B): implement via a `State` accessor.
     pub fn predicates(&self) -> Vec<PredicateDef> {
-        todo!("core-B: predicates")
+        self.state().canonical_predicates().cloned().collect()
     }
 
     /// Adds another name to an entity.
@@ -377,9 +404,11 @@ impl Memory {
         recalled
     }
 
-    /// The current values of a (subject, predicate) pair.
+    /// The current values of a (subject, predicate) pair; a synonym gives
+    /// the values of its canonical predicate.
     pub fn values_of(&self, subject: EntityId, predicate: PredicateId) -> Vec<Fact> {
         let state = self.state();
+        let predicate = state.canonical(predicate);
         state
             .lineages_of_pair(subject, predicate)
             .iter()
@@ -394,19 +423,29 @@ impl Memory {
         &self,
         plan: impl FnOnce(&mut Planner<'_>) -> Result<R, StoreError>,
     ) -> Result<R, StoreError> {
+        self.write_with(None, plan)
+    }
+
+    /// Like [`Memory::write`], with the vector of one text already
+    /// embedded (the predicate being defined), so it is not embedded twice.
+    fn write_with<R>(
+        &self,
+        known: Option<(&str, &Quantized)>,
+        plan: impl FnOnce(&mut Planner<'_>) -> Result<R, StoreError>,
+    ) -> Result<R, StoreError> {
         let mut writer = self.inner.writer.lock().map_err(|_| StoreError::Poisoned)?;
         let at = self.inner.clock.now().max(writer.last_at);
 
-        let (ops, result, texts) = {
+        let (ops, result, texts, predicate_texts) = {
             let state = self.state();
             let mut planner = Planner::new(&state, at);
             let result = plan(&mut planner)?;
             let ops = planner.into_ops();
-            let texts = match self.inner.semantic {
-                Some(_) => new_fact_texts(&state, &ops),
-                None => Vec::new(),
+            let (texts, predicate_texts) = match self.inner.semantic {
+                Some(_) => (new_fact_texts(&state, &ops), new_predicate_texts(&ops)),
+                None => (Vec::new(), Vec::new()),
             };
-            (ops, result, texts)
+            (ops, result, texts, predicate_texts)
         };
         if ops.is_empty() {
             // Nothing to change, for example a value that is already current.
@@ -414,8 +453,32 @@ impl Memory {
         }
         // Embedding is slow; it runs before the log, so a failure writes
         // nothing, and without the state lock, so readers go on.
+        let mut predicate_vectors: Vec<(PredicateId, Quantized)> = Vec::new();
+        let mut to_embed: Vec<(PredicateId, String)> = Vec::new();
+        for (id, text) in predicate_texts {
+            match known {
+                Some((t, q)) if t == text => predicate_vectors.push((id, q.clone())),
+                _ => to_embed.push((id, text)),
+            }
+        }
         let vectors = match &self.inner.semantic {
-            Some(semantic) if !texts.is_empty() => embed(semantic, &texts)?,
+            Some(semantic) if !texts.is_empty() || !to_embed.is_empty() => {
+                // One batch for the new predicates and the new facts.
+                let strings: Vec<String> = to_embed
+                    .iter()
+                    .map(|(_, t)| t.clone())
+                    .chain(texts.iter().map(|(_, t)| t.clone()))
+                    .collect();
+                let mut all = embed_texts(semantic, &strings)?.into_iter();
+                for ((id, _), v) in to_embed.iter().zip(all.by_ref()) {
+                    predicate_vectors.push((*id, v));
+                }
+                texts
+                    .iter()
+                    .zip(all)
+                    .map(|((id, _), v)| (*id, v))
+                    .collect::<Vec<(FactId, Quantized)>>()
+            }
             _ => Vec::new(),
         };
 
@@ -436,6 +499,11 @@ impl Memory {
             .unwrap_or_else(PoisonError::into_inner);
         for op in commit.ops {
             state.apply(op).map_err(StoreError::Internal)?;
+        }
+        for (id, vector) in predicate_vectors {
+            state
+                .push_predicate_vector(id, vector)
+                .map_err(StoreError::Internal)?;
         }
         for (fact, vector) in vectors {
             state
@@ -472,6 +540,33 @@ fn new_fact_texts(state: &State, ops: &[Op]) -> Vec<(FactId, String)> {
             Op::AddFact(f) => Some((f.id, fact_text_with(state, f, &new_entities))),
             _ => None,
         })
+        .collect()
+}
+
+/// Texts of the predicates a commit defines.
+fn new_predicate_texts(ops: &[Op]) -> Vec<(PredicateId, String)> {
+    ops.iter()
+        .filter_map(|op| match op {
+            Op::DefinePredicate(p) => Some((p.id, predicate_text(&p.name, &p.description))),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Embeds texts as documents and prepares the vectors for the index, one
+/// per text.
+fn embed_texts(semantic: &Semantic, texts: &[String]) -> Result<Vec<Quantized>, EmbedError> {
+    let vectors = semantic.embedder.embed_documents(texts)?;
+    if vectors.len() != texts.len() {
+        return Err(EmbedError(format!(
+            "{} vectors for {} texts",
+            vectors.len(),
+            texts.len()
+        )));
+    }
+    vectors
+        .iter()
+        .map(|v| Quantized::new(v, semantic.dims))
         .collect()
 }
 
