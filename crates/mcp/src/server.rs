@@ -33,7 +33,8 @@ even when you write to the project space.
 
 FACT KINDS. `statement`: one free-form sentence, for decisions and notes. `attribute`: a \
 property of an entity that can change (subject + predicate + value), such as where the user \
-lives. `event`: something that happened or will happen on a date; needs `when`. Always give \
+lives. `event`: something that happened or will happen on a date; needs `when`. An attribute may take \
+`when` too: when the thing described happens (a trip date); the value holds from now. Always give \
 `text`: one self-contained sentence in the third person (\"User plans a trip to Japan in May \
 2027\"). Searches match against it. Write dates as absolute dates, never \"next Friday\".
 

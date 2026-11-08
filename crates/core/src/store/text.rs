@@ -102,6 +102,7 @@ pub(crate) fn fact_text_with(state: &State, fact: &Fact, new: &[&Entity]) -> Str
             predicate,
             object,
             text,
+            ..
         } => {
             // The sentence first, then the structured form, so that both
             // the phrase and the exact key are found.
@@ -296,6 +297,7 @@ mod tests {
                 predicate,
                 object: Value::Text("five engineers".into()),
                 text: text.map(Into::into),
+                when: None,
             },
             mentions: Vec::new(),
             episode: None,

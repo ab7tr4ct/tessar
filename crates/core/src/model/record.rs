@@ -110,6 +110,11 @@ pub enum FactBody {
         /// is what a question resembles. `None` if written without one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         text: Option<String>,
+        /// When the described thing happens in the world, if known: a
+        /// vacation's dates, a plan's date. Not when the fact holds (that
+        /// is `valid_from`): "plans a trip in March" holds from today.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        when: Option<TimeSpan>,
     },
     /// An event. It cannot be created without `when`.
     Event {
@@ -141,7 +146,9 @@ impl FactBody {
     /// `text` of a triple.
     ///
     /// The version chain records changes of value, not rephrasings: the
-    /// same value written in other words is not a new version.
+    /// same value written in other words is not a new version. A changed
+    /// `when` is a change: a vacation moved from July to August is a new
+    /// version.
     pub fn same_content(&self, other: &Self) -> bool {
         match (self, other) {
             (
@@ -149,26 +156,32 @@ impl FactBody {
                     subject: s1,
                     predicate: p1,
                     object: o1,
+                    when: w1,
                     ..
                 },
                 Self::Triple {
                     subject: s2,
                     predicate: p2,
                     object: o2,
+                    when: w2,
                     ..
                 },
-            ) => s1 == s2 && p1 == p2 && o1 == o2,
+            ) => s1 == s2 && p1 == p2 && o1 == o2 && w1 == w2,
             _ => self == other,
         }
     }
 
     /// When the described thing happens in the world, if known.
     ///
-    /// For a triple, only if the value itself is a span ([`Value::Span`]).
+    /// For a triple, its `when` if set, else the value itself if it is a
+    /// span ([`Value::Span`]).
     pub fn when(&self) -> Option<TimeSpan> {
         match self {
             Self::Statement { when, .. } => *when,
             Self::Event { when, .. } => Some(*when),
+            Self::Triple {
+                when: Some(when), ..
+            } => Some(*when),
             Self::Triple {
                 object: Value::Span(span),
                 ..
@@ -302,6 +315,7 @@ mod tests {
                 predicate: PredicateId::new(0),
                 object: Value::Entity(e(1)),
                 text: None,
+                when: None,
             },
             mentions: vec![e(2), e(0)],
             episode: None,
@@ -372,6 +386,7 @@ mod tests {
             predicate: PredicateId::new(0),
             object: Value::Text("memory engine".into()),
             text: None,
+            when: None,
         };
         assert_eq!(text_only.entities(), vec![e(5)]);
     }
@@ -393,17 +408,64 @@ mod tests {
             predicate: PredicateId::new(1),
             object: Value::Span(july),
             text: None,
+            when: None,
         };
         let deadline = FactBody::Triple {
             subject: e(3),
             predicate: PredicateId::new(2),
             object: Value::Time(ts(15)),
             text: None,
+            when: None,
         };
         assert_eq!(statement.when(), None);
         assert_eq!(event.when(), Some(july));
         assert_eq!(span.when(), Some(july));
         assert_eq!(deadline.when(), None);
+        // An explicit `when` wins over the value, and a plain value keeps
+        // the fact timeless.
+        let planned = FactBody::Triple {
+            subject: e(3),
+            predicate: PredicateId::new(3),
+            object: Value::Text("Japan".into()),
+            text: None,
+            when: Some(july),
+        };
+        assert_eq!(planned.when(), Some(july));
+        let with_span = FactBody::Triple {
+            subject: e(3),
+            predicate: PredicateId::new(1),
+            object: Value::Span(july),
+            text: None,
+            when: Some(TimeSpan::Point(ts(99))),
+        };
+        assert_eq!(with_span.when(), Some(TimeSpan::Point(ts(99))));
+    }
+
+    #[test]
+    fn triple_when_round_trips_and_is_optional_in_old_json() {
+        let july = TimeSpan::Range(Interval::new(ts(10), ts(20)).unwrap());
+        let body = FactBody::Triple {
+            subject: e(0),
+            predicate: PredicateId::new(0),
+            object: Value::Text("Japan".into()),
+            text: None,
+            when: Some(july),
+        };
+        let json = serde_json::to_string(&body).unwrap();
+        assert!(json.contains("\"when\""), "{json}");
+        assert_eq!(serde_json::from_str::<FactBody>(&json).unwrap(), body);
+
+        let without = FactBody::Triple {
+            subject: e(0),
+            predicate: PredicateId::new(0),
+            object: Value::Text("Japan".into()),
+            text: None,
+            when: None,
+        };
+        let old = serde_json::to_string(&without).unwrap();
+        assert!(!old.contains("when"), "{old}");
+        assert_eq!(serde_json::from_str::<FactBody>(&old).unwrap(), without);
+        assert!(!body.same_content(&without), "only `when` differs");
     }
 
     #[test]
@@ -451,6 +513,7 @@ mod tests {
             predicate: PredicateId::new(0),
             object: Value::Int(n),
             text: text.map(Into::into),
+            when: None,
         };
         assert!(triple(None, 1).same_content(&triple(Some("one"), 1)));
         assert!(triple(Some("a"), 1).same_content(&triple(Some("b"), 1)));

@@ -172,6 +172,7 @@ fn a_correction_was_never_true_but_was_known() {
                     predicate: w.lives_in,
                     object: ObjectDraft::Entity(w.place("Minsk")),
                     text: None,
+                    when: None,
                 },
                 mentions: vec![],
             }),
@@ -235,6 +236,7 @@ fn a_failed_transaction_writes_nothing() {
         predicate: w.lives_in,
         object: ObjectDraft::Entity(w.person("Bob")),
         text: None,
+        when: None,
     });
     let result = w.try_remember(vec![w.knows("Zed", "Rust"), bad]);
     assert!(matches!(result, Err(StoreError::TypeMismatch { .. })));
@@ -262,6 +264,7 @@ fn lives_in_user(w: &World, city: &str) -> FactDraft {
         predicate: w.lives_in,
         object: ObjectDraft::Entity(w.place(city)),
         text: None,
+        when: None,
     })
 }
 
@@ -292,6 +295,7 @@ fn a_fact_may_refer_to_an_entity_of_another_space() {
                 predicate: w.knows,
                 object: ObjectDraft::Value(Value::Text("Rust".into())),
                 text: None,
+                when: None,
             })
         }],
     )[0];
@@ -304,6 +308,7 @@ fn a_fact_may_refer_to_an_entity_of_another_space() {
         predicate: w.knows,
         object: ObjectDraft::Value(Value::Text("Go".into())),
         text: None,
+        when: None,
     }));
     let facts = w.memory.facts_about(user.id, View::Current);
     let spaces: Vec<_> = facts.iter().map(|f| f.space).collect();
@@ -325,6 +330,7 @@ fn one_new_cross_space_key_is_one_entity_within_a_transaction() {
                 predicate: w.knows,
                 object: ObjectDraft::Value(Value::Text("Go".into())),
                 text: None,
+                when: None,
             }),
         ],
     );
@@ -382,6 +388,7 @@ fn goal_with_text(w: &World, goal: &str, text: &str) -> FactDraft {
         predicate: w.goal,
         object: ObjectDraft::Value(Value::Text(goal.into())),
         text: Some(text.into()),
+        when: None,
     })
 }
 
@@ -422,6 +429,7 @@ fn the_same_value_with_another_text_is_unchanged() {
             predicate: w.knows,
             object: ObjectDraft::Value(Value::Text("Rust".into())),
             text: Some(text.into()),
+            when: None,
         })
     };
     let one = w.remember_one(knows("Anna knows Rust"));
@@ -694,6 +702,7 @@ fn concurrent_increments_lose_nothing() {
             predicate: w.counter,
             object: ObjectDraft::Value(Value::Int(n)),
             text: None,
+            when: None,
         })
     };
     let first = w.remember_one(counter(0, None));
@@ -721,6 +730,7 @@ fn concurrent_increments_lose_nothing() {
                                 predicate: w.counter,
                                 object: ObjectDraft::Value(Value::Int(n + 1)),
                                 text: None,
+                                when: None,
                             })
                         };
                         match w.try_remember(vec![draft]) {
@@ -766,4 +776,37 @@ fn concurrent_writers_create_one_entity() {
     let ids: Vec<EntityId> = workers.into_iter().map(|t| t.join().unwrap()).collect();
     assert!(ids.windows(2).all(|p| p[0] == p[1]), "{ids:?}");
     assert_eq!(w.memory.facts_about(ids[0], View::Current).len(), 16);
+}
+
+#[test]
+fn another_when_with_the_same_value_is_a_new_version() {
+    use tessar_core::model::{Interval, TimeSpan};
+    let w = World::new();
+    let plan = |from: i64, to: i64| {
+        FactDraft::new(BodyDraft::Triple {
+            subject: w.project("tessar"),
+            predicate: w.goal,
+            object: ObjectDraft::Value(Value::Text("vacation".into())),
+            text: None,
+            when: Some(TimeSpan::Range(Interval::new(ts(from), ts(to)).unwrap())),
+        })
+    };
+    let july = w.remember_one(plan(1_000, 2_000));
+    assert_eq!(july.outcome, Outcome::Created);
+    assert_eq!(
+        w.remember_one(plan(1_000, 2_000)).outcome,
+        Outcome::Unchanged
+    );
+    w.clock.set(ts(200));
+    let august = w.remember_one(plan(3_000, 4_000));
+    assert_eq!(
+        august.outcome,
+        Outcome::Superseded {
+            previous: july.fact
+        }
+    );
+    assert_eq!(
+        w.fact(august).body.when().unwrap(),
+        TimeSpan::Range(Interval::new(ts(3_000), ts(4_000)).unwrap())
+    );
 }

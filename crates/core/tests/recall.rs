@@ -268,6 +268,7 @@ fn a_query_entity_of_another_space_finds_facts_of_the_project() {
             predicate: w.knows,
             object: ObjectDraft::Value(Value::Text("Rust".into())),
             text: None,
+            when: None,
         })],
     );
     let user = w
@@ -289,4 +290,30 @@ fn a_query_entity_of_another_space_finds_facts_of_the_project() {
     let result = w.memory.recall(&query);
     assert_eq!(result.entities, [user]);
     assert_eq!(texts(&result.hits), ["Rust"]);
+}
+
+#[test]
+fn a_triple_with_when_is_found_by_the_window() {
+    use tessar_core::model::{TimeSpan, Value};
+    use tessar_core::store::{BodyDraft, FactDraft, ObjectDraft};
+    let w = World::new();
+    let trip = |who: &str, country: &str, from: i64, to: i64| {
+        FactDraft::new(BodyDraft::Triple {
+            subject: w.person(who),
+            predicate: w.knows,
+            object: ObjectDraft::Value(Value::Text(format!("trip to {country}"))),
+            text: None,
+            when: Some(TimeSpan::Range(Interval::new(ts(from), ts(to)).unwrap())),
+        })
+    };
+    w.remember_one(trip("Anna", "Japan", 3_000, 4_000));
+    w.clock.set(ts(200));
+    w.remember_one(trip("Bob", "Peru", 1_000, 2_000));
+
+    let mut march = Recall::new("trip");
+    march.window = Some(Interval::new(ts(3_000), ts(4_000)).unwrap());
+    let hits = w.memory.recall(&march).hits;
+    assert_eq!(hits[0].fact.entities(), [w.entity(w.person, "anna")]);
+    assert!(hits[0].why.in_window);
+    assert!(!hits[1].why.in_window);
 }

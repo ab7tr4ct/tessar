@@ -13,7 +13,7 @@ use std::sync::Arc;
 use tessar_core::clock::Clock;
 use tessar_core::model::{
     Cardinality, EntityId, EntityKindId, Fact, FactBody, Key, Name, Origin, PredicateDef,
-    PredicateId, SpaceId, SpaceKind, Timestamp, Value, ValueType,
+    PredicateId, SpaceId, SpaceKind, TimeSpan, Timestamp, Value, ValueType,
 };
 use tessar_core::store::{
     BodyDraft, EntityRef, EpisodeDraft, FactDraft, Memory, ObjectDraft, Outcome, PredicateDraft,
@@ -322,7 +322,6 @@ impl Tessar {
             .iter()
             .filter_map(|e| ok(&mut problems, self.resolve(e, space)))
             .collect();
-        let mut valid_from = None;
 
         let body = match f.kind {
             FactKind::Statement => {
@@ -357,8 +356,6 @@ impl Tessar {
                 }
             }
             FactKind::Attribute => {
-                // The value holds from the start of `when`.
-                valid_from = when.and_then(when::span_start);
                 let subject = match &f.subject {
                     Some(s) => ok(&mut problems, self.resolve(s, space)),
                     None => ok(
@@ -390,17 +387,14 @@ impl Tessar {
                         pred,
                         value,
                         text: text.clone(),
+                        when,
                     }),
                     _ => None,
                 }
             }
         };
         match (body, problems.is_empty()) {
-            (Some(body), true) => Ok(Pending {
-                body,
-                mentions,
-                valid_from,
-            }),
+            (Some(body), true) => Ok(Pending { body, mentions }),
             _ => Err(problems),
         }
     }
@@ -641,6 +635,7 @@ impl Tessar {
                 predicate,
                 object,
                 text,
+                ..
             } => match text.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
                 Some(t) => t.to_owned(),
                 None => {
@@ -883,6 +878,7 @@ enum PendingBody {
         pred: PredRef,
         value: String,
         text: Option<String>,
+        when: Option<TimeSpan>,
     },
 }
 
@@ -890,7 +886,6 @@ enum PendingBody {
 struct Pending {
     body: PendingBody,
     mentions: Vec<EntityRef>,
-    valid_from: Option<Timestamp>,
 }
 
 impl Pending {
@@ -903,6 +898,7 @@ impl Pending {
                 pred,
                 value,
                 text,
+                when,
             } => BodyDraft::Triple {
                 subject,
                 predicate: match pred {
@@ -911,12 +907,13 @@ impl Pending {
                 },
                 object: ObjectDraft::Value(Value::Text(value)),
                 text,
+                when,
             },
         };
         FactDraft {
             body,
             mentions: self.mentions,
-            valid_from: self.valid_from,
+            valid_from: None,
             expected_version: None,
         }
     }

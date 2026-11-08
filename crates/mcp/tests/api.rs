@@ -582,19 +582,20 @@ fn one_new_predicate_in_two_facts_is_defined_once() {
 }
 
 #[test]
-fn when_on_an_attribute_is_valid_from() {
+fn when_on_an_attribute_is_when_it_happens_not_when_it_holds() {
     let f = fixture();
     remember(
         &f,
         json!({"space": "user", "facts": [{
             "kind": "attribute", "subject": user(), "predicate": "lives_in", "value": "Lisbon",
-            "when": "2026-01-01", "text": "User lives in Lisbon"}]}),
+            "when": "2099-01-01", "text": "User lives in Lisbon"}]}),
     )
     .unwrap();
-    let found = recall(&f, json!({"query": "Lisbon", "as_of": "2026-02-01"})).unwrap();
+    // The value holds now, even though the thing it describes is in the future.
+    let found = recall(&f, json!({"query": "Lisbon"})).unwrap();
     assert!(found.contains("User lives in Lisbon"), "{found}");
-    let before = recall(&f, json!({"query": "Lisbon", "as_of": "2025-12-31"})).unwrap();
-    assert_eq!(before, "Nothing found.");
+    assert!(found.contains("(future: 2099-01-01)"), "{found}");
+    assert!(!found.contains("no longer current"), "{found}");
 }
 
 #[test]

@@ -72,6 +72,7 @@ fn memory_survives_a_restart() {
                 predicate: goal,
                 object: ObjectDraft::Value(Value::Text(text.into())),
                 text: None,
+                when: None,
             })],
         };
         let first = memory.remember(draft("graph database")).unwrap();
@@ -132,6 +133,7 @@ fn write_throughput_and_read_latency() {
             predicate: knows,
             object: ObjectDraft::Value(Value::Text(format!("skill {i}"))),
             text: None,
+            when: None,
         })],
     };
 
@@ -232,6 +234,7 @@ fn throughput_limits() {
             predicate: knows,
             object: ObjectDraft::Value(Value::Text(format!("skill {i}"))),
             text: None,
+            when: None,
         })
     }
     let origin = || Origin::Asserted { by: key("bench") };

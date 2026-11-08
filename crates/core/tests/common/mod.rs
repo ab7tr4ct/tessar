@@ -213,6 +213,7 @@ impl World {
             predicate: self.goal,
             object: ObjectDraft::Value(Value::Text(text.into())),
             text: None,
+            when: None,
         })
     }
 
@@ -222,6 +223,7 @@ impl World {
             predicate: self.lives_in,
             object: ObjectDraft::Entity(self.place(city)),
             text: None,
+            when: None,
         })
     }
 
@@ -231,6 +233,7 @@ impl World {
             predicate: self.knows,
             object: ObjectDraft::Value(Value::Text(what.into())),
             text: None,
+            when: None,
         })
     }
 

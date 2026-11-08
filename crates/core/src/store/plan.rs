@@ -432,6 +432,7 @@ impl<'s> Planner<'s> {
                 predicate,
                 object,
                 text,
+                when,
             } => {
                 let subject = self.resolve(&subject)?;
                 // A synonym is written under its canonical predicate; the
@@ -462,6 +463,7 @@ impl<'s> Planner<'s> {
                     predicate,
                     object,
                     text,
+                    when,
                 })
             }
         }
@@ -533,15 +535,22 @@ impl<'s> Planner<'s> {
                     predicate: p1,
                     subject: s1,
                     object: o1,
+                    when: w1,
                     ..
                 },
                 FactBody::Triple {
                     predicate: p2,
                     subject: s2,
                     object: o2,
+                    when: w2,
                     ..
                 },
-            ) => s1 == s2 && o1 == o2 && self.state.canonical(*p1) == self.state.canonical(*p2),
+            ) => {
+                s1 == s2
+                    && o1 == o2
+                    && w1 == w2
+                    && self.state.canonical(*p1) == self.state.canonical(*p2)
+            }
             _ => old.same_content(new),
         }
     }

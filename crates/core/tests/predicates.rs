@@ -110,6 +110,7 @@ fn set(w: &World, who: &str, predicate: PredicateId, text: &str) -> FactDraft {
         predicate,
         object: ObjectDraft::Value(Value::Text(text.into())),
         text: None,
+        when: None,
     })
 }
 
@@ -823,6 +824,7 @@ fn bodies_compare_by_canonical_predicate() {
                     predicate: w.goal,
                     object: ObjectDraft::Value(Value::Text("v2".into())),
                     text: None,
+                    when: None,
                 },
                 mentions: vec![],
             }),

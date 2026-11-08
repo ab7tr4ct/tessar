@@ -66,6 +66,9 @@ pub enum BodyDraft {
         object: ObjectDraft,
         /// The fact in one sentence, if the writer has one.
         text: Option<String>,
+        /// When the described thing happens in the world, if known; the
+        /// value holds from `valid_from` regardless.
+        when: Option<TimeSpan>,
     },
     /// An event.
     Event {

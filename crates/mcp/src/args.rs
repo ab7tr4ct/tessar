@@ -59,7 +59,7 @@ pub struct Fact {
     /// The fact in one self-contained sentence ("User plans a trip to Japan in May 2027"). Required for statement and event, strongly recommended for attribute: it is what later searches match.
     #[serde(default)]
     pub text: Option<String>,
-    /// When it happens: "YYYY-MM-DD", "YYYY-MM", "YYYY" or "YYYY-MM-DD/YYYY-MM-DD". Required for event, optional for statement. On an attribute it is when the value starts to hold (the fact is true from the start of that date).
+    /// When it happens: "YYYY-MM-DD", "YYYY-MM", "YYYY" or "YYYY-MM-DD/YYYY-MM-DD". Required for event, optional for statement. On an attribute it is when the described thing happens, e.g. the date of a planned trip; the value holds from now.
     #[serde(default)]
     pub when: Option<String>,
     /// Attribute only: who or what the property belongs to.
