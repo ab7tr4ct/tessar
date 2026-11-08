@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use tessar_core::embed::{Embedder, Prompts};
-use tessar_embed_candle::{Accel, CandleEmbedder, DType, Options};
+use tessar_embed_candle::{Accel, CandleEmbedder, DType, Joins, Options};
 use tessar_embed_llama::{LlamaEmbedder, Options as LlamaOptions, voyage_nano_path};
 
 fn home() -> PathBuf {
@@ -158,6 +158,10 @@ fn candle_vs_llama() {
         dtype,
         append_eos: env("CANDLE_EOS").as_deref() == Some("1"),
         fused: env("TESSAR_CANDLE_NO_SDPA").is_none(),
+        joins: Joins {
+            qkv: env("CANDLE_JOIN_QKV").is_some(),
+            gate_up: env("CANDLE_JOIN_GU").is_some(),
+        },
     };
 
     let mut reference = None;
