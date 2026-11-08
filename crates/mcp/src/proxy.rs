@@ -223,11 +223,24 @@ where
     Ok(open_with(stream, &Header::status_request()).await?.hello)
 }
 
-/// Whether a proxy should retire the daemon: only when the builds differ
-/// and the user did not ask to keep it. A daemon that reports no build
-/// counts as different.
+/// The build time in a build id `<version>+<git>.<unix time>`.
+fn build_stamp(id: &str) -> Option<u64> {
+    id.rsplit_once('.')?.1.parse().ok()
+}
+
+/// Whether a daemon of build `daemon` is newer than `ours`, by build time.
+/// False when the ids cannot be ordered.
+pub fn daemon_is_newer(ours: &str, daemon: &str) -> bool {
+    matches!((build_stamp(ours), build_stamp(daemon)), (Some(o), Some(d)) if d > o)
+}
+
+/// Whether a proxy should retire the daemon: only when the builds differ,
+/// the daemon is not newer than this binary (a newer one was started by
+/// another session's upgrade; restarting it would make two proxies fight
+/// over it) and the user did not ask to keep it. A daemon that reports no
+/// build counts as older.
 pub fn needs_restart(ours: &str, daemon: &str, keep_daemon: bool) -> bool {
-    !keep_daemon && ours != daemon
+    !keep_daemon && ours != daemon && !daemon_is_newer(ours, daemon)
 }
 
 /// Like [`connect_or_start`] followed by [`open`], and for a proxy: if the
@@ -244,6 +257,12 @@ pub async fn open_current(
     let opened = open(stream, project, cwd).await?;
     let theirs = opened.hello().build.clone();
     if !needs_restart(BUILD_ID, &theirs, keep_daemon) {
+        if !keep_daemon && daemon_is_newer(BUILD_ID, &theirs) {
+            eprintln!(
+                "tessar: the daemon is build {theirs}, this proxy is {BUILD_ID}; \
+                 serving through the newer daemon"
+            );
+        }
         return Ok(opened);
     }
     eprintln!(
@@ -442,6 +461,12 @@ mod tests {
         assert!(!needs_restart("a", "a", false));
         assert!(needs_restart("a", "b", false));
         assert!(needs_restart("a", "", false));
+        // Ids with build times: only an older daemon is retired.
+        let (old, new) = ("0.1.0+aaa.1000", "0.1.0+bbb.2000");
+        assert!(needs_restart(new, old, false));
+        assert!(!needs_restart(old, new, false));
+        assert!(!needs_restart(new, new, false));
+        assert!(daemon_is_newer(old, new) && !daemon_is_newer(new, old));
         // --keep-daemon never restarts.
         assert!(!needs_restart("a", "b", true));
         assert!(!needs_restart("a", "a", true));

@@ -84,7 +84,13 @@ the journal admits one process.
   that. The daemon's other sessions are closed by the shutdown, and Claude
   Code shows tessar as disconnected in those sessions until you reconnect
   (`/mcp`). `tessar mcp --keep-daemon` never restarts the daemon, for
-  debugging. Hooks never restart anything: on a different build they use the
+  debugging. A proxy retires only an older daemon (by build time): one that
+  meets a newer daemon, started by another session's upgrade, logs `serving
+  through the newer daemon` and uses it. A proxy survives daemon restarts and
+  upgrades: when its connection drops it reconnects at once (starting a daemon
+  if none runs), retries every 2 s while that fails, and answers calls made
+  meanwhile with an error for that call only; it exits only when its client
+  closes stdin. Hooks never restart anything: on a different build they use the
   daemon as it is and write `daemon build differs` to stderr.
 - **Upgrading from a daemon without the handshake.** Such a daemon sends no
   hello, so the proxy and the hooks give up after 5 s with an error. Stop it
