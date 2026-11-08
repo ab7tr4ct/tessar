@@ -116,3 +116,36 @@ fn kernels() {
         (candle_nn::ops::silu(&a).unwrap() * &a).unwrap()
     });
 }
+
+#[test]
+#[ignore = "needs GPU"]
+fn quantized_matmul() {
+    use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
+    let dev = Device::new_metal(0).unwrap();
+    let w = Tensor::randn(0f32, 0.05, (3072, 1024), &dev).unwrap();
+    let qw = QMatMul::from_qtensor(QTensor::quantize(&w, GgmlDType::Q8_0).unwrap()).unwrap();
+    for (rows, label) in [
+        (1usize, "1 row (mv kernel)"),
+        (40, "40 rows (one query)"),
+        (2560, "2560 rows (64 docs)"),
+    ] {
+        let x = Tensor::randn(0f32, 1.0, (1, rows, 1024), &dev).unwrap();
+        time(
+            &format!("Q8_0 QMatMul 1024->3072, {label}"),
+            2.0 * rows as f64 * 1024.0 * 3072.0,
+            || qw.forward(&x).unwrap(),
+        );
+    }
+    let lin = Linear::new(w.to_dtype(DType::F16).unwrap(), None);
+    for rows in [1usize, 40, 2560] {
+        let x = Tensor::randn(0f32, 1.0, (1, rows, 1024), &dev)
+            .unwrap()
+            .to_dtype(DType::F16)
+            .unwrap();
+        time(
+            &format!("f16 Linear 1024->3072, {rows} rows"),
+            2.0 * rows as f64 * 1024.0 * 3072.0,
+            || lin.forward(&x).unwrap(),
+        );
+    }
+}

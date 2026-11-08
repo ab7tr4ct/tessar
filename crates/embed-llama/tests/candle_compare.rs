@@ -11,7 +11,7 @@
 //!
 //! Knobs (environment): `CANDLE_DTYPE` (f16|bf16|f32), `CANDLE_DEVICE`
 //! (metal|cpu), `CANDLE_BATCH` (texts per forward pass), `CANDLE_EOS` (1 to
-//! append `<|endoftext|>`), `LLAMA_ONLY`/`CANDLE_ONLY` (1).
+//! append `<|endoftext|>`), `CANDLE_GGUF` (1 to load the Q8_0 GGUF), `LLAMA_ONLY`/`CANDLE_ONLY` (1).
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -28,7 +28,7 @@ fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty())
 }
 
-/// 100 short bilingual texts, 5-30 words, built from parts.
+/// 200 short bilingual texts, 5-30 words, built from parts.
 fn texts() -> Vec<String> {
     let en_subj = [
         "The release build of the journal crate",
@@ -69,7 +69,7 @@ fn texts() -> Vec<String> {
         "хранит периоды действия и неизменяемые версии, чтобы старые ответы можно было повторить",
     ];
     let mut out = Vec::new();
-    for i in 0..50 {
+    for i in 0..100 {
         out.push(format!(
             "{} {}.",
             en_subj[i % 8],
@@ -120,6 +120,15 @@ fn report(name: &str, texts: &[String], e: &dyn Embedder) -> Vec<Vec<f32>> {
     let b = bench(2, 10, |_| {
         e.embed_documents(&docs).unwrap();
     });
+    let bulk = bench(1, 3, |_| {
+        e.embed_documents(texts).unwrap();
+    });
+    println!(
+        "RESULT {name}: bulk {} texts p50 {:.0} ms = {:.0} texts/s",
+        texts.len(),
+        bulk.0,
+        texts.len() as f64 / (bulk.0 / 1000.0)
+    );
     println!(
         "RESULT {name}: query p50 {:.1} ms p95 {:.1} ms | batch64 p50 {:.0} ms p95 {:.0} ms",
         q.0, q.1, b.0, b.1
@@ -131,7 +140,7 @@ fn report(name: &str, texts: &[String], e: &dyn Embedder) -> Vec<Vec<f32>> {
 #[ignore = "needs GPU and model files"]
 fn candle_vs_llama() {
     let texts = texts();
-    assert_eq!(texts.len(), 100);
+    assert_eq!(texts.len(), 200);
 
     let dtype = match env("CANDLE_DTYPE").as_deref() {
         Some("bf16") => DType::BF16,
@@ -173,10 +182,16 @@ fn candle_vs_llama() {
     }
 
     let t = Instant::now();
-    let candle = CandleEmbedder::load(
-        &home().join(".tessar/models/voyage-4-nano-candle"),
-        &options,
-    )
+    let dir = home().join(".tessar/models/voyage-4-nano-candle");
+    let candle = if env("CANDLE_GGUF").is_some() {
+        CandleEmbedder::load_gguf(
+            voyage_nano_path().unwrap(),
+            dir.join("tokenizer.json"),
+            &options,
+        )
+    } else {
+        CandleEmbedder::load(&dir, &options)
+    }
     .unwrap()
     .with_prompts(Prompts::voyage());
     println!(

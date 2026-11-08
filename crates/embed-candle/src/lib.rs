@@ -35,6 +35,7 @@ pub struct Options {
     /// Device choice.
     pub device: Accel,
     /// Compute dtype (the weights are bf16 on disk and converted on load).
+    /// Ignored by `load_gguf`, which runs quantized weights on f32 activations.
     pub dtype: DType,
     /// Append `<|endoftext|>` to every text. The HF tokenizer does not.
     pub append_eos: bool,
@@ -147,6 +148,21 @@ impl CandleEmbedder {
         Self::assemble(model, tokenizer, device, options)
     }
 
+    /// Loads the quantized GGUF at `gguf` (the file llama.cpp uses) and the
+    /// tokenizer from `tokenizer_json`. Linear layers stay quantized and run
+    /// through `QMatMul`; norms are dequantized to f16.
+    pub fn load_gguf(
+        gguf: impl AsRef<Path>,
+        tokenizer_json: impl AsRef<Path>,
+        options: &Options,
+    ) -> Result<Self, EmbedError> {
+        let tokenizer = Tokenizer::from_file(tokenizer_json.as_ref()).map_err(err)?;
+        let device = pick_device(options.device)?;
+        let file = std::fs::File::open(gguf.as_ref()).map_err(err)?;
+        let model = model::Model::load_gguf(file, &device, options.fused).map_err(err)?;
+        Self::assemble(model, tokenizer, device, options)
+    }
+
     fn assemble(
         model: model::Model,
         mut tokenizer: Tokenizer,
@@ -241,9 +257,8 @@ impl CandleEmbedder {
                 // Padding is masked out, any valid id will do.
                 ids.extend(std::iter::repeat_n(0u32, pad));
             }
-            let ids = Tensor::from_vec(ids, (chunk.len(), len), &self.device).map_err(err)?;
             let valid = Tensor::from_vec(valid, (chunk.len(), len), &self.device).map_err(err)?;
-            let v = model.forward(&ids, &valid).map_err(err)?;
+            let v = model.forward(&ids, chunk.len(), len, &valid).map_err(err)?;
             let v = v.to_vec2::<f32>().map_err(err)?;
             for (&i, mut row) in chunk.iter().zip(v) {
                 normalize(&mut row)?;

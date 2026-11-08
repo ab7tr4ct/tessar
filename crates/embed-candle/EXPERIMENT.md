@@ -206,3 +206,70 @@ or as the fast path until the bulk gap closes. Concretely:
    ONNX) elsewhere.
 3. Keep `crates/embed-llama/tests/candle_compare.rs` as the gate: cosine >= 0.999 mean to the
    llama.cpp adapter on the same texts.
+
+## E15b step 1: Q8_0 weights straight from the GGUF
+
+`CandleEmbedder::load_gguf(gguf, tokenizer_json, &options)` reads the same
+`voyage-4-nano-Q8_0.gguf` llama.cpp uses through
+`candle_core::quantized::gguf_file`, so the 693 MB safetensors copy is not
+needed (the tokenizer still comes from `tokenizer.json`; candle has no GGUF
+tokenizer). Config is read from the `qwen3.*` metadata (`attention.causal`
+must be false, `pooling_type` must be 1 = mean).
+
+Tensor mapping (candle shapes are `[out, in]`; all linear weights are Q8_0,
+norms F32):
+
+| Model part | GGUF name | safetensors name | Handling |
+| --- | --- | --- | --- |
+| token embedding `[151936, 1024]` | `token_embd.weight` (Q8_0) | `model.embed_tokens.weight` | kept as raw Q8_0 bytes in host memory (165 MB); only the rows of the ids in use are dequantized per call |
+| q / k / v proj | `blk.N.attn_q/k/v.weight` | `...self_attn.{q,k,v}_proj` | `QMatMul` |
+| o proj `[1024, 2048]` | `blk.N.attn_output.weight` | `...self_attn.o_proj` | `QMatMul` |
+| q / k norm `[128]` | `blk.N.attn_q_norm/attn_k_norm.weight` | `...self_attn.{q,k}_norm` | dequantized (F32) |
+| input / post-attn norm | `blk.N.attn_norm.weight`, `blk.N.ffn_norm.weight` | `input_layernorm`, `post_attention_layernorm` | dequantized (F32) |
+| gate / up / down | `blk.N.ffn_gate/up/down.weight` | `...mlp.{gate,up,down}_proj` | `QMatMul` |
+| final norm | `output_norm.weight` | `model.norm.weight` | dequantized |
+| **1024 -> 2048 projection** | **`dense_2.weight`** (Q8_0 `[2048, 1024]`) | `linear.weight` | `QMatMul` |
+
+The token embedding is a gather, which candle has no op for on `QTensor`, so
+the Q8_0 table (34 bytes per 32 values: f16 scale + 32 `i8`) stays on the CPU
+and the needed rows are dequantized by hand (about 15 lines, `half` for the
+scale). Costs nothing measurable per call and saves 450+ MB against a
+dequantized table.
+
+Which Metal path `QMatMul` takes (candle-core 0.11.1 `quantized/metal.rs`):
+one input row goes to `call_quantized_matmul_mv_t`; more than one row goes to
+`call_quantized_matmul_mm_t`, a dedicated quantized matrix-matrix kernel. The
+weights are **not** dequantized to f16 for batches. The input has to be f32
+and contiguous, the output is f32, so the whole model runs on f32
+activations in this mode. Micro-benchmark (1024 -> 3072): Q8_0 `QMatMul`
+2560 rows 4.18 ms (3.85 TFLOPS) vs f16 `Linear` 3.39 ms (4.75 TFLOPS); 40
+rows 0.19 ms vs 0.35 ms (faster); 1 row 0.05 ms vs 0.07 ms. The kernel is
+not the problem.
+
+Measured on the same 200 texts against llama.cpp (raw numbers:
+`evals/runs/e15b/step1-q8.md`):
+
+| | llama.cpp Q8_0 | candle GGUF Q8_0 | candle safetensors f16 |
+| --- | --- | --- | --- |
+| cosine to llama.cpp, mean / min | - | 1.00000 / 1.00000 | 0.99992 / 0.99987 |
+| max RSS | 737 MB (footprint 339 MB) | **674 MB** (footprint 665 MB) | 1122 MB (footprint 2475 MB) |
+| query p50 / p95 | 10.1 / 10.6 ms | 17.6 / 20.2 ms | 16.0 / 17.8 ms |
+| bulk (200 texts) | 241 texts/s | 81 texts/s | 106 texts/s |
+| 64 docs p50 | 264 ms | 807 ms | 625 ms |
+| load | 0.25-0.5 s | 0.7 s | 1.0 s |
+
+Criteria, fixed in advance: cosine >= 0.999 (pass: identical weights give
+1.00000), RSS <= 1 GB (pass: 674 MB), query p95 <= 1.5x llama.cpp (**fail**:
+1.9x), bulk <= 2x llama.cpp (**fail**: 3.0x slower).
+
+Reading: memory and quality are solved by taking Q8_0 straight from the
+GGUF. Speed got worse than f16 safetensors (query p95 17.8 -> 20.2 ms, bulk
+106 -> 81 texts/s) while the quantized matmul itself is as fast as dense
+f16; the loss is that `QMatMul` forces f32 activations, so every non-matmul
+op (norms, RoPE, SwiGLU, sdpa, residual adds, copies) moves twice the bytes.
+Step 2 candidates: keep activations in f16 and cast only at the 7 `QMatMul`
+inputs/outputs per layer (casts are cheap element-wise ops, but add
+dispatches), or fuse norm + cast; merge Q/K/V into one `QMatMul` by
+concatenating the quantized rows (needs `QTensor` concatenation, which is not
+a public op, so repacking Q8_0 blocks by hand); reduce dispatch count
+(about 16 ms floor per forward pass is what bounds the query).
