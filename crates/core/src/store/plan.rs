@@ -140,6 +140,38 @@ impl<'s> Planner<'s> {
         })
     }
 
+    /// Plans the permanent removal of a fact version's content. A current
+    /// version is closed first as a correction without a successor, so a
+    /// single-valued pair is free for a new value and a closed version is
+    /// never left looking current.
+    ///
+    /// Works in an archived space too: removing something that must not
+    /// be kept is not a write of new memory.
+    pub(crate) fn redact(&mut self, fact: FactId) -> Result<(), StoreError> {
+        let f = self.state.fact(fact).ok_or(StoreError::UnknownFact(fact))?;
+        if f.is_redacted() {
+            return Err(StoreError::AlreadyRedacted(fact));
+        }
+        if f.is_current() {
+            self.close(fact, Ending::Corrected, None);
+        }
+        self.ops.push(Op::Redact { fact });
+        Ok(())
+    }
+
+    /// Plans blanking the text of an episode.
+    pub(crate) fn redact_episode(&mut self, episode: EpisodeId) -> Result<(), StoreError> {
+        let e = self
+            .state
+            .episode(episode)
+            .ok_or(StoreError::UnknownEpisode(episode))?;
+        if e.text.is_empty() {
+            return Err(StoreError::EpisodeAlreadyRedacted(episode));
+        }
+        self.ops.push(Op::RedactEpisode { episode });
+        Ok(())
+    }
+
     pub(crate) fn update(&mut self, update: Update) -> Result<Recorded, StoreError> {
         let state = self.state;
         let head = state

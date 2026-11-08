@@ -23,6 +23,20 @@ impl SharedLog {
     pub fn commits(&self) -> usize {
         self.0.lock().unwrap().commits().len()
     }
+
+    /// Every commit appended so far.
+    pub fn snapshot(&self) -> Vec<Commit<Op>> {
+        self.0.lock().unwrap().commits().to_vec()
+    }
+
+    /// A log that already holds `commits`.
+    pub fn from_commits(commits: Vec<Commit<Op>>) -> Self {
+        let log = Self::default();
+        for commit in &commits {
+            log.0.lock().unwrap().append(commit).unwrap();
+        }
+        log
+    }
 }
 
 impl Log<Op> for SharedLog {

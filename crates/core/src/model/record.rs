@@ -125,13 +125,22 @@ pub enum FactBody {
         /// When.
         when: TimeSpan,
     },
+    /// The content was removed for good (see `Memory::redact`). The
+    /// version stays in its chain with its ids and times, but says nothing
+    /// and is never returned by a read or a recall.
+    Redacted,
 }
 
 impl FactBody {
+    /// Whether the content was removed by a redaction.
+    pub fn is_redacted(&self) -> bool {
+        matches!(self, Self::Redacted)
+    }
+
     /// Entities referenced by the content, in order of appearance.
     pub fn entities(&self) -> Vec<EntityId> {
         match self {
-            Self::Statement { .. } => Vec::new(),
+            Self::Statement { .. } | Self::Redacted => Vec::new(),
             Self::Triple {
                 subject,
                 object: Value::Entity(object),
@@ -186,7 +195,7 @@ impl FactBody {
                 object: Value::Span(span),
                 ..
             } => Some(*span),
-            Self::Triple { .. } => None,
+            Self::Triple { .. } | Self::Redacted => None,
         }
     }
 }
@@ -253,6 +262,11 @@ impl Fact {
     /// Whether this is the current version.
     pub fn is_current(&self) -> bool {
         self.end.is_none()
+    }
+
+    /// Whether the content was removed by a redaction.
+    pub fn is_redacted(&self) -> bool {
+        self.body.is_redacted()
     }
 
     /// The next version, if any.

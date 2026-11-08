@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::model::{
-    Entity, EntityId, EntityKindDef, Episode, Fact, FactEnd, FactId, Key, PredicateDef,
+    Entity, EntityId, EntityKindDef, Episode, EpisodeId, Fact, FactEnd, FactId, Key, PredicateDef,
     PredicateId, Space,
 };
 
@@ -54,5 +54,24 @@ pub enum Op {
         fact: FactId,
         /// How and when it was closed.
         end: FactEnd,
+    },
+    /// Removes the content of a fact version for good: its body becomes
+    /// [`FactBody::Redacted`](crate::model::FactBody::Redacted), its
+    /// mentions and episode link are dropped, and it leaves the keyword,
+    /// entity and meaning indexes. Ids, chain links, times and the ending
+    /// stay.
+    ///
+    /// Replay accepts a fact that is already redacted (a purged journal
+    /// has the content gone before this op), so applying it twice is a
+    /// no-op; the planner still refuses to redact twice.
+    Redact {
+        /// The version to redact.
+        fact: FactId,
+    },
+    /// Blanks the text of an episode; the record and its id stay. Like
+    /// [`Op::Redact`], harmless to apply twice.
+    RedactEpisode {
+        /// The episode to blank.
+        episode: EpisodeId,
     },
 }

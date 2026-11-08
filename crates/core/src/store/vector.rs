@@ -95,10 +95,39 @@ impl VectorIndex {
         Ok(())
     }
 
+    /// Adds a cleared slot for the next fact: it has no vector, like a
+    /// fact that was cleared after being indexed.
+    pub(crate) fn push_blank(&mut self, fact: FactId) -> Result<(), String> {
+        if fact.index() != self.len() {
+            return Err(format!(
+                "vector index expected fact {}, got {fact}",
+                self.len()
+            ));
+        }
+        self.values.resize(self.values.len() + self.dims, 0);
+        self.scales.push(0.0);
+        Ok(())
+    }
+
+    /// Erases the vector of a fact: its values are zeroed and
+    /// [`VectorIndex::similarity`] returns `None` from now on. A real
+    /// vector never has a zero scale, so a zero scale marks the cleared
+    /// slot. An unknown fact is ignored.
+    pub(crate) fn clear(&mut self, fact: FactId) {
+        let i = fact.index();
+        if let Some(scale) = self.scales.get_mut(i) {
+            *scale = 0.0;
+            self.values[i * self.dims..(i + 1) * self.dims].fill(0);
+        }
+    }
+
     /// Cosine similarity of a fact to a query, if the fact has a vector.
     pub(crate) fn similarity(&self, query: &Quantized, fact: FactId) -> Option<f32> {
         let i = fact.index();
         let scale = *self.scales.get(i)?;
+        if scale == 0.0 {
+            return None;
+        }
         let v = &self.values[i * self.dims..(i + 1) * self.dims];
         Some(dot_i8(&query.values, v) as f32 * scale * query.scale)
     }
@@ -216,6 +245,23 @@ mod tests {
         assert!(Quantized::new(&[0.0, 0.0], 2).is_err(), "zero");
         assert!(Quantized::new(&[1.0, f32::NAN], 2).is_err(), "NaN");
         assert!(Quantized::new(&[f32::INFINITY], 1).is_err(), "infinite");
+    }
+
+    #[test]
+    fn a_cleared_vector_has_no_similarity_and_no_values() {
+        let q = Quantized::new(&[1.0, 2.0], 2).unwrap();
+        let mut index = VectorIndex::new(2);
+        index.push(FactId::new(0), q.clone()).unwrap();
+        index.push(FactId::new(1), q.clone()).unwrap();
+        assert!(index.similarity(&q, FactId::new(0)).unwrap() > 0.99);
+        index.clear(FactId::new(0));
+        assert_eq!(index.similarity(&q, FactId::new(0)), None);
+        assert!(index.similarity(&q, FactId::new(1)).unwrap() > 0.99);
+        assert_eq!(&index.values[..2], &[0, 0]);
+        // Slots stay dense: a blank slot takes the next id.
+        index.push_blank(FactId::new(2)).unwrap();
+        assert_eq!(index.similarity(&q, FactId::new(2)), None);
+        index.clear(FactId::new(9)); // unknown: ignored
     }
 
     #[test]

@@ -11,6 +11,7 @@ mod memory;
 mod op;
 mod plan;
 mod predicate;
+mod purge;
 mod recall;
 mod state;
 mod text;
@@ -23,4 +24,5 @@ pub use draft::{
 pub use error::{NotUniversal, StoreError};
 pub use memory::{Memory, Semantic};
 pub use op::Op;
+pub use purge::{PurgeReport, purge, purge_with_report};
 pub use recall::{Channels, Hit, Recall, Recalled, Why};

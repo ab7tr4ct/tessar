@@ -26,8 +26,19 @@
 //!
 //! The file is locked for the life of the [`FileJournal`]. A second open,
 //! from this process or another, fails with [`LogError::Locked`].
+//!
+//! # Rewriting
+//!
+//! The journal is append-only in normal operation. [`FileJournal::rewrite`]
+//! is the one exception, for purging redacted content: it replays the
+//! file, lets a closure change the commits, writes the result to
+//! `<file>.tmp`, syncs it and renames it over the original. The temporary
+//! file is never read on open, so one left by a crash is ignored and
+//! overwritten by the next rewrite. The journal must not be open anywhere
+//! else, including in the calling process.
 
-use std::fs::{File, OpenOptions, TryLockError};
+use std::ffi::OsString;
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
@@ -37,6 +48,19 @@ use tessar_core::log::{Commit, Log, LogError, Seq};
 
 /// The first line of every journal file.
 const HEADER: &[u8] = b"tessar-journal 1\n";
+
+/// What [`FileJournal::rewrite`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RewriteReport {
+    /// Commits in the journal before.
+    pub commits_before: usize,
+    /// Commits in the journal after.
+    pub commits_after: usize,
+    /// File size before, in bytes.
+    pub bytes_before: u64,
+    /// File size after, in bytes.
+    pub bytes_after: u64,
+}
 
 /// A journal of commits with operations of type `T`, kept in one file.
 #[derive(Debug)]
@@ -92,6 +116,89 @@ impl<T: Serialize + DeserializeOwned> FileJournal<T> {
             recovered: Some(commits),
             cut_on_open,
             poisoned: false,
+        })
+    }
+
+    /// Rewrites the journal at `path`: reads every commit, passes them to
+    /// `f` and replaces the file with what `f` returns. Commit numbers in
+    /// the result must run from 1 with no gaps, or nothing is changed and
+    /// the call fails with [`LogError::OutOfOrder`].
+    ///
+    /// Takes the file lock, so it fails with [`LogError::Locked`] while
+    /// anything else has the journal open. A torn write at the end of the
+    /// old file is dropped, as on open. The new file is written next to
+    /// the old one as `<name>.tmp`, with fresh checksums, and synced; then
+    /// it is renamed over the old file and the directory is synced. A
+    /// crash before the rename leaves the old journal untouched; after it,
+    /// the new one is complete.
+    ///
+    /// The file must exist.
+    pub fn rewrite(
+        path: impl AsRef<Path>,
+        f: impl FnOnce(Vec<Commit<T>>) -> Vec<Commit<T>>,
+    ) -> Result<RewriteReport, LogError> {
+        let path = path.as_ref();
+        let mut file = OpenOptions::new().read(true).append(true).open(path)?;
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => return Err(LogError::Locked),
+            Err(TryLockError::Error(err)) => return Err(err.into()),
+        }
+        let mut bytes = Vec::new();
+        file.seek(SeekFrom::Start(0))?;
+        file.read_to_end(&mut bytes)?;
+        let commits_before;
+        let commits = {
+            let Scan { commits, .. } = scan::<T>(&bytes)?;
+            commits_before = commits.len();
+            f(commits)
+        };
+
+        let mut expected = Seq::FIRST;
+        let mut out = HEADER.to_vec();
+        for commit in &commits {
+            if commit.seq != expected {
+                return Err(LogError::OutOfOrder {
+                    expected,
+                    got: commit.seq,
+                });
+            }
+            expected = expected.next();
+            out.extend_from_slice(&encode_line(commit)?);
+        }
+
+        let mut tmp_name: OsString = path
+            .file_name()
+            .ok_or_else(|| std::io::Error::other("the journal path has no file name"))?
+            .to_owned();
+        tmp_name.push(".tmp");
+        let tmp = path.with_file_name(tmp_name);
+        let written = (|| {
+            let mut new = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp)?;
+            new.write_all(&out)?;
+            new.sync_all()?;
+            fs::rename(&tmp, path)?;
+            // Make the rename itself durable.
+            let dir = match path.parent() {
+                Some(dir) if !dir.as_os_str().is_empty() => dir,
+                _ => Path::new("."),
+            };
+            File::open(dir)?.sync_all()
+        })();
+        if let Err(err) = written {
+            // Best effort: do not leave a half-written temporary file.
+            let _ = fs::remove_file(&tmp);
+            return Err(err.into());
+        }
+        Ok(RewriteReport {
+            commits_before,
+            commits_after: commits.len(),
+            bytes_before: bytes.len() as u64,
+            bytes_after: out.len() as u64,
         })
     }
 

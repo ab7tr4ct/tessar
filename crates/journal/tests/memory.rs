@@ -395,3 +395,76 @@ fn throughput_limits() {
         );
     }
 }
+
+#[test]
+fn purging_the_journal_removes_redacted_text_from_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("journal.log");
+    let clock = Arc::new(ManualClock::new(Timestamp::from_millis(100)));
+
+    let (secret, kept) = {
+        let memory = Memory::open(FileJournal::<Op>::open(&path).unwrap(), clock.clone()).unwrap();
+        let space = memory
+            .create_space(key("tessar"), SpaceKind::LongTerm, None)
+            .unwrap();
+        let project = memory.define_kind(space, name("project")).unwrap();
+        let goal = memory
+            .define_predicate(
+                space,
+                predicate("goal", ValueType::Text, Cardinality::Single),
+            )
+            .unwrap();
+        let triple = |value: &str| FactDraft {
+            body: BodyDraft::Triple {
+                subject: EntityRef::Key {
+                    kind: project,
+                    key: key("tessar"),
+                },
+                predicate: goal,
+                object: ObjectDraft::Value(Value::Text(value.into())),
+                text: None,
+                when: None,
+            },
+            mentions: Vec::new(),
+            valid_from: None,
+            expected_version: None,
+        };
+        let write = |fact: FactDraft| {
+            memory
+                .remember(Remember {
+                    space,
+                    origin: Origin::Asserted { by: key("test") },
+                    episode: None,
+                    facts: vec![fact],
+                })
+                .unwrap()
+                .facts[0]
+                .fact
+        };
+        let secret = write(triple("the vault code is hunter2"));
+        clock.advance(10);
+        let kept = write(triple("a memory engine"));
+        memory.redact(secret).unwrap();
+        (secret, kept)
+    };
+    let find = |needle: &str| {
+        std::fs::read(&path)
+            .unwrap()
+            .windows(needle.len())
+            .any(|w| w == needle.as_bytes())
+    };
+    assert!(
+        find("hunter2"),
+        "redaction alone leaves the text in the file"
+    );
+
+    let report = FileJournal::<Op>::rewrite(&path, tessar_core::store::purge).unwrap();
+    assert_eq!(report.commits_before, report.commits_after);
+    assert!(report.bytes_after < report.bytes_before);
+    assert!(!find("hunter2"));
+    assert!(find("a memory engine"));
+
+    let memory = Memory::open(FileJournal::<Op>::open(&path).unwrap(), clock).unwrap();
+    assert_eq!(memory.fact(secret).unwrap().body, FactBody::Redacted);
+    assert_eq!(text(&memory.fact(kept).unwrap()), "a memory engine");
+}

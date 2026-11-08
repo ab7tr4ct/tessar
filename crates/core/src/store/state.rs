@@ -10,8 +10,8 @@ use super::op::Op;
 use super::text::{TextIndex, fact_text};
 use super::vector::{PredicateVectors, Quantized, VectorIndex};
 use crate::model::{
-    Entity, EntityId, EntityKindDef, EntityKindId, Episode, Fact, FactBody, FactId, Lineage, Name,
-    PredicateDef, PredicateId, Space, SpaceId, ValueType,
+    Entity, EntityId, EntityKindDef, EntityKindId, Episode, EpisodeId, Fact, FactBody, FactId,
+    Lineage, Name, PredicateDef, PredicateId, Space, SpaceId, ValueType,
 };
 
 #[derive(Debug, Default)]
@@ -71,6 +71,10 @@ impl State {
 
     pub(crate) fn fact(&self, id: FactId) -> Option<&Fact> {
         self.facts.get(id.index())
+    }
+
+    pub(crate) fn episode(&self, id: EpisodeId) -> Option<&Episode> {
+        self.episodes.get(id.index())
     }
 
     pub(crate) fn len(&self) -> Lens {
@@ -204,6 +208,16 @@ impl State {
         index.push(fact, vector)
     }
 
+    /// Adds a cleared vector slot for the next fact, which has no content
+    /// to embed (a redacted one).
+    pub(crate) fn push_blank_vector(&mut self, fact: FactId) -> Result<(), String> {
+        let index = self.vectors.as_mut().ok_or("the meaning channel is off")?;
+        if fact.index() >= self.facts.len() {
+            return Err(format!("vector for unknown fact {fact}"));
+        }
+        index.push_blank(fact)
+    }
+
     pub(crate) fn facts_of(&self, entity: EntityId) -> &[FactId] {
         self.facts_by_entity
             .get(entity.index())
@@ -296,7 +310,44 @@ impl State {
                 }
                 f.end = Some(end);
             }
+            Op::Redact { fact } => self.redact_fact(fact)?,
+            Op::RedactEpisode { episode } => {
+                self.episodes
+                    .get_mut(episode.index())
+                    .ok_or_else(|| format!("unknown episode {episode}"))?
+                    .text
+                    .clear();
+            }
         }
+        Ok(())
+    }
+
+    /// Removes the content of a fact version and every trace of it from
+    /// the indexes. The record, its chain links, times and ending stay;
+    /// `pairs` and `heads` are about the structure of lineages and stay too.
+    ///
+    /// A fact that is already redacted is left alone: a purged journal has
+    /// the content gone before the `Redact` op comes up.
+    fn redact_fact(&mut self, id: FactId) -> Result<(), String> {
+        let fact = self.fact(id).ok_or_else(|| format!("unknown fact {id}"))?;
+        if fact.is_redacted() {
+            return Ok(());
+        }
+        let text = fact_text(self, fact);
+        let entities = fact.entities();
+        self.text.remove(id, &text);
+        for e in entities {
+            if let Some(list) = self.facts_by_entity.get_mut(e.index()) {
+                list.retain(|&f| f != id);
+            }
+        }
+        if let Some(vectors) = &mut self.vectors {
+            vectors.clear(id);
+        }
+        let fact = &mut self.facts[id.index()];
+        fact.body = FactBody::Redacted;
+        fact.mentions.clear();
+        fact.episode = None;
         Ok(())
     }
 
@@ -425,6 +476,23 @@ impl State {
                 .entry((*subject, predicate))
                 .or_default()
                 .push(fact.lineage);
+        } else if fact.version > NonZeroU32::MIN
+            && let FactBody::Triple {
+                subject, predicate, ..
+            } = &fact.body
+            && self
+                .fact(fact.lineage.first())
+                .is_some_and(Fact::is_redacted)
+        {
+            // The first version was redacted before it got here (a purged
+            // journal): this version tells the pair, so the lineage is
+            // still found. Ordered by first version like after a merge.
+            let predicate = self.canonical(*predicate);
+            let lineages = self.pairs.entry((*subject, predicate)).or_default();
+            if !lineages.contains(&fact.lineage) {
+                let at = lineages.partition_point(|l| l.first() < fact.lineage.first());
+                lineages.insert(at, fact.lineage);
+            }
         }
         self.facts.push(fact);
         Ok(())

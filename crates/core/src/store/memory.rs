@@ -16,8 +16,8 @@ use crate::clock::Clock;
 use crate::embed::{EmbedError, Embedder};
 use crate::log::{Commit, Log};
 use crate::model::{
-    Entity, EntityId, EntityKindId, Fact, FactId, Key, Lineage, Name, PredicateDef, PredicateId,
-    Space, SpaceId, SpaceKind, Timestamp,
+    Entity, EntityId, EntityKindId, Episode, EpisodeId, Fact, FactId, Key, Lineage, Name,
+    PredicateDef, PredicateId, Space, SpaceId, SpaceKind, Timestamp,
 };
 
 /// How many texts go to the embedder in one call when the memory opens.
@@ -153,20 +153,33 @@ impl Memory {
                     next += 1;
                 }
             }
-            let (ids, texts): (Vec<FactId>, Vec<String>) = state
+            // Redacted facts have nothing to embed: they get a cleared slot.
+            let texts: Vec<String> = state
                 .facts()
                 .iter()
-                .map(|f| (f.id, fact_text(&state, f)))
-                .unzip();
-            // Chunk ids and texts together: zipping a shared iterator over
-            // ids with each batch of vectors would consume one id per
-            // batch boundary.
-            for (ids, texts) in ids.chunks(EMBED_BATCH).zip(texts.chunks(EMBED_BATCH)) {
-                for (fact, vector) in ids.iter().zip(embed_texts(semantic, texts)?) {
-                    state
-                        .push_vector(*fact, vector)
-                        .map_err(StoreError::Internal)?;
+                .filter(|f| !f.is_redacted())
+                .map(|f| fact_text(&state, f))
+                .collect();
+            let mut vectors = Vec::with_capacity(texts.len());
+            for batch in texts.chunks(EMBED_BATCH) {
+                vectors.extend(embed_texts(semantic, batch)?);
+            }
+            let ids: Vec<(FactId, bool)> = state
+                .facts()
+                .iter()
+                .map(|f| (f.id, f.is_redacted()))
+                .collect();
+            let mut vectors = vectors.into_iter();
+            for (fact, redacted) in ids {
+                if redacted {
+                    state.push_blank_vector(fact)
+                } else {
+                    let vector = vectors.next().ok_or_else(|| {
+                        StoreError::Internal("fewer vectors than facts".to_owned())
+                    })?;
+                    state.push_vector(fact, vector)
                 }
+                .map_err(StoreError::Internal)?;
             }
         }
         Ok(Self {
@@ -340,6 +353,31 @@ impl Memory {
         self.write(|p| p.update(update))
     }
 
+    /// Removes the content of a fact version for good: its text leaves
+    /// the keyword, entity and meaning indexes, and the version stays in
+    /// its chain as [`FactBody::Redacted`](crate::model::FactBody::Redacted)
+    /// with its id and times. A current version is closed first as a
+    /// correction without a successor, so a single-valued pair accepts a
+    /// new value afterwards.
+    ///
+    /// The text stays in the journal file until `purge`
+    /// rewrites it. Fails if the fact is unknown or already redacted.
+    pub fn redact(&self, fact: FactId) -> Result<(), StoreError> {
+        self.write(|p| p.redact(fact))
+    }
+
+    /// Blanks the text of an episode; the record and its id stay. Facts
+    /// taken from it keep their link until they are redacted themselves.
+    /// Fails if the episode is unknown or already blank.
+    pub fn redact_episode(&self, episode: EpisodeId) -> Result<(), StoreError> {
+        self.write(|p| p.redact_episode(episode))
+    }
+
+    /// An episode by id.
+    pub fn episode(&self, id: EpisodeId) -> Option<Episode> {
+        self.state().episode(id).cloned()
+    }
+
     /// A space by id.
     pub fn space(&self, id: SpaceId) -> Option<Space> {
         self.state().space(id).cloned()
@@ -391,7 +429,7 @@ impl Memory {
     pub fn current(&self, lineage: Lineage) -> Option<Fact> {
         self.state()
             .head(lineage)
-            .filter(|f| f.is_current())
+            .filter(|f| f.is_current() && !f.is_redacted())
             .cloned()
     }
 
@@ -458,7 +496,7 @@ impl Memory {
             .lineages_of_pair(subject, predicate)
             .iter()
             .filter_map(|&l| state.head(l))
-            .filter(|f| f.is_current())
+            .filter(|f| f.is_current() && !f.is_redacted())
             .cloned()
             .collect()
     }

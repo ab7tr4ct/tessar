@@ -3,7 +3,7 @@
 //! No stemming yet: "решили" and "решение" are different words (known
 //! trade-off; a stemmer or `tantivy` comes when measurements ask for it).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::state::State;
 use crate::model::{Entity, Fact, FactBody, FactId, Value};
@@ -97,6 +97,8 @@ pub(crate) fn fact_text_with(state: &State, fact: &Fact, new: &[&Entity]) -> Str
             parts.push(text.clone());
             parts.extend(participants.iter().map(|&p| key(p).to_owned()));
         }
+        // Redacted content has no text.
+        FactBody::Redacted => {}
         FactBody::Triple {
             subject,
             predicate,
@@ -159,6 +161,30 @@ impl TextIndex {
         self.lengths.push(length);
         self.total_length += u64::from(length);
         Ok(())
+    }
+
+    /// Removes a fact from the index. `old_text` is the text it was added
+    /// with. The fact keeps its slot with length 0, so ids stay dense and
+    /// the index equals one built from an empty text. An unknown fact is
+    /// ignored.
+    pub(crate) fn remove(&mut self, fact: FactId, old_text: &str) {
+        let Some(length) = self.lengths.get_mut(fact.index()) else {
+            return;
+        };
+        let mut seen = HashSet::new();
+        for word in words(old_text) {
+            if !seen.insert(word.clone()) {
+                continue;
+            }
+            if let Some(list) = self.postings.get_mut(&word) {
+                list.retain(|&(f, _)| f != fact);
+                if list.is_empty() {
+                    self.postings.remove(&word);
+                }
+            }
+        }
+        self.total_length -= u64::from(*length);
+        *length = 0;
     }
 
     /// BM25 score of every fact containing at least one of `terms`.
@@ -322,6 +348,26 @@ mod tests {
     #[test]
     fn triple_text_without_a_sentence_is_the_structured_form() {
         assert_eq!(triple_text(None), "Bob team lead of five engineers");
+    }
+
+    #[test]
+    fn removed_fact_leaves_the_index_like_an_empty_one() {
+        let mut index = TextIndex::default();
+        index.add(FactId::new(0), "memory engine in rust").unwrap();
+        index.add(FactId::new(1), "secret rust secret").unwrap();
+        index.add(FactId::new(2), "graph engine").unwrap();
+        index.remove(FactId::new(1), "secret rust secret");
+
+        let mut expected = TextIndex::default();
+        expected
+            .add(FactId::new(0), "memory engine in rust")
+            .unwrap();
+        expected.add(FactId::new(1), "").unwrap();
+        expected.add(FactId::new(2), "graph engine").unwrap();
+        assert_eq!(index.postings, expected.postings);
+        assert_eq!(index.lengths, expected.lengths);
+        assert_eq!(index.total_length, expected.total_length);
+        assert!(index.search(&["secret".to_owned()]).is_empty());
     }
 
     #[test]

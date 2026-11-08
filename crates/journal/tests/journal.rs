@@ -259,3 +259,112 @@ proptest! {
         prop_assert_eq!(journal.replay().unwrap(), commits);
     }
 }
+
+fn tmp_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap().to_owned();
+    name.push(".tmp");
+    path.with_file_name(name)
+}
+
+#[test]
+fn rewrite_through_identity_changes_nothing() {
+    let mut dir = Dir::new();
+    let path = dir.fresh_path();
+    let before = write_journal(&path, &sample());
+    let report = FileJournal::<u32>::rewrite(&path, |commits| commits).unwrap();
+    assert_eq!(report.commits_before, 4);
+    assert_eq!(report.commits_after, 4);
+    assert_eq!(report.bytes_before, before.len() as u64);
+    assert_eq!(report.bytes_after, before.len() as u64);
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        before,
+        "same bytes, same checksums"
+    );
+    assert!(!tmp_path(&path).exists());
+    assert_eq!(open(&path).unwrap().replay().unwrap(), sample());
+}
+
+#[test]
+fn rewrite_stores_the_changed_payload_with_fresh_checksums() {
+    let mut dir = Dir::new();
+    let path = dir.fresh_path();
+    write_journal(&path, &sample());
+    FileJournal::<u32>::rewrite(&path, |mut commits| {
+        commits[2].ops = vec![33, 34];
+        commits
+    })
+    .unwrap();
+
+    let mut expected = sample();
+    expected[2].ops = vec![33, 34];
+    let mut journal = open(&path).unwrap();
+    assert_eq!(journal.cut_on_open(), 0);
+    assert_eq!(journal.replay().unwrap(), expected);
+    // The journal goes on from where it was.
+    journal.append(&commit(5, &[9])).unwrap();
+}
+
+#[test]
+fn rewrite_refuses_a_journal_that_is_open() {
+    let mut dir = Dir::new();
+    let path = dir.fresh_path();
+    let before = write_journal(&path, &sample());
+    let journal = open(&path).unwrap();
+    let err = FileJournal::<u32>::rewrite(&path, |_| Vec::new()).unwrap_err();
+    assert!(matches!(err, LogError::Locked), "{err}");
+    drop(journal);
+    assert_eq!(fs::read(&path).unwrap(), before);
+    assert!(!tmp_path(&path).exists());
+}
+
+#[test]
+fn rewrite_refuses_commits_that_do_not_count_from_one() {
+    let mut dir = Dir::new();
+    let path = dir.fresh_path();
+    let before = write_journal(&path, &sample());
+    let err = FileJournal::<u32>::rewrite(&path, |mut commits| {
+        commits.remove(1);
+        commits
+    })
+    .unwrap_err();
+    assert!(matches!(err, LogError::OutOfOrder { .. }), "{err}");
+    assert_eq!(fs::read(&path).unwrap(), before);
+    assert!(!tmp_path(&path).exists());
+}
+
+#[test]
+fn rewrite_needs_an_existing_journal() {
+    let mut dir = Dir::new();
+    let path = dir.fresh_path();
+    assert!(matches!(
+        FileJournal::<u32>::rewrite(&path, |c| c),
+        Err(LogError::Io(_))
+    ));
+    assert!(!path.exists(), "rewrite must not create a journal");
+}
+
+/// A crash while the new file is being written leaves `<name>.tmp`. It is
+/// not part of the journal: the journal opens from the original, and the
+/// next rewrite overwrites the leftover.
+#[test]
+fn a_torn_tmp_file_is_ignored_and_overwritten() {
+    let mut dir = Dir::new();
+    let path = dir.fresh_path();
+    let before = write_journal(&path, &sample());
+    let tmp = tmp_path(&path);
+    fs::write(&tmp, &before[..before.len() / 2]).unwrap();
+
+    let mut journal = open(&path).unwrap();
+    assert_eq!(journal.cut_on_open(), 0);
+    assert_eq!(journal.replay().unwrap(), sample());
+    journal.append(&commit(5, &[9])).unwrap();
+    drop(journal);
+    assert_eq!(fs::read(&tmp).unwrap(), &before[..before.len() / 2]);
+
+    FileJournal::<u32>::rewrite(&path, |commits| commits).unwrap();
+    assert!(!tmp.exists(), "the leftover was replaced and renamed away");
+    let mut expected = sample();
+    expected.push(commit(5, &[9]));
+    assert_eq!(open(&path).unwrap().replay().unwrap(), expected);
+}

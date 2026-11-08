@@ -221,7 +221,12 @@ pub enum View {
 
 impl View {
     /// Whether `fact` is visible in this view.
+    ///
+    /// A redacted version is in no view: its content is gone.
     pub fn includes(self, fact: &Fact) -> bool {
+        if fact.is_redacted() {
+            return false;
+        }
         match self {
             Self::Current => fact.is_current(),
             Self::TrueAt(t) => fact.was_true_at(t),

@@ -7,7 +7,8 @@ use thiserror::Error;
 use crate::embed::EmbedError;
 use crate::log::{LogError, Seq};
 use crate::model::{
-    EntityId, EntityKindId, Lineage, ModelError, PredicateId, SpaceId, Timestamp, ValueType,
+    EntityId, EntityKindId, EpisodeId, FactId, Lineage, ModelError, PredicateId, SpaceId,
+    Timestamp, ValueType,
 };
 
 /// Errors of the store.
@@ -49,6 +50,22 @@ pub enum StoreError {
     /// No such fact lineage.
     #[error("unknown fact lineage {0}")]
     UnknownLineage(Lineage),
+
+    /// No such fact version.
+    #[error("unknown fact {0}")]
+    UnknownFact(FactId),
+
+    /// No such episode.
+    #[error("unknown episode {0}")]
+    UnknownEpisode(EpisodeId),
+
+    /// The fact version was redacted already.
+    #[error("fact {0} is already redacted")]
+    AlreadyRedacted(FactId),
+
+    /// The episode was redacted already.
+    #[error("episode {0} is already redacted")]
+    EpisodeAlreadyRedacted(EpisodeId),
 
     /// The space is archived and read-only.
     #[error("space {0} is archived")]

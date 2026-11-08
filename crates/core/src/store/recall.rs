@@ -175,7 +175,8 @@ struct Prepared<'q> {
 
 impl Prepared<'_> {
     fn visible(&self, fact: &Fact) -> bool {
-        (self.query.spaces.is_empty() || self.query.spaces.contains(&fact.space))
+        !fact.is_redacted()
+            && (self.query.spaces.is_empty() || self.query.spaces.contains(&fact.space))
             && self.query.view.includes(fact)
     }
 
@@ -323,7 +324,7 @@ pub(crate) fn recall(
     let mut hits: Vec<Hit> = fused
         .into_iter()
         .filter_map(|(id, ranks)| {
-            let fact = state.fact(id)?;
+            let fact = state.fact(id).filter(|f| !f.is_redacted())?;
             let fact_entities = fact.entities();
             let fact_words: HashSet<String> = words(&fact_text(state, fact)).collect();
             let covered = prepared.covered(&fact_entities, &fact_words);
