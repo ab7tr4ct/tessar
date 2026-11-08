@@ -41,7 +41,8 @@ Or in `.mcp.json` (project) / `~/.claude.json` (user):
 ```
 
 The server loads the model before it starts serving, so the first start takes
-a few seconds. It exits with status 0 when stdin closes. Only one server can
+a few seconds. Opening the memory also embeds every fact again (vectors are not
+stored yet), so startup grows with the journal; a vector cache is planned. It exits with status 0 when stdin closes. Only one server can
 use a journal at a time: a second one prints `another tessar is using …` and
 exits with status 1.
 
@@ -49,7 +50,7 @@ exits with status 1.
 
 | Tool         | What it does |
 |--------------|--------------|
-| `remember`   | Writes facts in one transaction: `statement` (a sentence), `attribute` (subject, predicate, value; a single-valued predicate replaces the old value and keeps it in history) or `event` (needs `when`). Reports `created`, `unchanged` or `superseded` per fact. Checks new predicates: snake_case, at most four words, universal, and not a near-duplicate of an existing one; on a problem it writes nothing and says what to do (`synonym_of`, `force_new_predicate`). |
+| `remember`   | Writes facts in one transaction: `statement` (a sentence), `attribute` (subject, predicate, value; a single-valued predicate replaces the old value and keeps it in history) or `event` (needs `when`). Reports `created`, `unchanged` or `superseded` per fact. Checks new predicates: snake_case, at most four words, universal, and not a near-duplicate of an existing one; on a problem it writes no facts and says what to do (`synonym_of`, `force_new_predicate`). |
 | `recall`     | Natural-language search over both spaces (or one), best first, each hit with the channels that found it. `as_of` (`YYYY-MM-DD`) shows what was true on that day. |
 | `vocabulary` | Lists the predicates with `single` or `many` cardinality, descriptions and synonyms. |
 | `about`      | Lists the facts about one entity, oldest first; `history: true` includes replaced versions. |
@@ -64,10 +65,13 @@ they explain spaces, fact kinds and predicate rules.
   the whole memory; vectors are recomputed on start.
 - Two spaces. `user` holds facts about the person and the entity `user`
   (kind `person`), plus the predicate vocabulary shared by every project. The
-  **project space** is named after the repository: the basename of
-  `git rev-parse --show-toplevel` from the server's working directory,
-  lowercased, or the basename of the working directory outside a repository.
-  Claude Code starts MCP servers in the project directory.
+  **project space** is named after the repository: the name of the main
+  checkout (the parent of `git rev-parse --git-common-dir`, so all worktrees
+  of a repository share one space), lowercased. Outside a git repository the
+  basename of the server's working directory is used instead.
+  Claude Code starts MCP servers in the project directory. `recall` searches
+  all spaces by default, including other repositories; each hit shows its
+  space.
 - Facts are attributed to `claude-code`. Both spaces get the entity kinds
   `person, place, organization, item, project, event, topic, other`.
 

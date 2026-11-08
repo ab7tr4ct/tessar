@@ -28,6 +28,9 @@ The memory lives in DIR (default: $TESSAR_HOME, else ~/.tessar): journal.jsonl,
 and the embedding model in models/voyage-4-nano-Q8_0.gguf. Set TESSAR_MODEL to
 use a model file from elsewhere.";
 
+/// Vector length in the index.
+const INDEX_DIMS: usize = 1024;
+
 /// The model file name under `<home>/models/`.
 const MODEL_FILE: &str = "voyage-4-nano-Q8_0.gguf";
 
@@ -100,18 +103,29 @@ fn model_path(home: &std::path::Path) -> Result<PathBuf, String> {
     }
 }
 
-/// The repository name: the top level of the git work tree around the
-/// current directory, else the current directory, lowercased.
+/// The repository name, lowercased. In a git repository it is the name of
+/// the main checkout, so every worktree of a repository shares one space:
+/// the parent of `git rev-parse --git-common-dir`. Outside git, or in a
+/// bare repository, it is the name of the git directory or the current
+/// directory.
 fn project_name() -> String {
-    let from_git = Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
+    let cwd = std::env::current_dir().ok();
+    let common = Command::new("git")
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
         .stderr(std::process::Stdio::null())
         .output()
         .ok()
         .filter(|o| o.status.success())
         .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| PathBuf::from(s.trim()));
-    let dir = from_git.or_else(|| std::env::current_dir().ok());
+        .map(|s| PathBuf::from(s.trim()))
+        .filter(|p| p.is_absolute());
+    let dir = match common {
+        Some(git_dir) if git_dir.file_name().is_some_and(|n| n == ".git") => {
+            git_dir.parent().map(std::path::Path::to_path_buf)
+        }
+        Some(git_dir) => Some(git_dir),
+        None => cwd,
+    };
     dir.as_deref()
         .and_then(std::path::Path::file_name)
         .map(|n| n.to_string_lossy().to_lowercase())
@@ -143,13 +157,21 @@ fn run(home: PathBuf) -> ExitCode {
         Ok(e) => Arc::new(e),
         Err(e) => return fail(&format!("cannot load the model: {e}")),
     };
+    // The index holds 1024 components per vector; a shorter model cannot fill it.
+    if embedder.dims() < INDEX_DIMS {
+        return fail(&format!(
+            "the model at {} gives {} dimensions per vector, at least {INDEX_DIMS} are needed",
+            model.display(),
+            embedder.dims()
+        ));
+    }
     let clock = Arc::new(SystemClock);
     let memory = match Memory::open_with(
         journal,
         clock.clone(),
         Semantic {
             embedder,
-            dims: 1024,
+            dims: INDEX_DIMS,
             near_bonus: 0.05,
             predicate_threshold: 0.70,
         },

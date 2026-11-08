@@ -17,10 +17,10 @@ tessar-embed-llama.workspace = true
 rmcp.workspace = true
 tokio.workspace = true
 serde.workspace = true
-serde_json.workspace = true
 schemars.workspace = true
 
 [dev-dependencies]
+serde_json.workspace = true
 tessar-core = { workspace = true, features = ["testing"] }
 tempfile.workspace = true
 

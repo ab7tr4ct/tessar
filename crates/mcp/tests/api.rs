@@ -195,7 +195,11 @@ fn as_of_shows_the_older_value() {
     write("Denver");
     let then = recall(&f, json!({"query": "User lives", "as_of": "2026-11-09"})).unwrap();
     assert!(then.contains("User lives in Boston"), "{then}");
-    assert!(then.contains("[no longer current"), "{then}");
+    assert!(
+        then.contains("[true on 2026-11-09; now: Denver; earlier:")
+            || then.contains("[true on 2026-11-09; now: Denver]"),
+        "{then}"
+    );
     assert!(!then.contains("User lives in Denver"), "{then}");
     assert!(recall(&f, json!({"query": "x", "as_of": "yesterday"})).is_err());
 }
@@ -271,7 +275,7 @@ fn new_predicate_without_description_is_refused() {
 }
 
 #[test]
-fn similar_predicate_is_a_tool_error_and_writes_nothing() {
+fn similar_predicate_is_a_tool_error_and_writes_no_facts() {
     let f = fixture();
     let err = remember(
         &f,
@@ -394,7 +398,7 @@ fn about_lists_facts_across_spaces() {
         &f,
         json!({"facts": [{
             "kind": "event", "text": "Anna reviews the tessar design", "when": "2026-11-20",
-            "mentions": [{"key": "Anna", "kind": "person", "space": "user"}]}]}),
+            "mentions": [{"key": "Anna", "kind": "person"}]}]}),
     )
     .unwrap();
     let list = about(
@@ -516,4 +520,104 @@ fn tools_carry_descriptions_and_schemas() {
     let info = server.get_info();
     assert_eq!(info.server_info.name, "tessar");
     assert!(info.capabilities.tools.is_some());
+}
+
+#[test]
+fn a_failed_call_defines_no_predicates() {
+    let f = fixture();
+    let err = remember(
+        &f,
+        json!({"facts": [
+            {"kind": "attribute", "subject": user(), "predicate": "espresso_machine",
+             "predicate_description": "coffee brewing gadget model somebody operates", "value": "Rancilio"},
+            {"kind": "statement"}]}),
+    )
+    .unwrap_err();
+    assert!(
+        err.starts_with("Nothing was written, no predicates either"),
+        "{err}"
+    );
+    let user_space = f.mem.space_named("user").unwrap().id;
+    assert!(
+        f.mem
+            .predicate_named(user_space, "espresso_machine")
+            .is_none()
+    );
+}
+
+#[test]
+fn a_similar_predicate_after_a_good_one_reports_what_was_kept() {
+    let f = fixture();
+    let err = remember(
+        &f,
+        json!({"facts": [
+            {"kind": "attribute", "subject": user(), "predicate": "espresso_machine",
+             "predicate_description": "coffee brewing gadget model somebody operates", "value": "Rancilio"},
+            {"kind": "attribute", "subject": user(), "predicate": "lives_place", "value": "Oslo",
+             "predicate_description": "the place where the subject lives"}]}),
+    )
+    .unwrap_err();
+    assert!(err.starts_with("No facts were written"), "{err}");
+    assert!(
+        err.contains("Predicates defined and kept: `espresso_machine`"),
+        "{err}"
+    );
+    assert!(
+        f.mem
+            .recall(&tessar_core::store::Recall::new("Rancilio"))
+            .hits
+            .is_empty()
+    );
+}
+
+#[test]
+fn one_new_predicate_in_two_facts_is_defined_once() {
+    let f = fixture();
+    let fact = |v: &str| {
+        json!({"kind": "attribute", "subject": user(), "predicate": "espresso_machine",
+        "predicate_description": "coffee brewing gadget model somebody operates", "value": v})
+    };
+    let out = remember(&f, json!({"facts": [fact("Rancilio"), fact("Gaggia")]})).unwrap();
+    assert!(out.matches("created").count() == 2, "{out}");
+}
+
+#[test]
+fn when_on_an_attribute_is_valid_from() {
+    let f = fixture();
+    remember(
+        &f,
+        json!({"space": "user", "facts": [{
+            "kind": "attribute", "subject": user(), "predicate": "lives_in", "value": "Lisbon",
+            "when": "2026-01-01", "text": "User lives in Lisbon"}]}),
+    )
+    .unwrap();
+    let found = recall(&f, json!({"query": "Lisbon", "as_of": "2026-02-01"})).unwrap();
+    assert!(found.contains("User lives in Lisbon"), "{found}");
+    let before = recall(&f, json!({"query": "Lisbon", "as_of": "2025-12-31"})).unwrap();
+    assert_eq!(before, "Nothing found.");
+}
+
+#[test]
+fn an_existing_entity_is_found_before_a_new_one_is_made() {
+    let f = fixture();
+    remember(
+        &f,
+        json!({"space": "user", "facts": [{"kind": "statement", "text": "Anna is the user's sister",
+            "mentions": [{"key": "Anna", "kind": "person"}]}]}),
+    )
+    .unwrap();
+    remember(
+        &f,
+        json!({"facts": [{"kind": "statement", "text": "Anna reviews the design",
+            "mentions": [{"key": "Anna", "kind": "person"}]}]}),
+    )
+    .unwrap();
+    let project_space = f.mem.space_named("tessar").unwrap().id;
+    let person = f.mem.kind_named(project_space, "person").unwrap();
+    assert!(f.mem.find_entity(project_space, person, "Anna").is_none());
+    let list = about(&f, json!({"entity": {"key": "Anna", "kind": "person"}})).unwrap();
+    assert!(
+        list.contains("sister") && list.contains("reviews the design"),
+        "{list}"
+    );
 }

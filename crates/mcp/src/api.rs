@@ -174,7 +174,8 @@ impl Tessar {
             }
             out.push('\n');
         }
-        out.trim_end().to_owned()
+        out.pop();
+        out
     }
 
     // ---- remember --------------------------------------------------
@@ -185,11 +186,13 @@ impl Tessar {
         if args.facts.is_empty() {
             return Err("`facts` is empty: nothing to remember".to_owned());
         }
-        let mut drafts = Vec::new();
+        // Phase 1: check everything that can be checked without writing.
+        let mut plan = Plan::default();
+        let mut pending = Vec::new();
         let mut problems = Vec::new();
         for (i, fact) in args.facts.iter().enumerate() {
-            match self.draft(fact, space) {
-                Ok(d) => drafts.push(d),
+            match self.draft(fact, space, i, &mut plan) {
+                Ok(p) => pending.push(p),
                 Err(found) => {
                     problems.extend(found.into_iter().map(|p| format!("fact {}: {p}", i + 1)));
                 }
@@ -197,10 +200,46 @@ impl Tessar {
         }
         if !problems.is_empty() {
             return Err(format!(
-                "Nothing was written. Fix these and call `remember` again:\n- {}",
+                "Nothing was written, no predicates either. Fix these and call `remember` again:\n- {}",
                 problems.join("\n- ")
             ));
         }
+
+        // Phase 2: define the new predicates. Memory checks a new predicate
+        // for near-duplicates only while defining it, so a problem found
+        // here may follow predicates that are already defined; they stay.
+        let mut ids = Vec::new();
+        let mut kept: Vec<String> = Vec::new();
+        for new in &plan.news {
+            match self.define_new(new) {
+                Ok(id) => {
+                    ids.push(id);
+                    kept.push(format!("`{}`", new.name));
+                }
+                Err(message) => {
+                    let which: Vec<String> =
+                        new.facts.iter().map(|i| (i + 1).to_string()).collect();
+                    problems.push(format!("fact {}: {message}", which.join(", ")));
+                }
+            }
+        }
+        let kept_note = if kept.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\nPredicates defined and kept: {}. They are part of the vocabulary now.",
+                kept.join(", ")
+            )
+        };
+        if !problems.is_empty() {
+            return Err(format!(
+                "No facts were written. Fix these and call `remember` again:\n- {}{kept_note}",
+                problems.join("\n- ")
+            ));
+        }
+
+        // Phase 3: one transaction for the facts.
+        let drafts: Vec<FactDraft> = pending.into_iter().map(|p| p.into_draft(&ids)).collect();
         let episode = args
             .source
             .as_deref()
@@ -217,10 +256,12 @@ impl Tessar {
             episode,
             facts: drafts,
         };
-        let done = self
-            .mem
-            .remember(request)
-            .map_err(|e| format!("Nothing was written. {}", self.store_message(&e)))?;
+        let done = self.mem.remember(request).map_err(|e| {
+            format!(
+                "No facts were written. {}{kept_note}",
+                self.store_message(&e)
+            )
+        })?;
 
         let now = self.clock.now();
         let mut out = format!(
@@ -232,7 +273,7 @@ impl Tessar {
             let line = self
                 .mem
                 .fact(recorded.fact)
-                .map_or_else(String::new, |f| self.line(&f, now, true));
+                .map_or_else(String::new, |f| self.line(&f, now, true, None));
             let verb = match recorded.outcome {
                 Outcome::Created => "created".to_owned(),
                 Outcome::Unchanged => "unchanged (already known)".to_owned(),
@@ -253,9 +294,15 @@ impl Tessar {
         Ok(out)
     }
 
-    /// Turns one fact of the request into a draft, or lists what is wrong.
-    /// Defines a new predicate if the fact proposes one.
-    fn draft(&self, f: &FactArgs, space: Space) -> Result<FactDraft, Vec<String>> {
+    /// Checks one fact of the request and prepares it, or lists what is
+    /// wrong. Writes nothing: a new predicate is added to `plan`.
+    fn draft(
+        &self,
+        f: &FactArgs,
+        space: Space,
+        index: usize,
+        plan: &mut Plan,
+    ) -> Result<Pending, Vec<String>> {
         let mut problems = Vec::new();
         let text = f
             .text
@@ -275,6 +322,7 @@ impl Tessar {
             .iter()
             .filter_map(|e| ok(&mut problems, self.resolve(e, space)))
             .collect();
+        let mut valid_from = None;
 
         let body = match f.kind {
             FactKind::Statement => {
@@ -282,10 +330,10 @@ impl Tessar {
                     mentions.extend(ok(&mut problems, self.resolve(subject, space)));
                 }
                 match &text {
-                    Some(text) => Some(BodyDraft::Statement {
+                    Some(text) => Some(PendingBody::Ready(BodyDraft::Statement {
                         text: text.clone(),
                         when,
-                    }),
+                    })),
                     None => ok(&mut problems, Err("a statement needs `text`".to_owned())),
                 }
             }
@@ -296,11 +344,11 @@ impl Tessar {
                     mentions.insert(0, r);
                 }
                 match (&text, when) {
-                    (Some(text), Some(when)) => Some(BodyDraft::Event {
+                    (Some(text), Some(when)) => Some(PendingBody::Ready(BodyDraft::Event {
                         text: text.clone(),
                         participants: std::mem::take(&mut mentions),
                         when,
-                    }),
+                    })),
                     (None, _) => ok(&mut problems, Err("an event needs `text`".to_owned())),
                     (_, None) => ok(
                         &mut problems,
@@ -309,6 +357,8 @@ impl Tessar {
                 }
             }
             FactKind::Attribute => {
+                // The value holds from the start of `when`.
+                valid_from = when.and_then(when::span_start);
                 let subject = match &f.subject {
                     Some(s) => ok(&mut problems, self.resolve(s, space)),
                     None => ok(
@@ -323,20 +373,22 @@ impl Tessar {
                     .filter(|v| !v.is_empty())
                     .map(str::to_owned);
                 if value.is_none() {
-                    ok::<()>(&mut problems, Err("an attribute needs `value`".to_owned()));
+                    problems.push("an attribute needs `value`".to_owned());
                 }
                 let predicate = match f.predicate.as_deref().map(str::trim) {
-                    Some(p) if !p.is_empty() => ok(&mut problems, self.resolve_predicate(p, f)),
+                    Some(p) if !p.is_empty() => {
+                        ok(&mut problems, self.resolve_predicate(p, f, index, plan))
+                    }
                     _ => ok(
                         &mut problems,
                         Err("an attribute needs `predicate`".to_owned()),
                     ),
                 };
                 match (subject, predicate, value) {
-                    (Some(subject), Some(predicate), Some(value)) => Some(BodyDraft::Triple {
+                    (Some(subject), Some(pred), Some(value)) => Some(PendingBody::Triple {
                         subject,
-                        predicate,
-                        object: ObjectDraft::Value(Value::Text(value)),
+                        pred,
+                        value,
                         text: text.clone(),
                     }),
                     _ => None,
@@ -344,19 +396,25 @@ impl Tessar {
             }
         };
         match (body, problems.is_empty()) {
-            (Some(body), true) => Ok(FactDraft {
+            (Some(body), true) => Ok(Pending {
                 body,
                 mentions,
-                valid_from: None,
-                expected_version: None,
+                valid_from,
             }),
             _ => Err(problems),
         }
     }
 
-    /// The predicate for an attribute: an existing one, a synonym declared
-    /// now or a new one. Explains what to do if none can be had.
-    fn resolve_predicate(&self, name: &str, f: &FactArgs) -> Result<PredicateId, String> {
+    /// Plans the predicate for an attribute: an existing one, or a new one
+    /// (defined or declared a synonym) to create in phase 2. Explains what
+    /// to do if none can be had. Writes nothing.
+    fn resolve_predicate(
+        &self,
+        name: &str,
+        f: &FactArgs,
+        index: usize,
+        plan: &mut Plan,
+    ) -> Result<PredRef, String> {
         let parsed = Name::new(name).map_err(|_| {
             format!(
                 "predicate `{name}` is not snake_case: use lowercase letters, digits and `_`, \
@@ -364,7 +422,12 @@ impl Tessar {
             )
         })?;
         if let Some(existing) = self.find_predicate(name) {
-            return Ok(existing.id);
+            return Ok(PredRef::Existing(existing.id));
+        }
+        // The same new predicate in two facts is defined once.
+        if let Some(i) = plan.news.iter().position(|n| n.name == name) {
+            plan.news[i].facts.push(index);
+            return Ok(PredRef::New(i));
         }
         let description = f
             .predicate_description
@@ -373,7 +436,7 @@ impl Tessar {
             .unwrap_or_default()
             .to_owned();
 
-        if let Some(target) = f
+        let how = if let Some(target) = f
             .synonym_of
             .as_deref()
             .map(str::trim)
@@ -384,40 +447,62 @@ impl Tessar {
                     "synonym_of `{target}` is not an existing predicate; call `vocabulary` for the list"
                 ));
             };
-            return self
+            NewHow::Alias { into: into.id }
+        } else {
+            if description.is_empty() {
+                return Err(format!(
+                    "predicate `{name}` is new: give `predicate_description` (one line: what it means \
+                     and what its value is), and `single: true` if a new value always replaces the old one. \
+                     If an existing predicate fits, use it: call `vocabulary`"
+                ));
+            }
+            NewHow::Define {
+                single: f.single.unwrap_or(false),
+                force: f.force_new_predicate.unwrap_or(false),
+            }
+        };
+        plan.news.push(NewPredicate {
+            name: name.to_owned(),
+            parsed,
+            description,
+            how,
+            facts: vec![index],
+        });
+        Ok(PredRef::New(plan.news.len() - 1))
+    }
+
+    /// Defines or aliases a planned predicate in the user space.
+    fn define_new(&self, new: &NewPredicate) -> Result<PredicateId, String> {
+        let name = &new.name;
+        match new.how {
+            NewHow::Alias { into } => self
                 .mem
-                .alias_predicate(self.user, parsed, description, into.id)
+                .alias_predicate(self.user, new.parsed.clone(), new.description.clone(), into)
                 .map_err(|e| {
                     format!(
-                        "cannot make `{name}` a synonym of `{target}`: {}",
+                        "cannot make `{name}` a synonym: {}",
                         self.predicate_message(name, &e)
                     )
-                });
+                }),
+            NewHow::Define { single, force } => {
+                let draft = PredicateDraft {
+                    name: new.parsed.clone(),
+                    description: new.description.clone(),
+                    object: ValueType::Text,
+                    cardinality: if single {
+                        Cardinality::Single
+                    } else {
+                        Cardinality::Many
+                    },
+                };
+                let defined = if force {
+                    self.mem.define_predicate_unchecked(self.user, draft)
+                } else {
+                    self.mem.define_predicate(self.user, draft)
+                };
+                defined.map_err(|e| self.predicate_message(name, &e))
+            }
         }
-
-        if description.is_empty() {
-            return Err(format!(
-                "predicate `{name}` is new: give `predicate_description` (one line: what it means \
-                 and what its value is), and `single: true` if a new value always replaces the old one. \
-                 If an existing predicate fits, use it: call `vocabulary`"
-            ));
-        }
-        let draft = PredicateDraft {
-            name: parsed,
-            description,
-            object: ValueType::Text,
-            cardinality: if f.single.unwrap_or(false) {
-                Cardinality::Single
-            } else {
-                Cardinality::Many
-            },
-        };
-        let defined = if f.force_new_predicate.unwrap_or(false) {
-            self.mem.define_predicate_unchecked(self.user, draft)
-        } else {
-            self.mem.define_predicate(self.user, draft)
-        };
-        defined.map_err(|e| self.predicate_message(name, &e))
     }
 
     /// What a failed predicate definition means for the agent.
@@ -482,12 +567,31 @@ impl Tessar {
         }
     }
 
+    /// The entity to write: `user` in the user space; else in the space
+    /// named; else where it already exists (project first, then user);
+    /// else a new one in the fact's space.
     fn resolve(&self, e: &Entity, default: Space) -> Result<EntityRef, String> {
-        let space = Self::entity_space(e, default);
-        let kind = self.kind_id(space, &e.kind)?;
         let key =
             Key::new(&e.key).map_err(|_| format!("entity key {:?} is empty or too long", e.key))?;
+        let space = if is_user(e) || e.space.is_some() {
+            Self::entity_space(e, default)
+        } else {
+            [Space::Project, Space::User]
+                .into_iter()
+                .find(|&s| self.exists(s, e))
+                .unwrap_or(default)
+        };
+        let kind = self.kind_id(space, &e.kind)?;
         Ok(EntityRef::Key { kind, key })
+    }
+
+    /// Whether the entity already exists in `space`.
+    fn exists(&self, space: Space, e: &Entity) -> bool {
+        self.kinds(space).get(e.kind.trim()).is_some_and(|&kind| {
+            self.mem
+                .find_entity(self.space_id(space), kind, &e.key)
+                .is_some()
+        })
     }
 
     fn kind_id(&self, space: Space, kind: &str) -> Result<EntityKindId, String> {
@@ -555,7 +659,7 @@ impl Tessar {
     }
 
     /// `[recorded] [space] sentence [current; earlier: v (date)] (tense)`.
-    fn line(&self, fact: &Fact, now: Timestamp, with_earlier: bool) -> String {
+    fn line(&self, fact: &Fact, now: Timestamp, with_earlier: bool, as_of: Option<&str>) -> String {
         let mut line = format!(
             "[{}] [{}] {}",
             when::ymd(fact.recorded_at),
@@ -571,12 +675,14 @@ impl Tessar {
                 .rev()
                 .map(|h| format!("{} ({})", self.value_of(&h.body), when::ymd(h.recorded_at)))
                 .collect();
+            let state = if fact.is_current() {
+                "current".to_owned()
+            } else if let (Some(day), Some(now_fact)) = (as_of, self.mem.current(fact.lineage)) {
+                format!("true on {day}; now: {}", self.value_of(&now_fact.body))
+            } else {
+                "no longer current".to_owned()
+            };
             if !earlier.is_empty() || !fact.is_current() {
-                let state = if fact.is_current() {
-                    "current"
-                } else {
-                    "no longer current"
-                };
                 if earlier.is_empty() {
                     let _ = write!(line, " [{state}]");
                 } else {
@@ -622,12 +728,12 @@ impl Tessar {
         if query.is_empty() {
             return Err("`query` is empty".to_owned());
         }
-        let view = match args
+        let day = args
             .as_of
             .as_deref()
             .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
+            .filter(|s| !s.is_empty());
+        let view = match day {
             Some(day) => View::TrueAt(when::parse_as_of(day).map_err(|e| format!("`as_of`: {e}"))?),
             None => View::Current,
         };
@@ -657,7 +763,7 @@ impl Tessar {
                 out,
                 "{}. {} | found by: {}",
                 i + 1,
-                self.line(&hit.fact, now, true),
+                self.line(&hit.fact, now, true, day),
                 self.why(&hit.why)
             );
         }
@@ -720,7 +826,7 @@ impl Tessar {
             facts.len()
         );
         for f in &facts {
-            let mut line = self.line(f, now, !history);
+            let mut line = self.line(f, now, !history, None);
             if history && matches!(f.body, FactBody::Triple { .. }) {
                 let _ = match f.end.map(|end| end.ending) {
                     None => write!(line, " [version {}, current]", f.version),
@@ -740,6 +846,79 @@ impl Tessar {
             let _ = write!(out, "\n- {line}");
         }
         Ok(out)
+    }
+}
+
+/// Predicates a `remember` call will have to create, found in phase 1.
+#[derive(Default)]
+struct Plan {
+    news: Vec<NewPredicate>,
+}
+
+struct NewPredicate {
+    name: String,
+    parsed: Name,
+    description: String,
+    how: NewHow,
+    /// The facts (0-based) that use it.
+    facts: Vec<usize>,
+}
+
+enum NewHow {
+    Define { single: bool, force: bool },
+    Alias { into: PredicateId },
+}
+
+/// A predicate in a prepared fact: existing, or the n-th of the plan.
+#[derive(Clone, Copy)]
+enum PredRef {
+    Existing(PredicateId),
+    New(usize),
+}
+
+enum PendingBody {
+    Ready(BodyDraft),
+    Triple {
+        subject: EntityRef,
+        pred: PredRef,
+        value: String,
+        text: Option<String>,
+    },
+}
+
+/// A checked fact that waits for its predicate to exist.
+struct Pending {
+    body: PendingBody,
+    mentions: Vec<EntityRef>,
+    valid_from: Option<Timestamp>,
+}
+
+impl Pending {
+    /// The draft, given the ids of the plan's new predicates.
+    fn into_draft(self, ids: &[PredicateId]) -> FactDraft {
+        let body = match self.body {
+            PendingBody::Ready(body) => body,
+            PendingBody::Triple {
+                subject,
+                pred,
+                value,
+                text,
+            } => BodyDraft::Triple {
+                subject,
+                predicate: match pred {
+                    PredRef::Existing(id) => id,
+                    PredRef::New(i) => ids[i],
+                },
+                object: ObjectDraft::Value(Value::Text(value)),
+                text,
+            },
+        };
+        FactDraft {
+            body,
+            mentions: self.mentions,
+            valid_from: self.valid_from,
+            expected_version: None,
+        }
     }
 }
 

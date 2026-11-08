@@ -96,6 +96,12 @@ fn parse_part(s: &str) -> Result<(i64, i64), String> {
 pub fn parse_when(s: &str) -> Result<TimeSpan, String> {
     let ms = |d: i64| Timestamp::from_millis(d * DAY_MS);
     let (start, end) = match s.split_once('/') {
+        Some((a, _)) if a.trim().is_empty() => {
+            return Err(format!("`{s}`: missing date before `/`"));
+        }
+        Some((_, b)) if b.trim().is_empty() => {
+            return Err(format!("`{s}`: missing date after `/`"));
+        }
         Some((a, b)) => {
             let (start, _) = parse_part(a)?;
             let (_, end) = parse_part(b)?;
@@ -106,6 +112,15 @@ pub fn parse_when(s: &str) -> Result<TimeSpan, String> {
     Interval::new(ms(start), ms(end))
         .map(TimeSpan::Range)
         .map_err(|_| format!("`{s}`: the end is before the start"))
+}
+
+/// The first instant of a span, if it has one.
+pub fn span_start(span: TimeSpan) -> Option<Timestamp> {
+    match span {
+        TimeSpan::Point(t) | TimeSpan::Since(t) => Some(t),
+        TimeSpan::Range(r) => Some(r.start()),
+        TimeSpan::Until(_) | TimeSpan::Duration(_) => None,
+    }
 }
 
 /// Parses `as_of` (`YYYY-MM-DD`) into the last millisecond of that day.
@@ -229,6 +244,12 @@ mod tests {
         ] {
             assert!(parse_when(bad).is_err(), "{bad:?} should fail");
         }
+    }
+
+    #[test]
+    fn slash_without_a_date_is_named() {
+        assert!(parse_when("2026/").unwrap_err().contains("after `/`"));
+        assert!(parse_when("/2026").unwrap_err().contains("before `/`"));
     }
 
     #[test]

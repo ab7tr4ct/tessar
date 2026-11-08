@@ -22,7 +22,7 @@ pub enum RecallSpace {
     Project,
     /// Only facts about the person.
     User,
-    /// Both (default).
+    /// All spaces (default): this repository, the user, and other repositories. Each hit shows its space.
     #[default]
     All,
 }
@@ -59,7 +59,7 @@ pub struct Fact {
     /// The fact in one self-contained sentence ("User plans a trip to Japan in May 2027"). Required for statement and event, strongly recommended for attribute: it is what later searches match.
     #[serde(default)]
     pub text: Option<String>,
-    /// When it happens: "YYYY-MM-DD", "YYYY-MM", "YYYY" or "YYYY-MM-DD/YYYY-MM-DD". Required for event, optional for statement.
+    /// When it happens: "YYYY-MM-DD", "YYYY-MM", "YYYY" or "YYYY-MM-DD/YYYY-MM-DD". Required for event, optional for statement. On an attribute it is when the value starts to hold (the fact is true from the start of that date).
     #[serde(default)]
     pub when: Option<String>,
     /// Attribute only: who or what the property belongs to.
@@ -80,7 +80,7 @@ pub struct Fact {
     /// Attribute: declare `predicate` a synonym of this existing predicate, so both mean the same from now on.
     #[serde(default)]
     pub synonym_of: Option<String>,
-    /// Attribute: define `predicate` as new even though memory found a similar one. Use only after looking at the similar predicate.
+    /// Attribute: define `predicate` as new even though memory found a similar one. Skips the similarity check and the universality check (no numbers or entity names in the name), so use it only after looking at the similar predicate.
     #[serde(default)]
     pub force_new_predicate: Option<bool>,
     /// Other entities the fact is about besides the subject.
@@ -106,7 +106,7 @@ pub struct RememberArgs {
 pub struct RecallArgs {
     /// What to look for, in natural language.
     pub query: String,
-    /// How many facts to return. Default 10.
+    /// How many facts to return, 1 to 50. Default 10.
     #[serde(default)]
     pub limit: Option<usize>,
     /// project, user or all (default).

@@ -45,10 +45,10 @@ new value always replaces the old one, such as `lives_in` or `job_title`. Writin
 of a single-valued predicate replaces the old one, which stays in history; the result says \
 `superseded`. A new predicate needs `predicate_description` (one line: what it means and what \
 its value is) and `single: true` if it is single-valued. If memory finds an existing predicate \
-with a similar meaning, the call fails and writes nothing: reuse that predicate, or pass \
+with a similar meaning, the call fails and writes no facts: reuse that predicate, or pass \
 `synonym_of` to declare yours its synonym, or `force_new_predicate: true` to define it anyway.
 
-All facts of one call are written, or none. Put facts that share a source in one call and pass \
+All facts of one call are written, or none. (A new predicate that memory accepted stays defined even if the facts then fail.) Put facts that share a source in one call and pass \
 that text as `source`.
 
 CURRENT VOCABULARY, name (single|many): description. Call `vocabulary` for the live list.
@@ -58,7 +58,7 @@ const RECALL: &str = "\
 Search memory in natural language and get the best matching facts, best first. Each line reads `[date recorded] [space] fact`, followed by `[current; earlier: \
 value (date), ...]` when a property changed over time, a `(past|now|future: date)` tag for \
 facts about a date, and `found by:` saying why the fact matched (entity, words, meaning). \
-Searches both spaces by default. Set `as_of` (YYYY-MM-DD) to see what was true on that day \
+Searches all spaces by default (this repository, the user, and other repositories); each hit shows its space, and `space` narrows it to `project` or `user`. Set `as_of` (YYYY-MM-DD) to see what was true on that day \
 instead of now. Use it before asking the user about something they may have already told \
 you, and to check a decision or convention before changing it.";
 
