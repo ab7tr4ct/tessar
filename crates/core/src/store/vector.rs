@@ -9,7 +9,7 @@
 //! an approximate index comes when a space outgrows it (trade-off K4).
 
 use crate::embed::EmbedError;
-use crate::model::FactId;
+use crate::model::{FactId, PredicateId};
 
 /// A vector cut, normalized and quantized for the index.
 #[derive(Debug, Clone, PartialEq)]
@@ -101,6 +101,56 @@ impl VectorIndex {
         let scale = *self.scales.get(i)?;
         let v = &self.values[i * self.dims..(i + 1) * self.dims];
         Some(dot_i8(&query.values, v) as f32 * scale * query.scale)
+    }
+}
+
+/// Vectors of predicates (name and description), for the similarity check
+/// of new names. A small separate store: there are few predicates, so the
+/// search is a plain scan.
+#[derive(Debug)]
+pub(crate) struct PredicateVectors {
+    dims: usize,
+    ids: Vec<PredicateId>,
+    values: Vec<i8>,
+    scales: Vec<f32>,
+}
+
+impl PredicateVectors {
+    pub(crate) fn new(dims: usize) -> Self {
+        Self {
+            dims,
+            ids: Vec::new(),
+            values: Vec::new(),
+            scales: Vec::new(),
+        }
+    }
+
+    pub(crate) fn push(&mut self, id: PredicateId, vector: Quantized) -> Result<(), String> {
+        if vector.values.len() != self.dims {
+            return Err(format!(
+                "vector of length {}, index holds {}",
+                vector.values.len(),
+                self.dims
+            ));
+        }
+        self.ids.push(id);
+        self.values.extend_from_slice(&vector.values);
+        self.scales.push(vector.scale);
+        Ok(())
+    }
+
+    /// The predicate most similar to `query`, with the cosine; the lower
+    /// id wins a tie.
+    pub(crate) fn most_similar(&self, query: &Quantized) -> Option<(PredicateId, f32)> {
+        let mut best: Option<(PredicateId, f32)> = None;
+        for (i, &id) in self.ids.iter().enumerate() {
+            let v = &self.values[i * self.dims..(i + 1) * self.dims];
+            let s = dot_i8(&query.values, v) as f32 * self.scales[i] * query.scale;
+            if best.is_none_or(|(b, bs)| s > bs || (s == bs && id < b)) {
+                best = Some((id, s));
+            }
+        }
+        best
     }
 }
 

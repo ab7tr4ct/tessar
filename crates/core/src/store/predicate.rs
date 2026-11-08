@@ -13,7 +13,7 @@ use super::error::StoreError;
 use super::op::Op;
 use super::plan::{Planner, mint};
 use super::vector::Quantized;
-use crate::model::{Name, PredicateDef, PredicateId, SpaceId, ValueType};
+use crate::model::{Key, Name, PredicateDef, PredicateId, SpaceId, ValueType};
 
 /// The most words a predicate name may have.
 pub(crate) const MAX_NAME_WORDS: usize = 4;
@@ -48,22 +48,24 @@ pub(crate) fn predicate_text(name: &Name, description: &str) -> String {
 }
 
 impl Planner<'_> {
-    /// Finds or defines a predicate. Fails if the name exists with another
-    /// type or cardinality, or if `check` rejects it.
+    /// Finds or defines a predicate. A name that already exists in the
+    /// space is reused (or conflicts on type or cardinality) without any
+    /// check. A new name must pass `check`:
     ///
-    /// TODO(core-B): the checks. Format: at most [`MAX_NAME_WORDS`] words.
-    /// Universality: no word is a number, no word (and not the whole name
-    /// with `_` as spaces) is the normalized key or alias of an existing
-    /// entity ([`State::entities_named`](super::state::State::entities_named)).
-    /// Similarity: the best cosine against the vectors of all existing
-    /// canonical predicates.
+    /// - format (always): at most [`MAX_NAME_WORDS`] words;
+    /// - universality (`Full`): no word is a number, and no word (nor the
+    ///   whole name with `_` as spaces) is the key or alias of an entity
+    ///   in any space;
+    /// - similarity (`Full` with a vector): the best cosine to the vectors
+    ///   of existing predicates is below the threshold. A threshold of 1.0
+    ///   or more turns this check off: quantized vectors never reach
+    ///   exactly 1.0 reliably, so it cannot mean "identical".
     pub(crate) fn define_predicate(
         &mut self,
         space: SpaceId,
         draft: PredicateDraft,
         check: PredicateCheck<'_>,
     ) -> Result<PredicateId, StoreError> {
-        let _ = check;
         let state = self.state;
         self.open_space(space)?;
         if let Some(id) = state.predicate_named(space, &draft.name) {
@@ -81,6 +83,21 @@ impl Planner<'_> {
         if let ValueType::Entity(Some(kind)) = draft.object {
             state.kind(kind).ok_or(StoreError::UnknownKind(kind))?;
         }
+        check_format(&draft.name)?;
+        if let PredicateCheck::Full { vector, threshold } = check {
+            self.check_universal(&draft.name)?;
+            if let Some(vector) = vector
+                && let Some((best, similarity)) = state.most_similar_predicate(vector)
+                && threshold < 1.0
+                && similarity >= threshold
+            {
+                return Err(StoreError::PredicateSimilar {
+                    name: draft.name.to_string(),
+                    existing: state.canonical(best),
+                    similarity,
+                });
+            }
+        }
         let id = mint(&mut self.next.predicates, PredicateId::new)?;
         self.ops.push(Op::DefinePredicate(PredicateDef {
             id,
@@ -93,27 +110,76 @@ impl Planner<'_> {
         Ok(id)
     }
 
-    /// Makes `from` a synonym of `into`'s canonical predicate.
+    /// Rejects names with a number or the name of an entity in them.
+    fn check_universal(&self, name: &Name) -> Result<(), StoreError> {
+        let not_universal = |word: &str, reason: &str| StoreError::PredicateNotUniversal {
+            name: name.to_string(),
+            word: word.to_owned(),
+            reason: reason.to_owned(),
+        };
+        let words = name_words(name);
+        for word in &words {
+            if is_number(word) {
+                return Err(not_universal(word, "is a number"));
+            }
+        }
+        let names_entity = |text: &str| {
+            Key::new(text)
+                .map(|k| !self.state.entities_named(&k.normalized()).is_empty())
+                .unwrap_or(false)
+        };
+        for word in &words {
+            if names_entity(word) {
+                return Err(not_universal(word, "is the name of an entity"));
+            }
+        }
+        let whole = words.join(" ");
+        if words.len() > 1 && names_entity(&whole) {
+            return Err(not_universal(&whole, "is the name of an entity"));
+        }
+        Ok(())
+    }
+
+    /// Makes `from` a synonym of `into`'s canonical predicate. Both must
+    /// exist in the state (not only in this transaction); `from` must be
+    /// canonical and not `into`'s canonical; value type and cardinality
+    /// must match. Merging into a synonym merges into its canonical.
     ///
-    /// TODO(core-B): both must exist; `from` must be canonical and not
-    /// `into`; value type and cardinality must match
-    /// ([`StoreError::MergeMismatch`]). Merging into a synonym merges into
-    /// its canonical predicate.
+    /// Errors: [`StoreError::UnknownPredicate`]; [`StoreError::MergeMismatch`]
+    /// for another type or cardinality, for `from` equal to the target and
+    /// for a `from` that is already a synonym.
     pub(crate) fn merge_predicates(
         &mut self,
         from: PredicateId,
         into: PredicateId,
     ) -> Result<(), StoreError> {
-        let _ = (from, into);
-        todo!("core-B: merge_predicates")
+        let state = self.state;
+        let f = state
+            .predicate(from)
+            .ok_or(StoreError::UnknownPredicate(from))?;
+        state
+            .predicate(into)
+            .ok_or(StoreError::UnknownPredicate(into))?;
+        let into = state.canonical(into);
+        let t = state
+            .predicate(into)
+            .ok_or(StoreError::UnknownPredicate(into))?;
+        if from == into
+            || state.canonical(from) != from
+            || f.object != t.object
+            || f.cardinality != t.cardinality
+        {
+            return Err(StoreError::MergeMismatch { from, into });
+        }
+        self.ops.push(Op::MergePredicate { from, into });
+        Ok(())
     }
 
     /// Defines `name` as a synonym of `into`: a definition with `into`'s
-    /// type and cardinality, then a merge, in one transaction. Returns the
-    /// canonical predicate. If `name` already exists it must already be
-    /// `into` or its synonym.
-    ///
-    /// TODO(core-B).
+    /// type and cardinality (format check only), then a merge, in one
+    /// transaction. Returns the canonical predicate. If `name` already
+    /// exists it must already be `into` or its synonym, else
+    /// [`StoreError::NameTaken`].
     pub(crate) fn alias_predicate(
         &mut self,
         space: SpaceId,
@@ -121,7 +187,55 @@ impl Planner<'_> {
         description: String,
         into: PredicateId,
     ) -> Result<PredicateId, StoreError> {
-        let _ = (space, name, description, into);
-        todo!("core-B: alias_predicate")
+        let state = self.state;
+        self.open_space(space)?;
+        state
+            .predicate(into)
+            .ok_or(StoreError::UnknownPredicate(into))?;
+        let into = state.canonical(into);
+        let target = state
+            .predicate(into)
+            .ok_or(StoreError::UnknownPredicate(into))?;
+        if let Some(existing) = state.predicate_named(space, &name) {
+            return if existing == into {
+                Ok(into)
+            } else {
+                Err(StoreError::NameTaken(format!("predicate {name}")))
+            };
+        }
+        check_format(&name)?;
+        let (object, cardinality) = (target.object, target.cardinality);
+        let id = mint(&mut self.next.predicates, PredicateId::new)?;
+        self.ops.push(Op::DefinePredicate(PredicateDef {
+            id,
+            space,
+            name,
+            object,
+            cardinality,
+            description,
+        }));
+        self.ops.push(Op::MergePredicate { from: id, into });
+        Ok(into)
     }
+}
+
+/// The non-empty parts of a name between underscores.
+fn name_words(name: &Name) -> Vec<&str> {
+    name.as_str().split('_').filter(|w| !w.is_empty()).collect()
+}
+
+fn check_format(name: &Name) -> Result<(), StoreError> {
+    if name_words(name).len() > MAX_NAME_WORDS {
+        return Err(StoreError::PredicateNameTooLong {
+            name: name.to_string(),
+            max_words: MAX_NAME_WORDS,
+        });
+    }
+    Ok(())
+}
+
+/// Whether a word is a number. `inf` and `nan` are words, not numbers.
+fn is_number(word: &str) -> bool {
+    word.chars().any(|c| c.is_ascii_digit())
+        && (word.parse::<i64>().is_ok() || word.parse::<f64>().is_ok())
 }

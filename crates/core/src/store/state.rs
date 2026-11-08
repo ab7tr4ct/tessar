@@ -8,7 +8,7 @@ use std::num::NonZeroU32;
 
 use super::op::Op;
 use super::text::{TextIndex, fact_text};
-use super::vector::{Quantized, VectorIndex};
+use super::vector::{PredicateVectors, Quantized, VectorIndex};
 use crate::model::{
     Entity, EntityId, EntityKindDef, EntityKindId, Episode, Fact, FactBody, FactId, Lineage, Name,
     PredicateDef, PredicateId, Space, SpaceId, ValueType,
@@ -47,6 +47,9 @@ pub(crate) struct State {
     /// built by [`State::apply`]: vectors are not in the log, the writer
     /// adds them right after applying a commit.
     vectors: Option<VectorIndex>,
+    /// Vectors of predicates, if the meaning channel is on. Like
+    /// `vectors`, not built by [`State::apply`].
+    predicate_vectors: Option<PredicateVectors>,
 }
 
 impl State {
@@ -146,6 +149,41 @@ impl State {
     /// must be pushed next, in order.
     pub(crate) fn enable_vectors(&mut self, dims: usize) {
         self.vectors = Some(VectorIndex::new(dims));
+        self.predicate_vectors = Some(PredicateVectors::new(dims));
+    }
+
+    /// Adds the vector of a predicate (canonical or synonym).
+    pub(crate) fn push_predicate_vector(
+        &mut self,
+        id: PredicateId,
+        vector: Quantized,
+    ) -> Result<(), String> {
+        let index = self
+            .predicate_vectors
+            .as_mut()
+            .ok_or("the meaning channel is off")?;
+        if self.predicates.get(id.index()).is_none() {
+            return Err(format!("vector for unknown predicate {id}"));
+        }
+        index.push(id, vector)
+    }
+
+    /// The predicate whose vector is closest to `query`, with the cosine.
+    /// `None` if the meaning channel is off or no predicate has a vector.
+    pub(crate) fn most_similar_predicate(&self, query: &Quantized) -> Option<(PredicateId, f32)> {
+        self.predicate_vectors.as_ref()?.most_similar(query)
+    }
+
+    /// Every canonical predicate (synonyms left out), in id order.
+    pub(crate) fn canonical_predicates(&self) -> impl Iterator<Item = &PredicateDef> {
+        self.predicates
+            .iter()
+            .filter(|p| self.canonical(p.id) == p.id)
+    }
+
+    /// Every predicate, synonyms included, in id order.
+    pub(crate) fn all_predicates(&self) -> &[PredicateDef] {
+        &self.predicates
     }
 
     /// Adds the vector of the next fact that has none.
@@ -268,15 +306,48 @@ impl State {
         Ok(())
     }
 
-    /// Makes `from` a synonym of `into`.
-    ///
-    /// TODO(core-B): check both exist, `into` is canonical, `from` is not
-    /// merged yet and is not `into`, value type and cardinality match;
-    /// then set `canonical[from] = into` and move the `pairs` entries of
-    /// `from` under `into`, keeping lineage order (sort by first version).
+    /// Makes `from` a synonym of `into`: both exist, `into` is canonical,
+    /// `from` is canonical (not merged yet) and not `into`, and value type
+    /// and cardinality match. The pairs of `from` move under `into`, their
+    /// lineages ordered by first version so the order never depends on how
+    /// the state was built.
     fn merge_predicate(&mut self, from: PredicateId, into: PredicateId) -> Result<(), String> {
-        let _ = (from, into);
-        Err("merging predicates is not implemented yet".to_owned())
+        let f = self
+            .predicate(from)
+            .ok_or_else(|| format!("unknown predicate {from}"))?;
+        let t = self
+            .predicate(into)
+            .ok_or_else(|| format!("unknown predicate {into}"))?;
+        if from == into {
+            return Err(format!("cannot merge {from} into itself"));
+        }
+        if self.canonical(into) != into {
+            return Err(format!("{into} is itself a synonym"));
+        }
+        if self.canonical(from) != from {
+            return Err(format!("{from} is already merged"));
+        }
+        if f.object != t.object || f.cardinality != t.cardinality {
+            return Err(format!(
+                "{from} and {into} differ in value type or cardinality"
+            ));
+        }
+        self.canonical[from.index()] = into;
+        let moved: Vec<(EntityId, PredicateId)> = self
+            .pairs
+            .keys()
+            .filter(|(_, p)| *p == from)
+            .copied()
+            .collect();
+        for key in moved {
+            let Some(lineages) = self.pairs.remove(&key) else {
+                continue;
+            };
+            let target = self.pairs.entry((key.0, into)).or_default();
+            target.extend(lineages);
+            target.sort_by_key(|l| l.first());
+        }
+        Ok(())
     }
 
     /// Adds a fact. Its entities and predicate may live in any space: the
