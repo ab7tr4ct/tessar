@@ -85,7 +85,9 @@ the journal admits one process.
   If the daemon's differs, `tessar mcp` starts the replacement from the
   current binary as `tessar daemon --takeover <old pid>` and waits for it to
   listen. The replacement gets in line for the journal lock, then sends the
-  old daemon SIGTERM itself and waits up to 20 s for it to let go. Being in
+  old daemon SIGTERM itself and waits up to 20 s for it to let go. It
+  signals that pid only if the socket or the pid file says it is the daemon
+  of this home; otherwise it signals nobody and just waits. Being in
   line first, it has the journal the moment the old daemon releases it, so a
   daemon that another session's (older) proxy starts in that moment finds
   the journal taken and steps aside. A replacement that waits while another

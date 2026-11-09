@@ -292,6 +292,11 @@ impl<T: Serialize + DeserializeOwned> Log<T> for FileJournal<T> {
     }
 }
 
+/// How many times a journal is opened and locked before giving up on a
+/// path that keeps naming another file. One rewrite in between costs one
+/// more attempt; nothing rewrites a journal eight times in a row.
+const LOCK_ATTEMPTS: usize = 8;
+
 /// Takes the lock or fails with [`LogError::Locked`].
 fn try_lock(file: &File) -> Result<(), LogError> {
     match file.try_lock() {
@@ -317,13 +322,16 @@ fn lock_waiting(file: &File) -> Result<(), LogError> {
 /// `lock`. The lock belongs to the file that was opened, and a rewrite may
 /// rename a new file over the path between the open and the lock; a lock on
 /// the old, now nameless file would protect nothing. So the path is checked
-/// again under the lock, and if it names another file the open is repeated.
+/// again under the lock, and if it names another file the open is repeated,
+/// up to [`LOCK_ATTEMPTS`] times: a path that never names the file just
+/// opened (a file system without stable file numbers, or something that
+/// replaces the file in a loop) is an error, not a reason to spin for ever.
 fn lock_file(
     path: &Path,
     create: bool,
     lock: impl Fn(&File) -> Result<(), LogError>,
 ) -> Result<File, LogError> {
-    loop {
+    for _ in 0..LOCK_ATTEMPTS {
         let file = OpenOptions::new()
             .read(true)
             .append(true)
@@ -334,6 +342,12 @@ fn lock_file(
             return Ok(file);
         }
     }
+    Err(std::io::Error::other(format!(
+        "{} was replaced by another file each of the {LOCK_ATTEMPTS} times it was opened and \
+         locked; giving up",
+        path.display()
+    ))
+    .into())
 }
 
 /// Whether `path` still names the open `file`.
@@ -464,4 +478,52 @@ fn first_line(bytes: &[u8]) -> String {
         .unwrap_or(bytes.len())
         .min(64);
     String::from_utf8_lossy(&bytes[..end]).into_owned()
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    #[test]
+    fn a_path_that_keeps_naming_another_file_is_given_up_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.log");
+        let other = dir.path().join("other.log");
+        let attempts = Cell::new(0);
+        // Every time the file is locked, another one takes its name.
+        let replaced_under_the_lock = |_: &File| {
+            attempts.set(attempts.get() + 1);
+            fs::write(&other, HEADER)?;
+            fs::rename(&other, &path)?;
+            Ok(())
+        };
+        let err = lock_file(&path, true, replaced_under_the_lock).unwrap_err();
+        assert_eq!(attempts.get(), LOCK_ATTEMPTS);
+        assert!(matches!(err, LogError::Io(_)), "{err}");
+        assert!(
+            err.to_string().contains("replaced by another file"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_file_replaced_a_few_times_is_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.log");
+        let other = dir.path().join("other.log");
+        let attempts = Cell::new(0);
+        let replaced_twice = |_: &File| {
+            attempts.set(attempts.get() + 1);
+            if attempts.get() <= 2 {
+                fs::write(&other, HEADER)?;
+                fs::rename(&other, &path)?;
+            }
+            Ok(())
+        };
+        let file = lock_file(&path, true, replaced_twice).unwrap();
+        assert_eq!(attempts.get(), 3);
+        assert!(still_at(&file, &path).unwrap());
+    }
 }

@@ -740,6 +740,53 @@ fn old_daemon_process(
     OldDaemonProcess { pid, _alive: alive }
 }
 
+/// A listener on the socket of a home that answers every connection as a
+/// daemon with the given pid would: it reads the header and sends a hello.
+/// It runs on a thread of its own, for tests without a runtime, and stops
+/// when dropped.
+struct Greeter {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Greeter {
+    fn start(home: &Path, pid: u32) -> Self {
+        use std::io::{BufRead, Write};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let listener = std::os::unix::net::UnixListener::bind(socket_path(home)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::clone(&stop);
+        let thread = std::thread::spawn(move || {
+            while !stopped.load(Ordering::SeqCst) {
+                let Ok((stream, _)) = listener.accept() else {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                };
+                let _ = stream.set_nonblocking(false);
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+                let mut header = String::new();
+                let _ = std::io::BufReader::new(&stream).read_line(&mut header);
+                let hello = format!("{{\"tessar\":1,\"build\":\"0.0.1+old.1\",\"pid\":{pid}}}\n");
+                let _ = (&stream).write_all(hello.as_bytes());
+            }
+        });
+        Self {
+            stop,
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for Greeter {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 /// Runs the real `tessar` with `args` on `home`, pointed at a missing model
 /// and away from the user's own home, so that nothing outside `home` is
 /// touched: a daemon that gets the journal fails on the model.
@@ -1081,11 +1128,18 @@ async fn an_upgrade_survives_an_old_proxy_that_starts_its_own_daemon_at_once() {
 /// lets go; at that very moment a daemon of the kind an old proxy starts
 /// (the real `tessar daemon`) goes for the journal too.
 ///
+/// The takeover signals only a process it can tell is the daemon of the
+/// home, so the stand-in is given the daemon's voice: a listener on the
+/// socket that answers every connection with a hello naming its pid.
+///
 /// The model is missing, so a daemon that gets the journal would fail at
 /// once and let it go again. To see who has it, the pid file is a FIFO: the
 /// daemon writes its pid as soon as it holds the journal, and that blocks
 /// until the test reads. Whoever holds the journal is stuck there, holding
-/// it, and its pid is what the test reads.
+/// it, and its pid is what the test reads. (A FIFO is never read as a pid
+/// file, so nothing blocks on it but that write. Once the test has read
+/// it, the takeover goes on, finds no model and exits; the guard below
+/// kills it if it has not by then, and reaps it.)
 fn takeover_by_the_binary(hold: Duration) {
     use tessar_core::store::Op;
     use tessar_journal::FileJournal;
@@ -1123,6 +1177,8 @@ fn takeover_by_the_binary(hold: Duration) {
             || {},
         )
     };
+
+    let _voice = Greeter::start(&dir, old.pid);
 
     let takeover = tessar(&dir, &["daemon", "--takeover", &old.pid.to_string()])
         .spawn()
@@ -1235,4 +1291,63 @@ fn a_daemon_does_not_step_aside_for_a_lock_held_for_an_instant() {
         out.status
     );
     drop(journal);
+}
+
+/// An old daemon that is hung: it greeted this proxy once, and then accepts
+/// connections without ever answering. While the proxy waits for the
+/// replacement, a daemon that says nothing is not the replacement: the wait
+/// must end with "no daemon answered", not hand that connection on to fail
+/// later as a daemon "without the handshake".
+#[tokio::test]
+async fn a_daemon_that_says_nothing_is_not_taken_for_the_replacement() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let home = tempfile::tempdir().unwrap();
+    let dir = home.path().to_path_buf();
+    let listener = UnixListener::bind(socket_path(&dir)).unwrap();
+    let old_pid = std::process::id();
+    let old_daemon = tokio::spawn(async move {
+        let mut held = Vec::new();
+        let mut first = true;
+        while let Ok((stream, _)) = listener.accept().await {
+            let (r, mut w) = tokio::io::split(stream);
+            let mut r = BufReader::new(r);
+            if std::mem::take(&mut first) {
+                let mut header = String::new();
+                let _ = r.read_line(&mut header).await;
+                let hello =
+                    format!("{{\"tessar\":1,\"build\":\"0.0.1+old.1\",\"pid\":{old_pid}}}\n");
+                let _ = w.write_all(hello.as_bytes()).await;
+            }
+            held.push((r, w));
+        }
+    });
+    // The replacement never comes up; nothing here signals anybody.
+    let stand_ins = StandIns::default();
+    let (spawn, calls) = {
+        let stand_ins = stand_ins.clone();
+        counting(move |_, _, mode| {
+            assert_eq!(mode, proxy::Start::Takeover(old_pid));
+            stand_ins.start()
+        })
+    };
+    let launcher = proxy::Launcher {
+        wait: Duration::from_millis(700),
+        grace: Duration::ZERO,
+        respawn_pause: Duration::from_secs(60),
+        spawn,
+    };
+    let started = std::time::Instant::now();
+    let err = proxy::open_current_with(&dir, "alpha", Path::new("/work/x"), false, &launcher)
+        .await
+        .err()
+        .expect("a daemon that never answered was taken for the new one");
+    assert!(err.contains("no daemon answered"), "{err}");
+    assert!(!err.contains("predates"), "{err}");
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    old_daemon.abort();
 }

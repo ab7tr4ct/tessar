@@ -81,9 +81,14 @@ pub fn remove_pid_file(home: &Path) {
     }
 }
 
-/// The pid in the pid file, if there is a sane one.
+/// The pid in the pid file, if there is a sane one. Only a regular file is
+/// read: opening anything else at that path (a FIFO, say) could block.
 pub fn read_pid_file(home: &Path) -> Option<u32> {
-    parse_pid(&std::fs::read_to_string(pid_path(home)).ok()?)
+    let path = pid_path(home);
+    if !std::fs::metadata(&path).ok()?.is_file() {
+        return None;
+    }
+    parse_pid(&std::fs::read_to_string(path).ok()?)
 }
 
 /// A pid that is safe to signal: not 0 (our process group), not 1 (init),
@@ -184,6 +189,13 @@ pub enum Takeover {
 /// `old` that is gone already is fine, the lock is then free or soon will
 /// be.
 ///
+/// The pid comes from the command line, and the journal may be held by
+/// something else than a daemon (a `tessar mcp --standalone`, a purge). So
+/// the rule of this module holds here too: `old` is signalled only if it is
+/// the daemon of `home`, by its own word on the socket or by the pid file,
+/// which is trusted because the journal is held. Otherwise nobody is
+/// signalled and the replacement just waits in line.
+///
 /// The wait ends without the journal ([`Takeover::Aside`]) after `wait`, or
 /// as soon as a daemon other than `old` answers on the socket: two sessions
 /// that upgrade together both start a replacement, and the one that lost
@@ -211,7 +223,15 @@ pub fn take_over(home: &Path, old: u32, wait: Duration) -> Result<Takeover, Stri
     std::thread::sleep(LOCK_HEAD_START);
     let mut early = journal.try_recv().ok();
     if early.is_none() {
-        terminate_or_gone(old)?;
+        if is_daemon_of(home, old) {
+            terminate_or_gone(old)?;
+        } else {
+            logln!(
+                "tessar: not signalling pid {old}: neither the socket nor the pid file of {} \
+                 says it is the daemon there; waiting for the journal",
+                home.display()
+            );
+        }
     }
     let started = Instant::now();
     loop {
@@ -230,7 +250,7 @@ pub fn take_over(home: &Path, old: u32, wait: Duration) -> Result<Takeover, Stri
                     }
                     if started.elapsed() >= wait {
                         return Ok(Takeover::Aside(format!(
-                            "the daemon it was to replace (pid {old}) kept the journal for {}s",
+                            "the journal was not released within {}s (it was to replace pid {old})",
                             wait.as_secs()
                         )));
                     }
@@ -240,6 +260,14 @@ pub fn take_over(home: &Path, old: u32, wait: Duration) -> Result<Takeover, Stri
         };
         return got.map(Takeover::Journal).map_err(failed);
     }
+}
+
+/// Whether `pid` is the daemon of `home`, for a caller that found the
+/// journal held: the pid file names it (a daemon writes the file as soon as
+/// it holds the journal), or it answers on the socket and says so (which
+/// also covers builds that wrote the pid file only once they listened).
+fn is_daemon_of(home: &Path, pid: u32) -> bool {
+    read_pid_file(home) == Some(pid) || serving_pid(home) == Some(pid)
 }
 
 /// The pid of the daemon that answers on the socket of `home`, if one
@@ -530,6 +558,8 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let old = bystander();
         let journal = hold_journal(home.path());
+        // What makes it the daemon of this home: the pid file names it.
+        std::fs::write(pid_path(home.path()), format!("{}\n", old.pid())).unwrap();
         // The "daemon" lets go of the journal when it dies, as one does.
         let released = old.when_ended(move || drop(journal));
         let journal = took(take_over(home.path(), old.pid(), Duration::from_secs(20)));
@@ -540,6 +570,46 @@ mod tests {
         assert!(!status.success());
         assert!(journal_in_use(home.path()));
         drop(journal);
+    }
+
+    /// The pid on the command line is not enough. With the journal held by
+    /// something that is not a daemon (a standalone session, a purge) and
+    /// nothing saying that the process named is the daemon of this home, it
+    /// is not signalled: the replacement only waits in line.
+    #[test]
+    fn a_takeover_signals_nobody_it_cannot_tell_is_the_daemon() {
+        let home = tempfile::tempdir().unwrap();
+        let named = bystander();
+        let other = bystander();
+        // A pid file that names somebody else is no evidence either.
+        std::fs::write(pid_path(home.path()), format!("{}\n", other.pid())).unwrap();
+        let journal = hold_journal(home.path());
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(400));
+            drop(journal);
+        });
+        let started = Instant::now();
+        let journal = took(take_over(home.path(), named.pid(), Duration::from_secs(20)));
+        assert!(
+            started.elapsed() >= Duration::from_millis(300),
+            "did not wait for the journal"
+        );
+        named.assert_alive();
+        other.assert_alive();
+        release.join().unwrap();
+        drop(journal);
+    }
+
+    /// Anything but a regular file at the pid file's path is not read:
+    /// opening a FIFO would block for ever.
+    #[test]
+    fn a_pid_file_that_is_not_a_regular_file_is_not_read() {
+        let home = tempfile::tempdir().unwrap();
+        let made = Command::new("mkfifo").arg(pid_path(home.path())).status();
+        assert!(made.unwrap().success());
+        assert_eq!(read_pid_file(home.path()), None);
+        remove_pid_file(home.path());
+        assert!(pid_path(home.path()).exists());
     }
 
     /// A free journal is taken at once, and nobody is signalled for it.
@@ -581,7 +651,7 @@ mod tests {
         let _journal = hold_journal(home.path());
         let started = Instant::now();
         let why = stepped_aside(take_over(home.path(), pid, Duration::from_millis(300)));
-        assert!(why.contains("kept the journal"), "{why}");
+        assert!(why.contains("was not released"), "{why}");
         assert!(started.elapsed() < Duration::from_secs(5));
     }
 

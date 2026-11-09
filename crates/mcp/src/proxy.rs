@@ -610,8 +610,9 @@ impl Drop for Started {
 
 /// Waits up to the launcher's `wait` for a daemon to listen, `child` being
 /// the one just started. With `old`, the daemon wanted is the replacement
-/// for the one with that pid, which may still listen for a moment: a daemon
-/// that says it is `old` does not count.
+/// for the one with that pid, which may still listen for a moment: only a
+/// daemon that says it is another one counts, not one that says it is `old`
+/// and not one that says nothing.
 ///
 /// A daemon that failed (no model, say) will never listen: that is an
 /// error. One that exited cleanly found another process holding the
@@ -638,12 +639,19 @@ async fn await_daemon(
             let Some(old) = old else {
                 return Ok(stream);
             };
-            // Whoever does not say it is the old daemon is taken; if it says
-            // nothing at all, opening the session reports that.
-            if status(stream).await.is_ok_and(|hello| hello.pid == old) {
-                old_serves = true;
-            } else if let Ok(stream) = UnixStream::connect(&socket).await {
-                return Ok(stream);
+            // Only a daemon that says it is another one than the old is the
+            // replacement. One that says nothing may be the old daemon,
+            // hung or busy: keep waiting, for no longer than is left.
+            let left = launcher.wait.saturating_sub(started.elapsed());
+            let said = tokio::time::timeout(left.max(DAEMON_POLL), status(stream)).await;
+            match said {
+                Ok(Ok(hello)) if hello.pid == old => old_serves = true,
+                Ok(Ok(_)) => {
+                    if let Ok(stream) = UnixStream::connect(&socket).await {
+                        return Ok(stream);
+                    }
+                }
+                Ok(Err(_)) | Err(_) => {}
             }
         }
         if stepped_aside.is_none()
