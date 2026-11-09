@@ -30,6 +30,13 @@ use tessar_mcp::purge;
 use tessar_mcp::server::TessarServer;
 use tokio::net::{UnixListener, UnixStream};
 
+/// A line on stderr that cannot panic; see [`tessar_mcp::log`].
+macro_rules! logln {
+    ($($arg:tt)*) => {
+        tessar_mcp::log(format_args!($($arg)*))
+    };
+}
+
 #[cfg(not(any(feature = "candle", feature = "llama")))]
 compile_error!("enable at least one embedder feature of tessar-mcp: `candle` (default) or `llama`");
 
@@ -43,12 +50,17 @@ USAGE:
                                when none runs and restarted when it is another
                                build than this binary (--keep-daemon: never
                                restart it); --standalone serves in process
-    tessar daemon [--home DIR] [--idle-exit MINUTES]
+    tessar daemon [--home DIR] [--idle-exit MINUTES] [--takeover PID]
                                hold the memory and the model and serve every
-                               session on DIR/tessar.sock
+                               session on DIR/tessar.sock. If another process
+                               holds the memory it exits at once. --takeover
+                               replaces the daemon with that pid: it gets in
+                               line for the memory, sends the old daemon
+                               SIGTERM and waits up to 20 s for it to let go
+                               (how `tessar mcp` upgrades a daemon)
     tessar daemon stop|status [--home DIR]
-                               stop the daemon (SIGTERM to the pid in
-                               DIR/tessar.pid), or print its build, pid, uptime
+                               stop the daemon (SIGTERM to the pid it reports
+                               on its socket), or print its build, pid, uptime
                                and open sessions
     tessar redact fNN... [--purge] [--home DIR]
                                destroy the content of facts by handle (starts
@@ -98,7 +110,7 @@ fn cached(home: &Path, inner: Arc<dyn Embedder>) -> Arc<dyn Embedder> {
         });
     match opened {
         Ok(cache) => {
-            eprintln!(
+            logln!(
                 "tessar: vector cache {}: {} vectors",
                 path.display(),
                 cache.len()
@@ -106,7 +118,7 @@ fn cached(home: &Path, inner: Arc<dyn Embedder>) -> Arc<dyn Embedder> {
             Arc::new(cache)
         }
         Err(e) => {
-            eprintln!(
+            logln!(
                 "tessar: vector cache {} unusable, embedding without it: {e}",
                 path.display()
             );
@@ -129,6 +141,8 @@ enum Cli {
     Daemon {
         home: PathBuf,
         idle_exit: Option<Duration>,
+        /// The pid of the daemon to replace.
+        takeover: Option<u32>,
     },
     DaemonStop {
         home: PathBuf,
@@ -179,7 +193,11 @@ fn main() -> ExitCode {
             println!("tessar {}", tessar_mcp::BUILD_ID);
             ExitCode::SUCCESS
         }
-        Ok(Cli::Daemon { home, idle_exit }) => run_daemon(&home, idle_exit),
+        Ok(Cli::Daemon {
+            home,
+            idle_exit,
+            takeover,
+        }) => run_daemon(&home, idle_exit, takeover),
         Ok(Cli::Purge { home }) => run_purge(&home),
         Ok(Cli::Redact {
             home,
@@ -196,7 +214,7 @@ fn main() -> ExitCode {
 }
 
 fn fail(message: &str) -> ExitCode {
-    eprintln!("tessar: {message}");
+    logln!("tessar: {message}");
     ExitCode::FAILURE
 }
 
@@ -232,6 +250,7 @@ fn parse(args: &[String], env: impl Fn(&str) -> Option<std::ffi::OsString>) -> R
     let mut standalone = false;
     let mut keep_daemon = false;
     let mut idle_exit = None;
+    let mut takeover = None;
     let mut it = rest.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -241,6 +260,12 @@ fn parse(args: &[String], env: impl Fn(&str) -> Option<std::ffi::OsString>) -> R
             a if a.starts_with("--home=") => home = Some(PathBuf::from(&a["--home=".len()..])),
             "--standalone" if command == "mcp" => standalone = true,
             "--keep-daemon" if command == "mcp" => keep_daemon = true,
+            "--takeover" if command == "daemon" && control.is_none() => {
+                takeover = Some(daemon_pid(it.next().ok_or("--takeover needs a pid")?)?);
+            }
+            a if a.starts_with("--takeover=") && command == "daemon" && control.is_none() => {
+                takeover = Some(daemon_pid(&a["--takeover=".len()..])?);
+            }
             "--idle-exit" if command == "daemon" && control.is_none() => {
                 idle_exit = Some(minutes(it.next().ok_or("--idle-exit needs minutes")?)?);
             }
@@ -262,7 +287,11 @@ fn parse(args: &[String], env: impl Fn(&str) -> Option<std::ffi::OsString>) -> R
         },
         (_, Some("stop")) => Cli::DaemonStop { home },
         (_, Some(_)) => Cli::DaemonStatus { home },
-        _ => Cli::Daemon { home, idle_exit },
+        _ => Cli::Daemon {
+            home,
+            idle_exit,
+            takeover,
+        },
     })
 }
 
@@ -353,6 +382,12 @@ fn parse_hook(
         (None, _) => default_home(env)?,
     };
     Ok(Cli::Hook { home, kind })
+}
+
+/// The pid of a daemon to replace: one that may be signalled.
+fn daemon_pid(text: &str) -> Result<u32, String> {
+    lifecycle::parse_pid(text)
+        .ok_or_else(|| format!("--takeover wants the pid of the daemon to replace, got `{text}`"))
 }
 
 fn minutes(text: &str) -> Result<Duration, String> {
@@ -537,7 +572,7 @@ fn open_memory(
         Backend::Candle => load_candle(home, &model)?,
         Backend::Llama => load_llama(&model)?,
     };
-    eprintln!("tessar: embedder {}", loaded.description);
+    logln!("tessar: embedder {}", loaded.description);
     // The index holds 1024 components per vector; a shorter model cannot fill it.
     if loaded.dims < INDEX_DIMS {
         return Err(format!(
@@ -550,9 +585,9 @@ fn open_memory(
     // build on macOS); pay for it here, not in the first request.
     let started = std::time::Instant::now();
     if let Err(e) = loaded.embedder.embed_query("warm-up") {
-        eprintln!("tessar: embedder warm-up failed: {e}");
+        logln!("tessar: embedder warm-up failed: {e}");
     }
-    eprintln!(
+    logln!(
         "tessar: embedder warm-up took {} ms",
         started.elapsed().as_millis()
     );
@@ -600,6 +635,9 @@ fn run_standalone(home: &Path) -> ExitCode {
         }
         Err(e) => return fail(&format!("cannot open the journal: {e}")),
     };
+    // Whoever holds the journal knows that no daemon runs: a pid file still
+    // there is stale, and `tessar daemon stop` must not act on it.
+    let _ = std::fs::remove_file(lifecycle::pid_path(home));
     let clock = Arc::new(SystemClock);
     let memory = match open_memory(home, journal, clock.clone()) {
         Ok(m) => m,
@@ -611,7 +649,7 @@ fn run_standalone(home: &Path) -> ExitCode {
         Ok(a) => a,
         Err(e) => return fail(&format!("cannot prepare the memory: {e}")),
     };
-    eprintln!(
+    logln!(
         "tessar: serving {} (project space `{project}`)",
         home.display()
     );
@@ -639,18 +677,66 @@ fn run_standalone(home: &Path) -> ExitCode {
 
 // ---- tessar daemon -------------------------------------------------
 
-fn run_daemon(home: &Path, idle_exit: Option<Duration>) -> ExitCode {
+/// The daemon's pid file, removed when the daemon ends, however it ends.
+struct PidFile<'a>(&'a Path);
+
+impl Drop for PidFile<'_> {
+    fn drop(&mut self) {
+        lifecycle::remove_pid_file(self.0);
+    }
+}
+
+/// How long a daemon that found the journal locked waits before it looks
+/// once more. A check whether the journal is in use (`tessar daemon stop`,
+/// the prompt hook) holds the lock for an instant; a daemon that stepped
+/// aside for that would leave nobody running.
+const LOCKED_RETRY: Duration = Duration::from_millis(50);
+
+/// Opens the journal for a daemon; `None` if another process keeps it.
+fn daemon_journal(home: &Path) -> Result<Option<FileJournal<Op>>, LogError> {
+    for attempt in 0..2 {
+        if attempt > 0 {
+            std::thread::sleep(LOCKED_RETRY);
+        }
+        match open_journal(home) {
+            Ok(journal) => return Ok(Some(journal)),
+            Err(LogError::Locked) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(None)
+}
+
+fn run_daemon(home: &Path, idle_exit: Option<Duration>, takeover: Option<u32>) -> ExitCode {
     if let Err(e) = create_home(home) {
         return fail(&e);
     }
-    let journal = match open_journal(home) {
-        Ok(j) => j,
-        Err(LogError::Locked) => {
-            eprintln!("tessar: a tessar daemon is already running");
-            return ExitCode::SUCCESS;
-        }
-        Err(e) => return fail(&format!("cannot open the journal: {e}")),
+    let journal = match takeover {
+        // The replacement for a daemon: it gets in line for the journal and
+        // then stops the old daemon itself.
+        Some(old) => match lifecycle::take_over(home, old, lifecycle::TAKEOVER_WAIT) {
+            Ok(lifecycle::Takeover::Journal(j)) => j,
+            Ok(lifecycle::Takeover::Aside(why)) => {
+                logln!("tessar: not taking over: {why}");
+                return ExitCode::SUCCESS;
+            }
+            Err(e) => return fail(&e),
+        },
+        None => match daemon_journal(home) {
+            Ok(Some(j)) => j,
+            Ok(None) => {
+                logln!("tessar: a tessar daemon is already running");
+                return ExitCode::SUCCESS;
+            }
+            Err(e) => return fail(&format!("cannot open the journal: {e}")),
+        },
     };
+    // From here on this process is the daemon, also while the model loads:
+    // the pid file says so for as long as the journal is held.
+    if let Err(e) = lifecycle::write_pid_file(home) {
+        logln!("tessar: cannot write the pid file: {e}");
+    }
+    let _pid_file = PidFile(home);
     // Loading the model takes seconds and a signal during it is not
     // handled: the default action ends the process, and nothing is lost
     // because nothing is served yet. Signals are installed below, once the
@@ -666,26 +752,28 @@ fn run_daemon(home: &Path, idle_exit: Option<Duration>) -> ExitCode {
     };
     let socket = socket_path(home);
     let served = runtime.block_on(async {
+        // A failure to bind leaves the socket alone: it may be another
+        // process's.
         let listener = bind(&socket).await?;
-        eprintln!(
+        logln!(
             "tessar: daemon serving {} on {}",
             home.display(),
             socket.display()
         );
-        if let Err(e) = lifecycle::write_pid_file(home) {
-            eprintln!("tessar: cannot write the pid file: {e}");
-        }
-        eprintln!(
+        logln!(
             "tessar: build {}, pid {}",
             tessar_mcp::BUILD_ID,
             std::process::id()
         );
         let projects = Arc::new(Projects::new(memory, clock));
-        daemon::run(listener, projects, idle_exit, termination()).await;
+        daemon::run(listener, Arc::clone(&projects), idle_exit, termination()).await;
+        // The socket file goes while the journal is still held, so a
+        // daemon that takes the journal next never has its own socket
+        // removed by this one.
+        let _ = std::fs::remove_file(&socket);
+        drop(projects);
         Ok::<(), String>(())
     });
-    let _ = std::fs::remove_file(&socket);
-    lifecycle::remove_pid_file(home);
     match served {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => fail(&e),
@@ -720,7 +808,7 @@ async fn termination() {
         signal(SignalKind::terminate()),
         signal(SignalKind::interrupt()),
     ) else {
-        eprintln!("tessar: cannot install signal handlers");
+        logln!("tessar: cannot install signal handlers");
         std::future::pending::<()>().await;
         return;
     };
@@ -767,7 +855,7 @@ fn run_redact(home: &Path, handles: &[String], purge: bool) -> ExitCode {
             match proxy::redact_fact(&server.daemon(), handle).await {
                 Ok(line) => println!("{line}"),
                 Err(e) => {
-                    eprintln!("tessar: {e}");
+                    logln!("tessar: {e}");
                     failed = true;
                 }
             }
@@ -791,16 +879,14 @@ fn run_redact(home: &Path, handles: &[String], purge: bool) -> ExitCode {
 /// Stops the daemon if one runs, rewrites the journal without redacted
 /// content and drops the vector cache.
 fn run_purge(home: &Path) -> ExitCode {
-    let stopped = match runtime().and_then(|rt| {
-        let running = lifecycle::read_pid_file(home).is_some();
-        let message = rt.block_on(lifecycle::stop(home))?;
-        Ok((running, message))
-    }) {
-        Ok((running, message)) => {
-            if running {
-                eprintln!("tessar: {message}");
+    let stopped = match runtime().and_then(|rt| rt.block_on(lifecycle::stop(home))) {
+        Ok(message) => {
+            let stopped = message.starts_with("stopped");
+            // Say what happened, unless there was nothing at all to stop.
+            if stopped || message.contains("stale") {
+                logln!("tessar: {message}");
             }
-            running && message.starts_with("stopped")
+            stopped
         }
         Err(e) => return fail(&e),
     };
@@ -830,17 +916,21 @@ fn run_hook(home: &Path, kind: HookKind) -> ExitCode {
     }
     let mut stdin = String::new();
     if let Err(e) = std::io::stdin().read_to_string(&mut stdin) {
-        eprintln!("tessar hook: cannot read stdin: {e}");
+        logln!("tessar hook: cannot read stdin: {e}");
         return ExitCode::SUCCESS;
     }
     let settings = hook::Settings::from_env(|name| std::env::var(name).ok());
     let result = runtime().and_then(|rt| {
-        rt.block_on(async {
+        let result = rt.block_on(async {
             match kind {
                 HookKind::Prompt => hook::run_prompt(home, &stdin, &settings).await,
                 _ => hook::run_session(home, &stdin, &settings).await,
             }
-        })
+        });
+        // Do not wait for work the time limit left behind (a `git` that
+        // hangs): the process is about to exit.
+        rt.shutdown_background();
+        result
     });
     match result {
         Ok(text) => {
@@ -848,7 +938,7 @@ fn run_hook(home: &Path, kind: HookKind) -> ExitCode {
             let _ = out.write_all(text.as_bytes());
             let _ = out.flush();
         }
-        Err(e) => eprintln!("tessar hook: {e}"),
+        Err(e) => logln!("tessar hook: {e}"),
     }
     ExitCode::SUCCESS
 }
@@ -868,14 +958,17 @@ fn run_proxy(home: &Path, keep_daemon: bool) -> ExitCode {
     let result = runtime.block_on(async {
         let opened = proxy::open_current(home, &project, &cwd, DAEMON_WAIT, keep_daemon).await?;
         let (server, link) = opened.serve().await?;
-        eprintln!("tessar: connected to the daemon (project space `{project}`)");
+        logln!("tessar: connected to the daemon (project space `{project}`)");
         let reconnect: proxy::Reconnect = {
             let (home, project, cwd) = (home.to_path_buf(), project.clone(), cwd.clone());
             Arc::new(move || {
                 let (home, project, cwd) = (home.clone(), project.clone(), cwd.clone());
                 Box::pin(async move {
+                    // Not at once: the daemon was most likely replaced, and
+                    // the replacement must get the journal first.
+                    let launcher = proxy::Launcher::new(DAEMON_WAIT).reconnecting();
                     let opened =
-                        proxy::open_current(&home, &project, &cwd, DAEMON_WAIT, keep_daemon)
+                        proxy::open_current_with(&home, &project, &cwd, keep_daemon, &launcher)
                             .await?;
                     let (server, link) = opened.serve().await?;
                     Ok((server.daemon(), link))
@@ -1032,14 +1125,43 @@ mod tests {
             p(&["daemon", "--home=/d", "--idle-exit", "30"], &[]).unwrap(),
             Cli::Daemon {
                 home: "/d".into(),
-                idle_exit: Some(Duration::from_secs(1800))
+                idle_exit: Some(Duration::from_secs(1800)),
+                takeover: None
             }
         );
+        assert_eq!(
+            p(&["daemon", "--home", "/d", "--takeover", "4242"], &[]).unwrap(),
+            Cli::Daemon {
+                home: "/d".into(),
+                idle_exit: None,
+                takeover: Some(4242)
+            }
+        );
+        assert_eq!(
+            p(&["daemon", "--takeover=4242"], &[("HOME", "/u")]).unwrap(),
+            Cli::Daemon {
+                home: "/u/.tessar".into(),
+                idle_exit: None,
+                takeover: Some(4242)
+            }
+        );
+        // A pid is required, and it must be one that may be signalled.
+        for bad in [
+            &["daemon", "--takeover"][..],
+            &["daemon", "--takeover", "1"],
+            &["daemon", "--takeover=0"],
+            &["daemon", "--takeover", "--home"],
+        ] {
+            assert!(p(bad, &[("HOME", "/u")]).is_err(), "{bad:?}");
+        }
+        assert!(p(&["mcp", "--takeover", "4242"], &[("HOME", "/u")]).is_err());
+        assert!(p(&["daemon", "stop", "--takeover", "4242"], &[("HOME", "/u")]).is_err());
         assert_eq!(
             p(&["daemon"], &[("HOME", "/u")]).unwrap(),
             Cli::Daemon {
                 home: "/u/.tessar".into(),
-                idle_exit: None
+                idle_exit: None,
+                takeover: None
             }
         );
         assert!(p(&["daemon", "--idle-exit", "0"], &[("HOME", "/u")]).is_err());

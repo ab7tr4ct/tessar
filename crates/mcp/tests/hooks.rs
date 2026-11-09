@@ -407,9 +407,16 @@ async fn run_prompt_uses_the_running_daemon_and_the_cwd_project() {
     let stdin = json!({"session_id": "s", "cwd": cwd.path(),
         "prompt": "in which language should the user be talked to"})
     .to_string();
-    let out = hook::run_prompt(home.path(), &stdin, &Settings::default())
-        .await
-        .unwrap();
+    // A generous limit: this test is about the answer, not the time.
+    let out = hook::run_prompt_with(
+        home.path(),
+        &stdin,
+        &Settings::default(),
+        Duration::from_secs(20),
+        &no_spawn(),
+    )
+    .await
+    .unwrap();
     assert!(out.contains("Russian"), "{out}");
     // Garbage on stdin is an error for the caller to log, not a panic.
     assert!(
@@ -469,4 +476,178 @@ async fn redact_fact_goes_through_the_daemon() {
     drop(hook);
     daemon.shutdown().await;
     drop(home);
+}
+
+/// A spawner that must not be called.
+fn no_spawn() -> proxy::Spawn {
+    Arc::new(|_, _| Err("the hook started a daemon".to_owned()))
+}
+
+/// A spawner that counts its calls and starts a process that just exits.
+fn counting_spawn() -> (proxy::Spawn, Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&calls);
+    let spawn: proxy::Spawn = Arc::new(move |_, start| {
+        assert_eq!(start, proxy::Start::Fresh);
+        count.fetch_add(1, Ordering::SeqCst);
+        std::process::Command::new("true")
+            .spawn()
+            .map_err(|e| e.to_string())
+    });
+    (spawn, calls)
+}
+
+fn prompt_stdin(cwd: &Path) -> String {
+    json!({"session_id": "s", "cwd": cwd,
+        "prompt": "in which language should the user be talked to"})
+    .to_string()
+}
+
+/// The prompt must not wait for a daemon that is down: the hook starts one
+/// for the next prompt and returns, long before its time limit.
+#[tokio::test]
+async fn prompt_hook_without_a_daemon_starts_one_and_returns_at_once() {
+    use std::sync::atomic::Ordering;
+    let home = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    let (spawn, calls) = counting_spawn();
+    let limit = Duration::from_secs(30);
+    let started = std::time::Instant::now();
+    let out = hook::run_prompt_with(
+        home.path(),
+        &prompt_stdin(cwd.path()),
+        &Settings::default(),
+        limit,
+        &spawn,
+    )
+    .await;
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "waited {:?} for a daemon",
+        started.elapsed()
+    );
+    let err = out.expect_err("nothing to print without a daemon");
+    assert!(err.contains("started one for the next prompt"), "{err}");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    // A daemon that holds the journal but does not listen yet (it loads
+    // the model) is not started a second time.
+    let journal = tessar_journal::FileJournal::<tessar_core::store::Op>::open(
+        home.path().join("journal.jsonl"),
+    )
+    .unwrap();
+    let err = hook::run_prompt_with(
+        home.path(),
+        &prompt_stdin(cwd.path()),
+        &Settings::default(),
+        limit,
+        &spawn,
+    )
+    .await
+    .expect_err("nothing to print without a daemon");
+    assert!(err.contains("it is starting"), "{err}");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    drop(journal);
+
+    // A prompt that is skipped anyway starts nothing.
+    let short = json!({"session_id": "s", "cwd": cwd.path(), "prompt": "ok"}).to_string();
+    let out = hook::run_prompt_with(home.path(), &short, &Settings::default(), limit, &spawn)
+        .await
+        .unwrap();
+    assert_eq!(out, "");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+/// A daemon that accepts the connection and then says nothing (one too old
+/// for the handshake, or one that hangs) costs the time limit and no more.
+#[tokio::test]
+async fn prompt_hook_gives_up_on_a_silent_daemon_at_its_limit() {
+    let home = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    let listener = UnixListener::bind(socket_path(home.path())).unwrap();
+    let silent = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
+        }
+    });
+    let limit = Duration::from_millis(300);
+    let started = std::time::Instant::now();
+    let err = hook::run_prompt_with(
+        home.path(),
+        &prompt_stdin(cwd.path()),
+        &Settings::default(),
+        limit,
+        &no_spawn(),
+    )
+    .await
+    .expect_err("a silent daemon gives nothing to print");
+    assert!(err.contains("no answer from the daemon"), "{err}");
+    assert!(started.elapsed() >= limit);
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "waited {:?}, far past the limit",
+        started.elapsed()
+    );
+    silent.abort();
+}
+
+#[test]
+fn the_prompt_hook_is_capped_at_about_a_second() {
+    assert!(hook::PROMPT_WAIT <= Duration::from_millis(1500));
+    assert!(hook::PROMPT_WAIT < hook::SESSION_WAIT);
+}
+
+/// The real binary: `tessar hook prompt` with no daemon prints nothing,
+/// exits with status 0 without waiting, and leaves a daemon starting. The
+/// daemon it starts finds no model (the environment points it at a missing
+/// file, so nothing outside the temp home is touched) and says so in the
+/// log, which is how the test knows it was started.
+#[test]
+fn hook_prompt_binary_does_not_wait_for_a_daemon() {
+    use std::io::Write;
+    let home = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    let started = std::time::Instant::now();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_tessar"))
+        .args(["hook", "prompt", "--home"])
+        .arg(home.path())
+        .env("HOME", home.path())
+        .env("TESSAR_MODEL", home.path().join("no-such-model.gguf"))
+        .env_remove("TESSAR_HOME")
+        .current_dir(cwd.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(prompt_stdin(cwd.path()).as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    let took = started.elapsed();
+    assert!(out.status.success(), "{:?}", out.status);
+    assert!(
+        out.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(took < Duration::from_secs(5), "the hook took {took:?}");
+    let log = home.path().join(daemon::LOG_FILE);
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let text = std::fs::read_to_string(&log).unwrap_or_default();
+        if text.contains("embedding model not found") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no daemon was started; log: {text:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }

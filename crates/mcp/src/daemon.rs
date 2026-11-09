@@ -56,6 +56,12 @@ pub const PROTOCOL: u32 = 1;
 /// The longest header line accepted, in bytes.
 const MAX_HEADER: u64 = 64 * 1024;
 
+/// How long a client gets to send its header. Clients send it right after
+/// connecting, so one that stays silent is not a tessar client; without a
+/// limit it would hold a connection open for good and keep an idle daemon
+/// from exiting.
+const HEADER_WAIT: Duration = Duration::from_secs(5);
+
 /// How long connections get to wind down after a shutdown signal.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 
@@ -261,7 +267,7 @@ impl Projects {
             self.mem.clone(),
             self.clock.clone(),
             project,
-            &|w| eprintln!("tessar: {w}"),
+            &|w| logln!("tessar: {w}"),
         )?);
         cache.insert(project.to_owned(), Arc::clone(&api));
         Ok(api)
@@ -270,7 +276,8 @@ impl Projects {
 
 /// Reads the header line, answers with the hello, then serves MCP on the
 /// rest of `stream` until the peer closes it or `stop` fires. A status
-/// request gets the extended hello and nothing more.
+/// request gets the extended hello and nothing more. A peer that sends no
+/// header within [`HEADER_WAIT`], or before `stop` fires, is dropped.
 pub async fn serve_connection<S>(
     stream: S,
     projects: Arc<Projects>,
@@ -284,12 +291,17 @@ where
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
-    // `take` bounds a peer that never sends a newline.
-    let read = (&mut reader)
-        .take(MAX_HEADER)
-        .read_line(&mut line)
-        .await
-        .map_err(|e| format!("cannot read the header: {e}"))?;
+    let mut stop = stop;
+    // `take` bounds a peer that never sends a newline, the timeout one that
+    // sends nothing.
+    let mut bounded = (&mut reader).take(MAX_HEADER);
+    let header = tokio::time::timeout(HEADER_WAIT, bounded.read_line(&mut line));
+    let read = tokio::select! {
+        read = header => read
+            .map_err(|_| format!("no header within {}s", HEADER_WAIT.as_secs()))?
+            .map_err(|e| format!("cannot read the header: {e}"))?,
+        _ = stop.wait_for(|s| *s) => return Err("shutdown before the header".to_owned()),
+    };
     if read == 0 {
         return Err("closed before the header".to_owned());
     }
@@ -306,7 +318,7 @@ where
         .await
         .and(writer.flush().await)
         .map_err(|e| format!("cannot write the hello: {e}"))?;
-    eprintln!(
+    logln!(
         "tessar: #{peer} opened: project `{}` in {} (client build {})",
         header.project,
         header.cwd,
@@ -330,7 +342,6 @@ where
         .await
         .map_err(|e| format!("handshake failed: {e}"))?;
     let token = service.cancellation_token();
-    let mut stop = stop;
     let watcher = tokio::spawn(async move {
         if stop.wait_for(|s| *s).await.is_ok() {
             token.cancel();
@@ -375,13 +386,12 @@ pub async fn run_as<F>(
         let idle_at = idle_exit
             .filter(|_| tasks.is_empty())
             .map(|d| idle_since + d);
+        // In this order: a connection that is already waiting when the idle
+        // time runs out is served, not dropped with the listener.
         tokio::select! {
+            biased;
             () = &mut shutdown => {
-                eprintln!("tessar: shutting down");
-                break;
-            }
-            () = async { tokio::time::sleep_until(idle_at.expect("guarded")).await }, if idle_at.is_some() => {
-                eprintln!("tessar: idle, exiting");
+                logln!("tessar: shutting down");
                 break;
             }
             accepted = listener.accept() => match accepted {
@@ -393,13 +403,13 @@ pub async fn run_as<F>(
                     let stop = stop_rx.clone();
                     tasks.spawn(async move {
                         match serve_connection(stream, projects, state, stop, id).await {
-                            Ok(()) => eprintln!("tessar: #{id} closed"),
-                            Err(e) => eprintln!("tessar: #{id} closed: {e}"),
+                            Ok(()) => logln!("tessar: #{id} closed"),
+                            Err(e) => logln!("tessar: #{id} closed: {e}"),
                         }
                     });
                 }
                 Err(e) => {
-                    eprintln!("tessar: accept failed: {e}");
+                    logln!("tessar: accept failed: {e}");
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
             },
@@ -407,6 +417,10 @@ pub async fn run_as<F>(
                 if tasks.is_empty() {
                     idle_since = Instant::now();
                 }
+            }
+            () = async { tokio::time::sleep_until(idle_at.expect("guarded")).await }, if idle_at.is_some() => {
+                logln!("tessar: idle, exiting");
+                break;
             }
         }
     }
@@ -417,7 +431,7 @@ pub async fn run_as<F>(
     })
     .await;
     if drained.is_err() {
-        eprintln!("tessar: connections did not close in time; dropping them");
+        logln!("tessar: connections did not close in time; dropping them");
         tasks.abort_all();
     }
 }

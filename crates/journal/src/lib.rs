@@ -25,7 +25,12 @@
 //! # Locking
 //!
 //! The file is locked for the life of the [`FileJournal`]. A second open,
-//! from this process or another, fails with [`LogError::Locked`].
+//! from this process or another, fails with [`LogError::Locked`];
+//! [`FileJournal::open_blocking`] waits for the lock instead, and
+//! [`FileJournal::is_locked`] asks whether it is held. A lock is
+//! only trusted if the path still names the locked file once it is taken:
+//! a rewrite may have replaced the file meanwhile, and then the open starts
+//! over with the new one.
 //!
 //! # Rewriting
 //!
@@ -78,19 +83,54 @@ pub struct FileJournal<T> {
 
 impl<T: Serialize + DeserializeOwned> FileJournal<T> {
     /// Opens the journal at `path`, creating it if missing, locking it and
-    /// cutting off a torn write at the end.
+    /// cutting off a torn write at the end. Fails with [`LogError::Locked`]
+    /// if anything else has it open.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, LogError> {
-        let path = path.as_ref().to_owned();
-        let mut file = OpenOptions::new()
-            .read(true)
-            .append(true)
-            .create(true)
-            .open(&path)?;
+        Self::open_locked(path.as_ref(), try_lock)
+    }
+
+    /// Like [`open`](Self::open), but if anything else has the journal open
+    /// it waits, for as long as it takes, until the journal is released.
+    /// The file is read only once the lock is held, so the journal returned
+    /// has everything the previous holder wrote.
+    ///
+    /// There is no time limit: a caller that needs one runs this on a
+    /// thread of its own and stops waiting for that thread.
+    pub fn open_blocking(path: impl AsRef<Path>) -> Result<Self, LogError> {
+        Self::open_locked(path.as_ref(), lock_waiting)
+    }
+
+    /// Whether something holds the lock of the journal at `path` right now:
+    /// a [`FileJournal`] in this process or another, or a rewrite. False if
+    /// there is no file at `path`.
+    ///
+    /// The file is not created, read or changed. The check takes the same
+    /// lock [`open`](Self::open) takes and lets it go at once, so an `open`
+    /// elsewhere that lands in that instant fails with
+    /// [`LogError::Locked`] although nobody keeps the journal; a caller of
+    /// `open` that must not lose to a check tries twice.
+    pub fn is_locked(path: impl AsRef<Path>) -> std::io::Result<bool> {
+        let file = match File::open(path.as_ref()) {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(err) => return Err(err),
+        };
         match file.try_lock() {
-            Ok(()) => {}
-            Err(TryLockError::WouldBlock) => return Err(LogError::Locked),
-            Err(TryLockError::Error(err)) => return Err(err.into()),
+            Ok(()) => {
+                let _ = file.unlock();
+                Ok(false)
+            }
+            Err(TryLockError::WouldBlock) => Ok(true),
+            Err(TryLockError::Error(err)) => Err(err),
         }
+    }
+
+    fn open_locked(
+        path: &Path,
+        lock: impl Fn(&File) -> Result<(), LogError>,
+    ) -> Result<Self, LogError> {
+        let path = path.to_owned();
+        let mut file = lock_file(&path, true, lock)?;
 
         let mut bytes = Vec::new();
         file.seek(SeekFrom::Start(0))?;
@@ -138,12 +178,7 @@ impl<T: Serialize + DeserializeOwned> FileJournal<T> {
         f: impl FnOnce(Vec<Commit<T>>) -> Vec<Commit<T>>,
     ) -> Result<RewriteReport, LogError> {
         let path = path.as_ref();
-        let mut file = OpenOptions::new().read(true).append(true).open(path)?;
-        match file.try_lock() {
-            Ok(()) => {}
-            Err(TryLockError::WouldBlock) => return Err(LogError::Locked),
-            Err(TryLockError::Error(err)) => return Err(err.into()),
-        }
+        let mut file = lock_file(path, false, try_lock)?;
         let mut bytes = Vec::new();
         file.seek(SeekFrom::Start(0))?;
         file.read_to_end(&mut bytes)?;
@@ -255,6 +290,69 @@ impl<T: Serialize + DeserializeOwned> Log<T> for FileJournal<T> {
     fn next_seq(&self) -> Seq {
         self.next_seq
     }
+}
+
+/// Takes the lock or fails with [`LogError::Locked`].
+fn try_lock(file: &File) -> Result<(), LogError> {
+    match file.try_lock() {
+        Ok(()) => Ok(()),
+        Err(TryLockError::WouldBlock) => Err(LogError::Locked),
+        Err(TryLockError::Error(err)) => Err(err.into()),
+    }
+}
+
+/// Waits for the lock. A signal that interrupts the wait (the standard
+/// library does not retry it) is no reason to give up.
+fn lock_waiting(file: &File) -> Result<(), LogError> {
+    loop {
+        match file.lock() {
+            Ok(()) => return Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+}
+
+/// Opens the file at `path` (creating it with `create`) and locks it with
+/// `lock`. The lock belongs to the file that was opened, and a rewrite may
+/// rename a new file over the path between the open and the lock; a lock on
+/// the old, now nameless file would protect nothing. So the path is checked
+/// again under the lock, and if it names another file the open is repeated.
+fn lock_file(
+    path: &Path,
+    create: bool,
+    lock: impl Fn(&File) -> Result<(), LogError>,
+) -> Result<File, LogError> {
+    loop {
+        let file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create(create)
+            .open(path)?;
+        lock(&file)?;
+        if still_at(&file, path)? {
+            return Ok(file);
+        }
+    }
+}
+
+/// Whether `path` still names the open `file`.
+#[cfg(unix)]
+fn still_at(file: &File, path: &Path) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let open = file.metadata()?;
+    match fs::metadata(path) {
+        Ok(named) => Ok(open.dev() == named.dev() && open.ino() == named.ino()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
+/// Whether `path` still names the open `file`. Not checked on this
+/// platform.
+#[cfg(not(unix))]
+fn still_at(_file: &File, _path: &Path) -> std::io::Result<bool> {
+    Ok(true)
 }
 
 /// Encodes one commit as a journal line, newline included.

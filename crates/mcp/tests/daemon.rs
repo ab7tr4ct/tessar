@@ -450,6 +450,8 @@ async fn a_lost_daemon_fails_calls_one_by_one_and_the_proxy_reconnects() {
     second.shutdown().await;
 }
 
+/// A proxy whose daemon drops every session keeps trying, but with growing
+/// pauses: at once, then after the pause, then after twice that, and so on.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_daemon_that_drops_every_session_is_not_hammered() {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -474,14 +476,25 @@ async fn a_daemon_that_drops_every_session_is_not_hammered() {
             })
         })
     };
+    let backoff = proxy::Backoff {
+        pause: Duration::from_millis(200),
+        cap: Duration::from_secs(30),
+    };
     let (agent, stdio) = tokio::io::duplex(1 << 20);
-    let bridge = tokio::spawn(proxy::bridge_reconnecting(server, link, stdio, reconnect));
+    let bridge = tokio::spawn(proxy::bridge_reconnecting_with(
+        server, link, stdio, reconnect, backoff,
+    ));
     let client: Client = ().serve(agent).await.unwrap();
+    // The first connection lives longer than the pause, so losing it is a
+    // fresh loss and the proxy reconnects at once.
+    tokio::time::sleep(backoff.pause * 2).await;
 
-    // Replace the daemon with one that greets and hangs up at once.
-    first.shutdown().await;
-    let _ = std::fs::remove_file(socket_path(&dir));
-    let listener = UnixListener::bind(socket_path(&dir)).unwrap();
+    // A daemon that greets and hangs up at once takes over the socket. The
+    // new listener is renamed into place before the old daemon stops, so
+    // the proxy never finds the socket without a listener.
+    let staging = dir.join("staging.sock");
+    let listener = UnixListener::bind(&staging).unwrap();
+    std::fs::rename(&staging, socket_path(&dir)).unwrap();
     let accepted = Arc::new(AtomicUsize::new(0));
     let count = Arc::clone(&accepted);
     let fake = tokio::spawn(async move {
@@ -498,9 +511,15 @@ async fn a_daemon_that_drops_every_session_is_not_hammered() {
                 .await;
         }
     });
-    tokio::time::sleep(Duration::from_millis(1200)).await;
+    first.shutdown().await;
+    // Attempts come at about 0, 0.2, 0.6, 1.4 and 3.0 s after the loss.
+    tokio::time::sleep(Duration::from_millis(1000)).await;
     let attempts = accepted.load(Ordering::SeqCst);
-    assert!(attempts <= 2, "{attempts} reconnects in 1.2 s");
+    assert!(
+        attempts >= 2,
+        "only {attempts} reconnects in 1 s: it gave up"
+    );
+    assert!(attempts <= 4, "{attempts} reconnects in 1 s: no backoff");
 
     fake.abort();
     drop(client);
@@ -599,4 +618,621 @@ async fn parallel_remember_calls_in_two_spaces_both_succeed() {
 
     drop(alpha);
     daemon.shutdown().await;
+}
+
+// ---- the daemon's life: silent clients, handover, starting ------------
+
+/// A client that connects and sends nothing must not keep the daemon from
+/// stopping for the whole grace period.
+#[tokio::test]
+async fn a_silent_client_does_not_hold_up_the_shutdown() {
+    let home = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(home.path(), None);
+    let silent = UnixStream::connect(socket_path(home.path())).await.unwrap();
+    // Let the daemon accept it.
+    let ok = session(home.path(), "alpha").await;
+    drop(ok);
+    let started = std::time::Instant::now();
+    daemon.shutdown().await;
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "the shutdown waited {:?} for a client that never sent a header",
+        started.elapsed()
+    );
+    drop(silent);
+}
+
+/// The same client is dropped after a few seconds without a shutdown, so it
+/// cannot keep an idle daemon alive for ever. The clock is paused: the wait
+/// is the daemon's own limit, whatever it is, and takes no real time.
+#[tokio::test(start_paused = true)]
+async fn a_client_that_sends_no_header_is_dropped() {
+    let (client, server) = tokio::io::duplex(1024);
+    let (_stop, stopped) = tokio::sync::watch::channel(false);
+    let state = Arc::new(daemon::State::new("test"));
+    let started = tokio::time::Instant::now();
+    let err = daemon::serve_connection(server, projects(), state, stopped, 1)
+        .await
+        .expect_err("served a connection without a header");
+    assert!(err.contains("no header within"), "{err}");
+    assert!(started.elapsed() <= Duration::from_secs(30));
+    drop(client);
+}
+
+/// A spawner that counts its calls and hands each one to `start`.
+fn counting(
+    start: impl Fn(usize, &Path, proxy::Start) -> Result<std::process::Child, String>
+    + Send
+    + Sync
+    + 'static,
+) -> (proxy::Spawn, Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&calls);
+    let spawn: proxy::Spawn = Arc::new(move |home, mode| {
+        let nth = count.fetch_add(1, Ordering::SeqCst) + 1;
+        start(nth, home, mode)
+    });
+    (spawn, calls)
+}
+
+/// Processes standing in for daemons that keep running. Each one reads a
+/// pipe whose other end is kept here, so they all end when this value is
+/// dropped, however the test ends; whoever holds the `Child` reaps it.
+#[derive(Clone, Default)]
+struct StandIns(Arc<std::sync::Mutex<Vec<std::process::ChildStdin>>>);
+
+impl StandIns {
+    fn start(&self) -> Result<std::process::Child, String> {
+        let mut child = std::process::Command::new("cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        self.0.lock().unwrap().push(child.stdin.take().unwrap());
+        Ok(child)
+    }
+}
+
+/// A process standing in for an old daemon: something for a SIGTERM to hit.
+/// On the signal it runs `on_signal`, lingers for `linger` seconds, exits
+/// and runs `on_exit`. It also ends, without either, when the value
+/// returned is dropped: it waits on a pipe whose other end is kept there.
+struct OldDaemonProcess {
+    pid: u32,
+    _alive: std::process::ChildStdin,
+}
+
+fn old_daemon_process(
+    linger: &str,
+    on_signal: impl FnOnce() + Send + 'static,
+    on_exit: impl FnOnce() + Send + 'static,
+) -> OldDaemonProcess {
+    use std::io::BufRead;
+    let script = format!(
+        "trap 'echo term; sleep {linger}; exit 0' TERM; exec 3<&0; echo ready; \
+         cat <&3 >/dev/null & wait"
+    );
+    let mut child = std::process::Command::new("sh")
+        .args(["-c", &script])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let alive = child.stdin.take().unwrap();
+    let mut out = std::io::BufReader::new(child.stdout.take().unwrap());
+    // Not before it handles the signal.
+    let mut said = String::new();
+    out.read_line(&mut said).unwrap();
+    assert_eq!(said, "ready\n");
+    std::thread::spawn(move || {
+        let mut said = String::new();
+        let _ = out.read_line(&mut said);
+        if said == "term\n" {
+            on_signal();
+            let _ = child.wait();
+            on_exit();
+        } else {
+            let _ = child.wait();
+        }
+    });
+    OldDaemonProcess { pid, _alive: alive }
+}
+
+/// Runs the real `tessar` with `args` on `home`, pointed at a missing model
+/// and away from the user's own home, so that nothing outside `home` is
+/// touched: a daemon that gets the journal fails on the model.
+fn tessar(home: &Path, args: &[&str]) -> std::process::Command {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_tessar"));
+    command
+        .args(args)
+        .arg("--home")
+        .arg(home)
+        .env("HOME", home)
+        .env("TESSAR_MODEL", home.join("no-such-model.gguf"))
+        .env_remove("TESSAR_HOME")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    command
+}
+
+/// The first run of a binary that was just linked can take most of a second
+/// (the system checks it). Paying for that first lets the daemons in a test
+/// start as fast as real ones.
+fn warm_up_the_binary() {
+    let version = std::process::Command::new(env!("CARGO_BIN_EXE_tessar"))
+        .arg("--version")
+        .output()
+        .unwrap();
+    assert!(version.status.success());
+}
+
+/// Waits up to `wait` for `child` to exit; kills it if it does not.
+fn exit_within(
+    mut child: std::process::Child,
+    wait: Duration,
+) -> Result<std::process::Output, String> {
+    let deadline = std::time::Instant::now() + wait;
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("still running after {wait:?}"));
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    Ok(child.wait_with_output().unwrap())
+}
+
+/// A process standing in for a daemon that exits at once with `status`.
+fn exited_process(status: &str) -> Result<std::process::Child, String> {
+    std::process::Command::new(status)
+        .spawn()
+        .map_err(|e| e.to_string())
+}
+
+/// A proxy that lost its daemon only looks for a new one at first: the
+/// daemon is most likely being replaced, and one started now from this
+/// proxy's binary could take the journal from the replacement.
+#[tokio::test]
+async fn a_reconnecting_proxy_starts_no_daemon_while_a_replacement_comes_up() {
+    use std::sync::atomic::Ordering;
+    let home = tempfile::tempdir().unwrap();
+    let dir = home.path().to_path_buf();
+    let (spawn, calls) = counting(|_, _, _| Err("started a daemon during the grace".to_owned()));
+    let launcher = proxy::Launcher {
+        wait: Duration::from_secs(10),
+        grace: Duration::from_secs(10),
+        respawn_pause: Duration::from_secs(1),
+        spawn,
+    };
+    // The replacement listens a little later.
+    let replacement = {
+        let dir = dir.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            Daemon::start(&dir, None)
+        })
+    };
+    let stream = proxy::connect_or_start_with(&dir, &launcher)
+        .await
+        .expect("did not find the replacement");
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    drop(stream);
+    replacement.await.unwrap().shutdown().await;
+
+    // The default for a first connection has no grace, a reconnecting one
+    // has a few seconds.
+    let first = proxy::Launcher::new(Duration::from_secs(60));
+    assert_eq!(first.grace, Duration::ZERO);
+    let again = first.reconnecting();
+    assert_eq!(again.grace, proxy::RECONNECT_GRACE);
+    assert!(again.grace >= Duration::from_secs(2) && again.grace <= Duration::from_secs(5));
+}
+
+/// With nothing listening after the grace, the proxy starts a daemon. If
+/// that daemon exits cleanly (another process held the journal) and still
+/// nothing listens a pause later, the holder was on its way out: the proxy
+/// starts a daemon again instead of waiting out its whole time limit.
+#[tokio::test]
+async fn a_daemon_is_started_again_after_one_that_stepped_aside() {
+    use std::sync::Mutex;
+    use std::sync::atomic::Ordering;
+    let home = tempfile::tempdir().unwrap();
+    let dir = home.path().to_path_buf();
+    let second: Arc<Mutex<Option<Daemon>>> = Arc::new(Mutex::new(None));
+    let slot = Arc::clone(&second);
+    let stand_ins = StandIns::default();
+    let (spawn, calls) = counting(move |nth, home, mode| {
+        assert_eq!(mode, proxy::Start::Fresh);
+        if nth == 1 {
+            return exited_process("true");
+        }
+        *slot.lock().unwrap() = Some(Daemon::start(home, None));
+        stand_ins.start()
+    });
+    let launcher = proxy::Launcher {
+        wait: Duration::from_secs(20),
+        grace: Duration::from_millis(300),
+        respawn_pause: Duration::from_millis(300),
+        spawn,
+    };
+    let started = std::time::Instant::now();
+    let stream = proxy::connect_or_start_with(&dir, &launcher)
+        .await
+        .expect("no daemon after the first one stepped aside");
+    assert!(started.elapsed() >= launcher.grace + launcher.respawn_pause);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    drop(stream);
+    let daemon = second.lock().unwrap().take().unwrap();
+    daemon.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_daemon_that_fails_to_start_is_an_error_and_is_not_started_again() {
+    use std::sync::atomic::Ordering;
+    let home = tempfile::tempdir().unwrap();
+    let (spawn, calls) = counting(|_, _, _| exited_process("false"));
+    let launcher = proxy::Launcher {
+        wait: Duration::from_secs(20),
+        grace: Duration::ZERO,
+        respawn_pause: Duration::from_millis(100),
+        spawn,
+    };
+    let err = proxy::connect_or_start_with(home.path(), &launcher)
+        .await
+        .expect_err("connected to nothing");
+    assert!(err.contains("the daemon exited with"), "{err}");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+/// The upgrade, with a client of the old kind in the way.
+///
+/// An older daemon holds the journal and serves two clients: a proxy of the
+/// build before the handover, and then the new proxy, which retires the
+/// daemon. The old proxy does what that build did when its connection
+/// dropped: it starts a daemon from its own binary at once (here the real
+/// `tessar daemon`, pointed at a missing model: if it gets the journal it
+/// fails on the model and exits with an error; if the journal is taken it
+/// steps aside with status 0).
+///
+/// The upgrade sticks only if the replacement gets the journal: it is in
+/// line for it before it tells the old daemon to stop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_upgrade_survives_an_old_proxy_that_starts_its_own_daemon_at_once() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tessar_core::store::Op;
+    use tessar_journal::FileJournal;
+    use tessar_mcp::lifecycle;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+    let home = tempfile::tempdir().unwrap();
+    let dir = home.path().to_path_buf();
+    // So that the old proxy's daemon below does reach the journal while it
+    // is free.
+    warm_up_the_binary();
+
+    // The old daemon. Its pid is a stand-in process, so the SIGTERM of the
+    // replacement has something to end. On the signal the daemon stops as
+    // the real one does: no listener, sessions closed, the journal released
+    // at once; the process lingers for a moment and removes the socket file
+    // last. So the journal is free for a while with nobody but a daemon
+    // already waiting for it to take it: the window the old proxy's daemon
+    // falls into.
+    let journal = FileJournal::<Op>::open(dir.join("journal.jsonl")).unwrap();
+    let (on_signal, mut signalled) = oneshot::channel::<()>();
+    let (on_exit, exited) = oneshot::channel::<()>();
+    let old_process = old_daemon_process(
+        "0.5",
+        move || {
+            let _ = on_signal.send(());
+        },
+        move || {
+            let _ = on_exit.send(());
+        },
+    );
+    let old_pid = old_process.pid;
+    let listener = UnixListener::bind(socket_path(&dir)).unwrap();
+    let old_daemon = {
+        let socket = socket_path(&dir);
+        tokio::spawn(async move {
+            let mut sessions = Vec::new();
+            loop {
+                tokio::select! {
+                    _ = &mut signalled => break,
+                    accepted = listener.accept() => {
+                        let (stream, _) = accepted.unwrap();
+                        let (r, mut w) = tokio::io::split(stream);
+                        let mut r = BufReader::new(r);
+                        let mut header = String::new();
+                        r.read_line(&mut header).await.unwrap();
+                        let hello = format!(
+                            "{{\"tessar\":1,\"build\":\"0.0.1+old.1\",\"pid\":{old_pid}}}\n"
+                        );
+                        w.write_all(hello.as_bytes()).await.unwrap();
+                        sessions.push((r, w));
+                    }
+                }
+            }
+            drop(listener);
+            drop(sessions);
+            drop(journal);
+            let _ = exited.await;
+            let _ = std::fs::remove_file(socket);
+        })
+    };
+
+    // The old proxy.
+    let (connected, old_proxy_is_connected) = oneshot::channel::<()>();
+    let old_proxy = {
+        let dir = dir.clone();
+        tokio::spawn(async move {
+            let mut stream = UnixStream::connect(socket_path(&dir)).await.unwrap();
+            stream
+                .write_all(b"{\"tessar\":1,\"project\":\"beta\",\"build\":\"0.0.1+old.1\"}\n")
+                .await
+                .unwrap();
+            let mut hello = [0u8; 1];
+            stream.read_exact(&mut hello).await.unwrap();
+            let _ = connected.send(());
+            // The connection drops when the daemon is retired...
+            let mut rest = Vec::new();
+            let _ = stream.read_to_end(&mut rest).await;
+            // ...nothing listens any more, and it starts its own daemon.
+            assert!(UnixStream::connect(socket_path(&dir)).await.is_err());
+            tokio::process::Command::from(tessar(&dir, &["daemon"]))
+                .output()
+                .await
+                .unwrap()
+        })
+    };
+    old_proxy_is_connected.await.unwrap();
+
+    // The new proxy. Its replacement daemon runs in this process: it gets
+    // the journal the way `tessar daemon --takeover PID` does (it stops the
+    // old daemon itself, once it is in line), holds it, and listens only
+    // after a while, as a daemon that loads a model first.
+    let has_journal = Arc::new(AtomicBool::new(false));
+    let stop_replacement = Arc::new(tokio::sync::Notify::new());
+    let (replacement_done, replacement_ended) = std::sync::mpsc::channel::<()>();
+    let stand_ins = StandIns::default();
+    let (spawn, calls) = {
+        let has_journal = Arc::clone(&has_journal);
+        let stop = Arc::clone(&stop_replacement);
+        let stand_ins = stand_ins.clone();
+        counting(move |nth, home, mode| {
+            assert_eq!(nth, 1, "a second daemon was started");
+            assert_eq!(mode, proxy::Start::Takeover(old_pid));
+            let home = home.to_path_buf();
+            let runtime = tokio::runtime::Handle::current();
+            let (has_journal, stop) = (Arc::clone(&has_journal), Arc::clone(&stop));
+            let done = replacement_done.clone();
+            std::thread::spawn(move || {
+                let journal = match lifecycle::take_over(&home, old_pid, Duration::from_secs(30)) {
+                    Ok(lifecycle::Takeover::Journal(journal)) => journal,
+                    Ok(lifecycle::Takeover::Aside(why)) => {
+                        panic!("the replacement did not get the journal: {why}")
+                    }
+                    Err(e) => panic!("the replacement did not get the journal: {e}"),
+                };
+                has_journal.store(true, Ordering::SeqCst);
+                // Well after the old daemon has removed its socket file.
+                std::thread::sleep(Duration::from_millis(1500));
+                runtime.block_on(async {
+                    let socket = socket_path(&home);
+                    let _ = std::fs::remove_file(&socket);
+                    let listener = UnixListener::bind(&socket).unwrap();
+                    daemon::run(listener, projects(), None, stop.notified()).await;
+                });
+                drop(journal);
+                let _ = done.send(());
+            });
+            stand_ins.start()
+        })
+    };
+    let launcher = proxy::Launcher {
+        wait: Duration::from_secs(30),
+        grace: Duration::ZERO,
+        respawn_pause: Duration::from_secs(1),
+        spawn,
+    };
+    let opened = proxy::open_current_with(&dir, "alpha", Path::new("/work/x"), false, &launcher)
+        .await
+        .expect("the new proxy did not get a daemon");
+    assert_eq!(
+        opened.hello().build,
+        tessar_mcp::BUILD_ID,
+        "the new proxy ended up on another build"
+    );
+    assert!(has_journal.load(Ordering::SeqCst));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    // The old proxy's daemon found the journal taken and stepped aside.
+    let theirs = tokio::time::timeout(Duration::from_secs(30), old_proxy)
+        .await
+        .expect("the old proxy's daemon did not exit")
+        .unwrap();
+    let said = String::from_utf8_lossy(&theirs.stderr);
+    assert!(
+        theirs.status.success() && said.contains("already running"),
+        "the old proxy's daemon took the journal from the replacement: {} {said}",
+        theirs.status
+    );
+    // And the old proxy, looking again, finds the newer daemon.
+    let stream = UnixStream::connect(socket_path(&dir)).await.unwrap();
+    assert_eq!(
+        proxy::status(stream).await.unwrap().build,
+        tessar_mcp::BUILD_ID
+    );
+
+    drop(opened);
+    old_daemon.await.unwrap();
+    stop_replacement.notify_one();
+    replacement_ended
+        .recv_timeout(Duration::from_secs(15))
+        .expect("the replacement daemon did not stop");
+}
+
+/// What the takeover tests below share: the real `tessar daemon --takeover
+/// PID` against a journal held here and a process standing in for the old
+/// daemon, which on its SIGTERM keeps the journal for `hold` more and then
+/// lets go; at that very moment a daemon of the kind an old proxy starts
+/// (the real `tessar daemon`) goes for the journal too.
+///
+/// The model is missing, so a daemon that gets the journal would fail at
+/// once and let it go again. To see who has it, the pid file is a FIFO: the
+/// daemon writes its pid as soon as it holds the journal, and that blocks
+/// until the test reads. Whoever holds the journal is stuck there, holding
+/// it, and its pid is what the test reads.
+fn takeover_by_the_binary(hold: Duration) {
+    use tessar_core::store::Op;
+    use tessar_journal::FileJournal;
+    use tessar_mcp::lifecycle;
+
+    warm_up_the_binary();
+    let home = tempfile::tempdir().unwrap();
+    let dir = home.path().to_path_buf();
+    let fifo = lifecycle::pid_path(&dir);
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let journal = FileJournal::<Op>::open(dir.join("journal.jsonl")).unwrap();
+
+    enum Event {
+        Signalled,
+        Released(std::process::Child),
+    }
+    let (events, seen) = std::sync::mpsc::channel();
+    let old = {
+        let dir = dir.clone();
+        old_daemon_process(
+            "0.2",
+            move || {
+                let _ = events.send(Event::Signalled);
+                std::thread::sleep(hold);
+                drop(journal);
+                let eager = tessar(&dir, &["daemon"]).spawn().unwrap();
+                let _ = events.send(Event::Released(eager));
+            },
+            || {},
+        )
+    };
+
+    let takeover = tessar(&dir, &["daemon", "--takeover", &old.pid.to_string()])
+        .spawn()
+        .unwrap();
+    let takeover_pid = takeover.id();
+    // Killed and reaped however the test ends.
+    struct Ended(Option<std::process::Child>);
+    impl Drop for Ended {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+    let mut takeover = Ended(Some(takeover));
+
+    // It tells the process it was given, and nobody else, to stop.
+    let wait = Duration::from_secs(30);
+    assert!(
+        matches!(seen.recv_timeout(wait), Ok(Event::Signalled)),
+        "the takeover did not signal the old daemon"
+    );
+    // And waits for the journal for as long as that one keeps it.
+    if !hold.is_zero() {
+        std::thread::sleep(hold / 2);
+        let running = takeover.0.as_mut().unwrap().try_wait().unwrap().is_none();
+        assert!(running, "the takeover did not wait for the journal");
+        assert!(lifecycle::journal_in_use(&dir));
+    }
+    let Ok(Event::Released(eager)) = seen.recv_timeout(wait) else {
+        panic!("the old daemon did not let go");
+    };
+    // The other daemon finds the journal taken and steps aside. If it had
+    // got the journal it would be stuck on the pid file and never exit.
+    let eager = exit_within(eager, wait).expect("the other daemon took the journal");
+    let said = String::from_utf8_lossy(&eager.stderr);
+    assert!(
+        eager.status.success() && said.contains("already running"),
+        "{} {said}",
+        eager.status
+    );
+    // The journal is with the takeover: its pid is in the pid file.
+    let (read, pid) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = read.send(std::fs::read_to_string(fifo));
+    });
+    let pid = pid
+        .recv_timeout(wait)
+        .expect("nobody wrote the pid file")
+        .unwrap();
+    assert_eq!(pid.trim(), takeover_pid.to_string());
+    drop(old);
+}
+
+/// The takeover waits for a journal that is held, and has it when it is
+/// released.
+#[test]
+fn the_takeover_binary_waits_for_the_journal_and_takes_it() {
+    takeover_by_the_binary(Duration::from_millis(600));
+}
+
+/// The worst case for the order: the old daemon lets go the moment it is
+/// signalled, and another daemon is started in the same moment. The
+/// takeover wins because it was in line before it sent the signal.
+#[test]
+fn the_takeover_binary_is_in_line_before_it_stops_the_old_daemon() {
+    takeover_by_the_binary(Duration::ZERO);
+}
+
+/// A daemon that finds the journal locked looks once more before it steps
+/// aside: a check whether the journal is in use holds the lock for an
+/// instant, and must not make a daemon give up with nobody running.
+#[test]
+fn a_daemon_does_not_step_aside_for_a_lock_held_for_an_instant() {
+    use tessar_core::store::Op;
+    use tessar_journal::FileJournal;
+
+    warm_up_the_binary();
+    let home = tempfile::tempdir().unwrap();
+    let dir = home.path().to_path_buf();
+    // Held when the daemon first looks, free well before it looks again.
+    let journal = FileJournal::<Op>::open(dir.join("journal.jsonl")).unwrap();
+    // A daemon takes some 10 ms to start and look, and looks again 50 ms
+    // later. (Should it be slower than this pause, it finds the journal
+    // free at its first look, and the test passes without testing much.)
+    let daemon = tessar(&dir, &["daemon"]).spawn().unwrap();
+    std::thread::sleep(Duration::from_millis(25));
+    drop(journal);
+    let out = exit_within(daemon, Duration::from_secs(30)).unwrap();
+    let said = String::from_utf8_lossy(&out.stderr);
+    // It got the journal on the second look and went on to the model.
+    assert!(
+        !out.status.success() && said.contains("embedding model not found"),
+        "{} {said}",
+        out.status
+    );
+
+    // A journal that stays held is still stepped aside for.
+    let journal = FileJournal::<Op>::open(dir.join("journal.jsonl")).unwrap();
+    let out = exit_within(
+        tessar(&dir, &["daemon"]).spawn().unwrap(),
+        Duration::from_secs(30),
+    )
+    .unwrap();
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success() && said.contains("already running"),
+        "{} {said}",
+        out.status
+    );
+    drop(journal);
 }

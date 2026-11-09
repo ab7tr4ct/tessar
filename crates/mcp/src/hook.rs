@@ -9,8 +9,10 @@
 //! The logic is split from the process: [`prompt`] and [`session`] take a
 //! connected daemon [`Peer`] and return the text to print, so tests drive
 //! them over the test daemon without spawning the binary. [`run_prompt`] and
-//! [`run_session`] add the connection (starting the daemon if needed) and
-//! the time limit.
+//! [`run_session`] add the connection and the time limit. The session hook
+//! starts the daemon if needed and waits for it. The prompt hook runs before
+//! every prompt and never waits: with no daemon listening it starts one for
+//! the next prompt and prints nothing.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -21,6 +23,8 @@ use rmcp::{Peer, RoleClient};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::daemon::socket_path;
+use crate::lifecycle;
 use crate::project::project_name;
 use crate::proxy;
 
@@ -35,8 +39,11 @@ pub const DEFAULT_ENTITY_MAX: usize = 2;
 pub const DEFAULT_BUDGET: usize = 1500;
 /// Characters the `session` hook may print.
 pub const DEFAULT_SESSION_BUDGET: usize = 3000;
-/// The `prompt` hook gives up (prints nothing) after this long.
-pub const PROMPT_WAIT: Duration = Duration::from_secs(15);
+/// The `prompt` hook gives up (prints nothing) after this long, all told:
+/// finding the project, the handshake with the daemon and the search. The
+/// user's prompt waits for this hook, so it must not be held up by a daemon
+/// that is down, restarting or loading its model.
+pub const PROMPT_WAIT: Duration = Duration::from_secs(1);
 /// The `session` hook gives up after this long: a cold daemon loads the model.
 pub const SESSION_WAIT: Duration = Duration::from_secs(60);
 
@@ -438,7 +445,7 @@ pub async fn prompt(
     if !ids.is_empty()
         && let Err(e) = append_shown(home, &input.session_id, &ids)
     {
-        eprintln!("tessar hook: cannot record shown facts: {e}");
+        logln!("tessar hook: cannot record shown facts: {e}");
     }
     Ok(text)
 }
@@ -484,13 +491,24 @@ pub async fn session(
 
 /// The project for a hook: the one of the hook's `cwd`, else of the
 /// process's.
-fn project_and_cwd(input: &HookInput) -> (String, PathBuf) {
-    let cwd = if input.cwd.trim().is_empty() {
+fn project_and_cwd(cwd: &str) -> (String, PathBuf) {
+    let cwd = if cwd.trim().is_empty() {
         std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
     } else {
-        PathBuf::from(&input.cwd)
+        PathBuf::from(cwd)
     };
     (project_name(&cwd), cwd)
+}
+
+/// Hooks never restart a daemon of another build; they say so and use it.
+fn note_build(hello: &crate::daemon::Hello) {
+    if hello.build != crate::BUILD_ID {
+        logln!(
+            "tessar hook: daemon build differs (daemon {}, hook {}); using it as it is",
+            hello.build,
+            crate::BUILD_ID
+        );
+    }
 }
 
 /// Connects to the daemon (starting it if none runs), runs `work` on the
@@ -505,19 +523,13 @@ where
     F: FnOnce(Peer<RoleClient>, String) -> Fut,
     Fut: std::future::Future<Output = Result<String, String>>,
 {
-    let (project, cwd) = project_and_cwd(input);
+    let (project, cwd) = project_and_cwd(&input.cwd);
     let attempt = async {
         std::fs::create_dir_all(home)
             .map_err(|e| format!("cannot create {}: {e}", home.display()))?;
         let stream = proxy::connect_or_start(home, wait).await?;
         let opened = proxy::open(stream, &project, &cwd).await?;
-        if opened.hello().build != crate::BUILD_ID {
-            eprintln!(
-                "tessar hook: daemon build differs (daemon {}, hook {}); using it as it is",
-                opened.hello().build,
-                crate::BUILD_ID
-            );
-        }
+        note_build(opened.hello());
         let (server, link) = opened.serve().await?;
         let out = work(server.daemon().clone(), project).await;
         drop(link);
@@ -535,15 +547,72 @@ where
 
 /// `tessar hook prompt` over the daemon in `home`.
 pub async fn run_prompt(home: &Path, stdin: &str, settings: &Settings) -> Result<String, String> {
+    run_prompt_with(home, stdin, settings, PROMPT_WAIT, &proxy::own_daemon()).await
+}
+
+/// [`run_prompt`] with its time limit and the way to start a daemon spelled
+/// out.
+///
+/// It only connects. If nothing listens, it starts a daemon through `spawn`
+/// without waiting for it (unless something already holds the journal: a
+/// daemon on its way up) and fails at once; the next prompt finds the
+/// daemon. Everything else, the `git` calls that name the project included,
+/// is cut off after `cap`.
+#[doc(hidden)]
+pub async fn run_prompt_with(
+    home: &Path,
+    stdin: &str,
+    settings: &Settings,
+    cap: Duration,
+    spawn: &proxy::Spawn,
+) -> Result<String, String> {
     let input = HookInput::parse(stdin)?;
     if skip_prompt(&input.prompt) {
         return Ok(String::new());
     }
     let hook_input = &input;
-    with_daemon(home, hook_input, PROMPT_WAIT, |peer, _| async move {
-        prompt(&peer, hook_input, settings, home).await
-    })
-    .await
+    let attempt = async {
+        let Ok(stream) = tokio::net::UnixStream::connect(socket_path(home)).await else {
+            return Err(start_for_the_next_prompt(home, spawn));
+        };
+        // `git` runs off the runtime's threads so that the limit holds
+        // even if it hangs.
+        let named = {
+            let cwd = hook_input.cwd.clone();
+            tokio::task::spawn_blocking(move || project_and_cwd(&cwd))
+        };
+        let (project, cwd) = named.await.map_err(|e| format!("internal error: {e}"))?;
+        let opened = proxy::open(stream, &project, &cwd).await?;
+        note_build(opened.hello());
+        let (server, link) = opened.serve().await?;
+        let out = prompt(&server.daemon(), hook_input, settings, home).await;
+        drop(link);
+        out
+    };
+    tokio::time::timeout(cap, attempt)
+        .await
+        .unwrap_or_else(|_| {
+            Err(format!(
+                "no answer from the daemon within {} ms",
+                cap.as_millis()
+            ))
+        })
+}
+
+/// Starts a daemon for `home` and does not wait for it. Returns what to
+/// tell the log.
+fn start_for_the_next_prompt(home: &Path, spawn: &proxy::Spawn) -> String {
+    if lifecycle::journal_in_use(home) {
+        return "no daemon is listening yet, but one holds the journal (it is starting)".to_owned();
+    }
+    let started = std::fs::create_dir_all(home)
+        .map_err(|e| format!("cannot create {}: {e}", home.display()))
+        .and_then(|()| spawn(home, proxy::Start::Fresh));
+    match started {
+        // Dropping the handle leaves the daemon running.
+        Ok(_) => "no daemon is listening; started one for the next prompt".to_owned(),
+        Err(e) => format!("no daemon is listening, and starting one failed: {e}"),
+    }
 }
 
 /// `tessar hook session` over the daemon in `home`.

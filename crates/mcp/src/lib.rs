@@ -13,6 +13,21 @@
 //!   changed, and `tessar daemon stop|status`.
 //! - `main.rs` opens the journal and the model and picks a mode.
 
+/// Writes one line to stderr, ignoring a failure to write it. `eprintln!`
+/// panics when stderr is gone (a closed terminal, a full disk under the
+/// log file), and neither the daemon nor a proxy may die of its own logging.
+pub fn log(line: std::fmt::Arguments<'_>) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr().lock(), "{line}");
+}
+
+/// [`log()`] with `format!` arguments.
+macro_rules! logln {
+    ($($arg:tt)*) => {
+        $crate::log(format_args!($($arg)*))
+    };
+}
+
 pub mod api;
 pub mod args;
 pub mod daemon;

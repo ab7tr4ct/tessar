@@ -129,6 +129,97 @@ fn lock_is_released_on_drop() {
     assert!(open(&path).is_ok());
 }
 
+#[test]
+fn is_locked_tells_whether_the_journal_is_held_and_changes_nothing() {
+    let mut dir = Dir::new();
+    let path = dir.fresh_path();
+    assert!(!FileJournal::<u32>::is_locked(&path).unwrap());
+    assert!(!path.exists(), "the check created the file");
+    let before = write_journal(&path, &sample());
+    assert!(!FileJournal::<u32>::is_locked(&path).unwrap());
+    let journal = open(&path).unwrap();
+    assert!(FileJournal::<u32>::is_locked(&path).unwrap());
+    drop(journal);
+    assert!(!FileJournal::<u32>::is_locked(&path).unwrap());
+    assert_eq!(fs::read(&path).unwrap(), before);
+    // The check left the lock free.
+    assert!(open(&path).is_ok());
+}
+
+/// Starts a blocking open on a thread; the journal arrives on the channel.
+fn open_blocking_on_a_thread(
+    path: &Path,
+) -> std::sync::mpsc::Receiver<Result<FileJournal<u32>, LogError>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let path = path.to_owned();
+    std::thread::spawn(move || {
+        let _ = tx.send(FileJournal::<u32>::open_blocking(&path));
+    });
+    rx
+}
+
+const STILL_WAITING: std::time::Duration = std::time::Duration::from_millis(200);
+const ARRIVES: std::time::Duration = std::time::Duration::from_secs(10);
+
+#[test]
+fn blocking_open_of_a_free_journal_does_not_wait() {
+    let mut dir = Dir::new();
+    let path = dir.fresh_path();
+    write_journal(&path, &sample());
+    let mut journal = FileJournal::<u32>::open_blocking(&path).unwrap();
+    assert_eq!(journal.replay().unwrap(), sample());
+    // It holds the lock like any other open.
+    assert!(matches!(open(&path), Err(LogError::Locked)));
+}
+
+#[test]
+fn blocking_open_waits_for_the_holder_and_sees_what_it_wrote() {
+    let mut dir = Dir::new();
+    let path = dir.fresh_path();
+    let mut holder = open(&path).unwrap();
+    let waiter = open_blocking_on_a_thread(&path);
+    assert!(
+        waiter.recv_timeout(STILL_WAITING).is_err(),
+        "opened a journal that is locked"
+    );
+    // Written while the other open was already waiting.
+    for c in sample() {
+        holder.append(&c).unwrap();
+    }
+    drop(holder);
+    let mut journal = waiter.recv_timeout(ARRIVES).unwrap().unwrap();
+    assert_eq!(journal.replay().unwrap(), sample());
+    assert!(matches!(open(&path), Err(LogError::Locked)));
+    journal.append(&commit(5, &[9])).unwrap();
+}
+
+/// A rewrite renames a new file over the path. An open that waited on the
+/// old file must not end up with a lock on a file that has no name.
+#[cfg(unix)]
+#[test]
+fn blocking_open_follows_a_file_replaced_while_it_waited() {
+    let mut dir = Dir::new();
+    let path = dir.fresh_path();
+    write_journal(&path, &sample());
+    let holder = open(&path).unwrap();
+    let waiter = open_blocking_on_a_thread(&path);
+    assert!(waiter.recv_timeout(STILL_WAITING).is_err());
+    // What `rewrite` does while it holds the lock.
+    let replacement = dir.fresh_path();
+    write_journal(&replacement, &sample()[..2]);
+    fs::rename(&replacement, &path).unwrap();
+    drop(holder);
+    let mut journal = waiter.recv_timeout(ARRIVES).unwrap().unwrap();
+    assert_eq!(journal.replay().unwrap(), sample()[..2]);
+    // The lock is on the file the path names now.
+    assert!(matches!(open(&path), Err(LogError::Locked)));
+    journal.append(&commit(3, &[7])).unwrap();
+    drop(journal);
+    let mut expected = sample()[..2].to_vec();
+    expected.push(commit(3, &[7]));
+    assert_eq!(open(&path).unwrap().replay().unwrap(), expected);
+}
+
 /// The process may die at any byte of an append. Whatever the cut, the
 /// journal opens with exactly the commits whose lines are complete, and
 /// keeps working after that.

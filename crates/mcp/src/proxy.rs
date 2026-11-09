@@ -5,7 +5,7 @@ use std::borrow::Cow;
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
@@ -23,9 +23,29 @@ use tokio::net::UnixStream;
 
 use crate::BUILD_ID;
 use crate::daemon::{Header, Hello, LOG_FILE, socket_path};
-use crate::lifecycle;
 
 const DAEMON_POLL: Duration = Duration::from_millis(200);
+
+/// How long a proxy that lost its daemon only tries to connect before it
+/// starts a daemon itself. A lost daemon is most often one being replaced
+/// by a newer build, and a daemon started from this proxy's binary in that
+/// moment could take the journal ahead of the replacement and undo the
+/// upgrade. The dangerous time is from the old daemon releasing the journal
+/// to the new one holding it: nothing when the replacement was started
+/// first and waits in line ([`Start::Takeover`]), and otherwise the poll of
+/// whoever retired the daemon (100 ms) plus the start of a process, a few
+/// tenths of a second in all. Three seconds cover that with a margin, and
+/// are what a session waits longer when its daemon simply died.
+pub const RECONNECT_GRACE: Duration = Duration::from_secs(3);
+
+/// How often a reconnecting proxy looks for a daemon during the grace time.
+const GRACE_POLL: Duration = Duration::from_millis(100);
+
+/// After a daemon this process started stepped aside for another one (it
+/// exited cleanly), how long to keep looking for that other one before
+/// starting a daemon again. The other one may have been on its way out.
+#[doc(hidden)]
+pub const RESPAWN_PAUSE: Duration = Duration::from_secs(1);
 
 /// How long a daemon gets to send its hello. It sends it before doing any
 /// work, so a daemon that stays silent predates the handshake.
@@ -70,6 +90,26 @@ const RECONNECT_PAUSE: Duration = Duration::from_secs(2);
 /// The longest wait between attempts after repeated failures.
 const RECONNECT_CAP: Duration = Duration::from_secs(30);
 
+/// The pauses of a proxy that reconnects to a lost daemon.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Backoff {
+    /// The first pause. A connection that lived shorter than this counts as
+    /// dropped by the daemon, and is not replaced at once.
+    pub pause: Duration,
+    /// The longest pause; each failure doubles the pause up to this.
+    pub cap: Duration,
+}
+
+impl Default for Backoff {
+    fn default() -> Self {
+        Self {
+            pause: RECONNECT_PAUSE,
+            cap: RECONNECT_CAP,
+        }
+    }
+}
+
 /// The daemon connection a [`ProxyServer`] forwards to. Dropping it closes
 /// the connection.
 pub type DaemonLink = RunningService<RoleClient, ()>;
@@ -81,7 +121,7 @@ fn forwarded(what: &str, e: ServiceError) -> ErrorData {
         // The daemon's own answer: pass it on as it is.
         ServiceError::McpError(e) => e,
         other => {
-            eprintln!("tessar: forwarding {what} to the daemon failed: {other}");
+            logln!("tessar: forwarding {what} to the daemon failed: {other}");
             ErrorData::internal_error(
                 Cow::Owned(format!("tessar daemon: {what} failed: {other}")),
                 None,
@@ -257,29 +297,47 @@ pub async fn open_current(
     wait: Duration,
     keep_daemon: bool,
 ) -> Result<Opened<UnixStream>, String> {
-    let stream = connect_or_start(home, wait).await?;
+    open_current_with(home, project, cwd, keep_daemon, &Launcher::new(wait)).await
+}
+
+/// [`open_current`] with the way to reach and start the daemon spelled out.
+///
+/// An older daemon is not stopped from here. Its replacement is started
+/// with the old daemon's pid ([`Start::Takeover`]) and stops it itself, once
+/// it waits in line for the journal: it has the journal the moment the old
+/// daemon lets go. Other sessions' proxies lose their connection at that
+/// point and may start daemons of their own build; those find the journal
+/// taken and step aside. This proxy only waits for the new daemon.
+pub async fn open_current_with(
+    home: &Path,
+    project: &str,
+    cwd: &Path,
+    keep_daemon: bool,
+    launcher: &Launcher,
+) -> Result<Opened<UnixStream>, String> {
+    let stream = connect_or_start_with(home, launcher).await?;
     let opened = open(stream, project, cwd).await?;
     let theirs = opened.hello().build.clone();
     if !needs_restart(BUILD_ID, &theirs, keep_daemon) {
         if !keep_daemon && daemon_is_newer(BUILD_ID, &theirs) {
-            eprintln!(
+            logln!(
                 "tessar: the daemon is build {theirs}, this proxy is {BUILD_ID}; \
                  serving through the newer daemon"
             );
         }
         return Ok(opened);
     }
-    eprintln!(
+    logln!(
         "tessar: the daemon is build {theirs}, this is {BUILD_ID}; restarting it \
          (other Claude Code sessions will show tessar as disconnected until reconnected)"
     );
     let pid = opened.hello().pid;
     drop(opened);
-    lifecycle::retire(home, pid).await?;
-    let stream = connect_or_start(home, wait).await?;
+    let replacement = (launcher.spawn)(home, Start::Takeover(pid))?;
+    let stream = await_daemon(home, launcher, replacement, Some(pid)).await?;
     let opened = open(stream, project, cwd).await?;
     if opened.hello().build != BUILD_ID {
-        eprintln!(
+        logln!(
             "tessar: the new daemon is build {}, not {BUILD_ID}; using it anyway",
             opened.hello().build
         );
@@ -339,14 +397,30 @@ where
     T: rmcp::transport::IntoTransport<RoleServer, E, A>,
     E: std::error::Error + Send + Sync + 'static,
 {
-    bridge_with(server, link, transport, Some(reconnect)).await
+    bridge_reconnecting_with(server, link, transport, reconnect, Backoff::default()).await
+}
+
+/// [`bridge_reconnecting`] with its pauses spelled out.
+#[doc(hidden)]
+pub async fn bridge_reconnecting_with<T, E, A>(
+    server: ProxyServer,
+    link: DaemonLink,
+    transport: T,
+    reconnect: Reconnect,
+    backoff: Backoff,
+) -> Result<bool, String>
+where
+    T: rmcp::transport::IntoTransport<RoleServer, E, A>,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    bridge_with(server, link, transport, Some((reconnect, backoff))).await
 }
 
 async fn bridge_with<T, E, A>(
     server: ProxyServer,
     link: DaemonLink,
     transport: T,
-    reconnect: Option<Reconnect>,
+    reconnect: Option<(Reconnect, Backoff)>,
 ) -> Result<bool, String>
 where
     T: rmcp::transport::IntoTransport<RoleServer, E, A>,
@@ -361,7 +435,8 @@ where
     tokio::pin!(session);
     let mut watcher = tokio::spawn(link.waiting());
     let mut linked_at = Instant::now();
-    let mut backoff = RECONNECT_PAUSE;
+    let limits = reconnect.as_ref().map(|(_, b)| *b).unwrap_or_default();
+    let mut backoff = limits.pause;
     loop {
         tokio::select! {
             _ = &mut session => {
@@ -370,20 +445,20 @@ where
             }
             _ = &mut watcher => {}
         }
-        let Some(reconnect) = &reconnect else {
+        let Some((reconnect, _)) = &reconnect else {
             return Ok(false);
         };
-        eprintln!("tessar: the daemon connection was lost; reconnecting");
+        logln!("tessar: the daemon connection was lost; reconnecting");
         // A link that lived a while is a fresh loss: try again at once. One
         // that died young means the daemon drops sessions: back off.
-        if linked_at.elapsed() < RECONNECT_PAUSE {
+        if linked_at.elapsed() < limits.pause {
             tokio::select! {
                 _ = &mut session => return Ok(true),
                 () = tokio::time::sleep(backoff) => {}
             }
-            backoff = (backoff * 2).min(RECONNECT_CAP);
+            backoff = (backoff * 2).min(limits.cap);
         } else {
-            backoff = RECONNECT_PAUSE;
+            backoff = limits.pause;
         }
         let link = loop {
             tokio::select! {
@@ -391,64 +466,221 @@ where
                 attempt = reconnect() => match attempt {
                     Ok((peer, link)) => {
                         handle.replace_peer(peer);
-                        eprintln!("tessar: reconnected to the daemon");
+                        logln!("tessar: reconnected to the daemon");
                         break link;
                     }
-                    Err(e) => eprintln!("tessar: cannot reconnect to the daemon: {e}"),
+                    Err(e) => logln!("tessar: cannot reconnect to the daemon: {e}"),
                 },
             }
             tokio::select! {
                 _ = &mut session => return Ok(true),
                 () = tokio::time::sleep(backoff) => {}
             }
-            backoff = (backoff * 2).min(RECONNECT_CAP);
+            backoff = (backoff * 2).min(limits.cap);
         };
         linked_at = Instant::now();
         watcher = tokio::spawn(link.waiting());
     }
 }
 
+/// How a daemon is asked to start.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Start {
+    /// Take the journal, or step aside (exit cleanly) if another process
+    /// holds it.
+    Fresh,
+    /// Replace the daemon with this process id: get in line for the
+    /// journal, tell that daemon to stop, and wait up to
+    /// [`crate::lifecycle::TAKEOVER_WAIT`] for it to let go. `tessar daemon
+    /// --takeover PID`; see [`crate::lifecycle::take_over`].
+    Takeover(u32),
+}
+
+/// Starts a daemon process for a home directory.
+#[doc(hidden)]
+pub type Spawn = Arc<dyn Fn(&Path, Start) -> Result<Child, String> + Send + Sync>;
+
+/// A [`Spawn`] that runs this binary as `tessar daemon`, in its own process
+/// group, so it outlives this process and the terminal's signals, with its
+/// output appended to the daemon log in the home directory.
+pub(crate) fn own_daemon() -> Spawn {
+    Arc::new(|home, start| spawn_daemon(home, &home.join(LOG_FILE), start))
+}
+
+/// How a client reaches the daemon and starts one.
+#[derive(Clone)]
+pub struct Launcher {
+    /// How long a started daemon gets to listen (the model loads first).
+    #[doc(hidden)]
+    pub wait: Duration,
+    /// How long to only look for a daemon before starting one. Zero for a
+    /// first connection, [`RECONNECT_GRACE`] for a proxy that lost its
+    /// daemon.
+    #[doc(hidden)]
+    pub grace: Duration,
+    /// See [`RESPAWN_PAUSE`].
+    #[doc(hidden)]
+    pub respawn_pause: Duration,
+    /// Starts the daemon.
+    #[doc(hidden)]
+    pub spawn: Spawn,
+}
+
+impl Launcher {
+    /// For a first connection: starts this binary as the daemon at once if
+    /// none listens, and gives it `wait` to do so.
+    pub fn new(wait: Duration) -> Self {
+        Self {
+            wait,
+            grace: Duration::ZERO,
+            respawn_pause: RESPAWN_PAUSE,
+            spawn: own_daemon(),
+        }
+    }
+
+    /// For a proxy that had a daemon and lost it: looks for a new one for
+    /// [`RECONNECT_GRACE`] before starting one.
+    #[must_use]
+    pub fn reconnecting(mut self) -> Self {
+        self.grace = RECONNECT_GRACE;
+        self
+    }
+}
+
 /// Connects to the daemon's socket, starting a daemon first if none answers
 /// and waiting up to `wait` for it to listen (the model loads first).
 pub async fn connect_or_start(home: &Path, wait: Duration) -> Result<UnixStream, String> {
+    connect_or_start_with(home, &Launcher::new(wait)).await
+}
+
+/// [`connect_or_start`] with the way to reach and start the daemon spelled
+/// out: nothing is started while a daemon shows up within the launcher's
+/// grace time.
+#[doc(hidden)]
+pub async fn connect_or_start_with(home: &Path, launcher: &Launcher) -> Result<UnixStream, String> {
     let socket = socket_path(home);
-    if let Ok(stream) = UnixStream::connect(&socket).await {
-        return Ok(stream);
-    }
-    let log = home.join(LOG_FILE);
-    let mut child = spawn_daemon(home, &log)?;
-    eprintln!("tessar: starting the daemon (log: {})", log.display());
     let started = Instant::now();
     loop {
-        tokio::time::sleep(DAEMON_POLL).await;
         if let Ok(stream) = UnixStream::connect(&socket).await {
             return Ok(stream);
         }
-        // A daemon that failed (no model, say) will never listen. One that
-        // exited cleanly found another daemon holding the journal, which
-        // is about to listen.
-        if let Ok(Some(status)) = child.try_wait()
-            && !status.success()
+        let left = launcher.grace.saturating_sub(started.elapsed());
+        if left.is_zero() {
+            break;
+        }
+        tokio::time::sleep(GRACE_POLL.min(left)).await;
+    }
+    let child = (launcher.spawn)(home, Start::Fresh)?;
+    logln!(
+        "tessar: starting the daemon (log: {})",
+        home.join(LOG_FILE).display()
+    );
+    await_daemon(home, launcher, child, None).await
+}
+
+/// A daemon this process started. When the handle is let go while the
+/// daemon runs, a thread waits for it, so that the daemon does not stay a
+/// zombie for as long as this process lives once it has ended.
+struct Started(Option<Child>);
+
+impl Started {
+    /// The exit status, if the daemon has ended.
+    fn ended(&mut self) -> Option<std::process::ExitStatus> {
+        self.0.as_mut()?.try_wait().ok().flatten()
+    }
+}
+
+impl Drop for Started {
+    fn drop(&mut self) {
+        let Some(mut child) = self.0.take() else {
+            return;
+        };
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        // Without the thread the daemon is only not reaped; nothing breaks.
+        let _ = std::thread::Builder::new()
+            .name("daemon-reaper".to_owned())
+            .spawn(move || {
+                let _ = child.wait();
+            });
+    }
+}
+
+/// Waits up to the launcher's `wait` for a daemon to listen, `child` being
+/// the one just started. With `old`, the daemon wanted is the replacement
+/// for the one with that pid, which may still listen for a moment: a daemon
+/// that says it is `old` does not count.
+///
+/// A daemon that failed (no model, say) will never listen: that is an
+/// error. One that exited cleanly found another process holding the
+/// journal. That is usually a daemon about to listen, but it may also be
+/// one that was shutting down, so if still nothing listens a pause later, a
+/// daemon is started again. A replacement that exited cleanly while the old
+/// daemon still serves could not make it stop: an error too.
+async fn await_daemon(
+    home: &Path,
+    launcher: &Launcher,
+    child: Child,
+    old: Option<u32>,
+) -> Result<UnixStream, String> {
+    let socket = socket_path(home);
+    let log = home.join(LOG_FILE);
+    let mut child = Started(Some(child));
+    let started = Instant::now();
+    // When the daemon last started was seen to have stepped aside.
+    let mut stepped_aside: Option<Instant> = None;
+    loop {
+        tokio::time::sleep(DAEMON_POLL.min(launcher.wait)).await;
+        let mut old_serves = false;
+        if let Ok(stream) = UnixStream::connect(&socket).await {
+            let Some(old) = old else {
+                return Ok(stream);
+            };
+            // Whoever does not say it is the old daemon is taken; if it says
+            // nothing at all, opening the session reports that.
+            if status(stream).await.is_ok_and(|hello| hello.pid == old) {
+                old_serves = true;
+            } else if let Ok(stream) = UnixStream::connect(&socket).await {
+                return Ok(stream);
+            }
+        }
+        if stepped_aside.is_none()
+            && let Some(status) = child.ended()
         {
+            if !status.success() {
+                return Err(format!(
+                    "the daemon exited with {status}; see {}",
+                    log.display()
+                ));
+            }
+            stepped_aside = Some(Instant::now());
+        }
+        if let (true, Some(_), Some(old)) = (old_serves, stepped_aside, old) {
             return Err(format!(
-                "the daemon exited with {status}; see {}",
+                "the old daemon (pid {old}) did not make way for a new one; see {}",
                 log.display()
             ));
         }
-        if started.elapsed() > wait {
+        if started.elapsed() > launcher.wait {
             return Err(format!(
                 "no daemon answered on {} within {}s; see {}",
                 socket.display(),
-                wait.as_secs(),
+                launcher.wait.as_secs(),
                 log.display()
             ));
+        }
+        if stepped_aside.is_some_and(|at| at.elapsed() >= launcher.respawn_pause) {
+            child = Started(Some((launcher.spawn)(home, Start::Fresh)?));
+            stepped_aside = None;
         }
     }
 }
 
 /// Starts `tessar daemon` in its own process group, so it outlives this
 /// proxy and the terminal's signals, with its output appended to `log`.
-fn spawn_daemon(home: &Path, log: &Path) -> Result<std::process::Child, String> {
+fn spawn_daemon(home: &Path, log: &Path, start: Start) -> Result<Child, String> {
     use std::os::unix::process::CommandExt;
     let exe = std::env::current_exe().map_err(|e| format!("cannot find my own binary: {e}"))?;
     let out = std::fs::OpenOptions::new()
@@ -459,10 +691,12 @@ fn spawn_daemon(home: &Path, log: &Path) -> Result<std::process::Child, String> 
     let err = out
         .try_clone()
         .map_err(|e| format!("cannot open {}: {e}", log.display()))?;
-    Command::new(exe)
-        .arg("daemon")
-        .arg("--home")
-        .arg(home)
+    let mut command = Command::new(exe);
+    command.arg("daemon").arg("--home").arg(home);
+    if let Start::Takeover(old) = start {
+        command.arg("--takeover").arg(old.to_string());
+    }
+    command
         .process_group(0)
         .stdin(Stdio::null())
         .stdout(out)

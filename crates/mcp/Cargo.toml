@@ -42,7 +42,7 @@ required-features = ["llama"]
 [dev-dependencies]
 tessar-core = { workspace = true, features = ["testing"] }
 tempfile.workspace = true
-tokio = { workspace = true, features = ["process"] }
+tokio = { workspace = true, features = ["process", "test-util"] }
 
 [lints]
 workspace = true

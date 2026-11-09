@@ -66,7 +66,10 @@ the journal admits one process.
   process group, so it outlives that session), or by hand with
   `tessar daemon [--home DIR] [--idle-exit MINUTES]`, for instance from a
   launchd agent. A second `tessar daemon` on the same home prints `a tessar
-  daemon is already running` and exits with status 0.
+  daemon is already running` and exits with status 0 (it looks twice, 50 ms
+  apart, since a check by `daemon stop` or a hook holds the journal lock for
+  an instant). `--takeover PID` replaces the daemon with that pid instead
+  (see *Build id*).
 - **Socket.** `$TESSAR_HOME/tessar.sock` (default `~/.tessar/tessar.sock`),
   mode 0600. A stale file from a daemon that died is removed on start.
 - **Protocol.** A connection starts with one JSON line from the client,
@@ -79,25 +82,42 @@ the journal admits one process.
 - **Build id.** Every binary carries `<version>+<git hash>.<build time>`;
   `tessar --version` prints it. A daemon keeps serving the code it was
   started with, so after `cargo build` the proxy compares ids on connect.
-  If the daemon's differs, `tessar mcp` sends it SIGTERM, waits up to 15 s
-  for it to go, starts a new one from the current binary and connects to
-  that. The daemon's other sessions are closed by the shutdown, and Claude
+  If the daemon's differs, `tessar mcp` starts the replacement from the
+  current binary as `tessar daemon --takeover <old pid>` and waits for it to
+  listen. The replacement gets in line for the journal lock, then sends the
+  old daemon SIGTERM itself and waits up to 20 s for it to let go. Being in
+  line first, it has the journal the moment the old daemon releases it, so a
+  daemon that another session's (older) proxy starts in that moment finds
+  the journal taken and steps aside. A replacement that waits while another
+  daemon already serves (two sessions upgraded together) leaves the line and
+  exits with status 0. The daemon's other sessions are closed by the shutdown, and Claude
   Code shows tessar as disconnected in those sessions until you reconnect
   (`/mcp`). `tessar mcp --keep-daemon` never restarts the daemon, for
   debugging. A proxy retires only an older daemon (by build time): one that
   meets a newer daemon, started by another session's upgrade, logs `serving
   through the newer daemon` and uses it. A proxy survives daemon restarts and
-  upgrades: when its connection drops it reconnects at once (starting a daemon
-  if none runs), retries every 2 s while that fails, and answers calls made
-  meanwhile with an error for that call only; it exits only when its client
-  closes stdin. Hooks never restart anything: on a different build they use the
+  upgrades: when its connection drops it looks for a daemon at once and for
+  the next 3 s, and only then starts one itself (the lost daemon is usually
+  being replaced, and the replacement must get the journal first). While
+  that fails it retries, first after 2 s and then with doubling pauses up to
+  30 s, and answers calls made meanwhile with an error for that call only;
+  it exits only when its client closes stdin. A daemon it started that
+  stepped aside for another process is started again a second later if
+  still nothing listens. Hooks never restart anything: on a different build they use the
   daemon as it is and write `daemon build differs` to stderr.
 - **Upgrading from a daemon without the handshake.** Such a daemon sends no
-  hello, so the proxy and the hooks give up after 5 s with an error. Stop it
-  once by hand (`pkill -f 'tessar daemon'`); from then on it restarts itself.
-- **`tessar daemon stop`.** Sends SIGTERM to the pid in
-  `$TESSAR_HOME/tessar.pid` (written on start, removed on shutdown) and waits
-  for the daemon to go. It says so if none runs.
+  hello, so the proxy and the session hook give up after 5 s with an error
+  (the prompt hook after 1 s). Stop it once by hand (`tessar daemon stop`,
+  which finds it through its pid file while it holds the journal, or `pkill
+  -f 'tessar daemon'`); from then on it restarts itself.
+- **`tessar daemon stop`.** Asks the daemon on the socket for its pid, sends
+  it SIGTERM and waits for it to go. It says so if none runs. The pid file
+  `$TESSAR_HOME/tessar.pid` (written once the daemon holds the journal,
+  removed when it ends) is used only when nothing answers on the socket and
+  something does hold the journal lock, that is, for a daemon still loading
+  its model. With the journal free, a pid file is stale (the daemon was
+  killed, or the machine rebooted, and the number may belong to any process
+  by now): it is deleted and nothing is signalled.
 - **`tessar daemon status`.** Connects with `{"tessar": 1, "status": true}`
   and prints the daemon's build id, pid, uptime and number of open sessions.
   Exits with failure if no daemon answers.
@@ -109,8 +129,9 @@ the journal admits one process.
   line when a connection opens and one when it closes.
 - **`--idle-exit N`.** Exit when no connection has been open for N minutes.
   The default is to run until stopped.
-- **Stopping.** SIGTERM or SIGINT stops accepting, closes the sessions, drops
-  the memory, removes the socket and exits with status 0. Every write is
+- **Stopping.** SIGTERM or SIGINT stops accepting, closes the sessions,
+  removes the socket, drops the memory and exits with status 0. A connection
+  that has sent no header after 5 s is closed. Every write is
   already durable, so killing it loses nothing either.
 - **`tessar mcp --standalone`** serves in the process itself, as before: it
   takes the journal lock, loads its own model and cannot run beside a daemon.
@@ -151,7 +172,7 @@ path of the running binary and writes nothing:
 ```
 
 Both hooks read the hook's JSON from stdin, use the project of its `cwd`, and
-talk to the daemon (starting it if none runs). Whatever goes wrong, they print
+talk to the daemon. Whatever goes wrong, they print
 nothing, log to stderr and exit with status 0, so a memory that is down never
 blocks a prompt.
 
@@ -171,14 +192,17 @@ blocks a prompt.
   - [2026-11-08] [user] User prefers to be talked to in Russian
   ```
 
-  It gives up after 15 s (a daemon that has to load the model first is not
-  waited for; the next prompt finds it running).
+  It never holds the prompt up for a daemon: if none listens it starts one
+  in the background (unless one is already starting) and prints nothing, and
+  the next prompt finds it running. With a daemon it gives up after 1 s, all
+  told: finding the project, the handshake and the search.
 - **`tessar hook session`** (`SessionStart`). Deletes the session's `.shown`
   file, since the context is fresh, and prints a briefing: a line with the
   counts and the tools, then `About you:` and `About this project:` with the
   newest current facts of each, cut to the budget (each list gets half, and
   what one leaves unused goes to the other). An empty memory gives one line
-  saying so and that `remember` saves facts. It waits up to 60 s for a daemon.
+  saying so and that `remember` saves facts. It starts the daemon if none
+  runs and waits up to 60 s for it.
 - **`tessar hook config`** prints the snippet above.
 
 | Variable | Default | Meaning |
