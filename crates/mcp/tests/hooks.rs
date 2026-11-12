@@ -447,6 +447,27 @@ async fn the_entity_floor_keeps_out_loosely_related_facts() {
 }
 
 #[tokio::test]
+async fn a_lesson_goes_through_the_daemon() {
+    let (_home, daemon, hook) = with_memory().await;
+    let line = proxy::call_tool_text(
+        &hook.peer,
+        "lesson",
+        json!({"text": "Before blaming the cache, read its key.", "space": "user"}),
+    )
+    .await
+    .unwrap();
+    assert!(
+        line.contains("space `user`") && line.contains("created"),
+        "{line}"
+    );
+    let err = proxy::call_tool_text(&hook.peer, "lesson", json!({"text": " "}))
+        .await
+        .unwrap_err();
+    assert!(err.contains("call `lesson` again"), "{err}");
+    daemon.shutdown().await;
+}
+
+#[tokio::test]
 async fn redact_fact_goes_through_the_daemon() {
     let (home, daemon, hook) = with_memory().await;
     remember(&hook, "user", "The vault code is quokka7788").await;

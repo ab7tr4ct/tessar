@@ -12,7 +12,7 @@ use tessar_core::log::MemLog;
 use tessar_core::model::{Key, Origin, Timestamp};
 use tessar_core::store::{BodyDraft, FactDraft, Memory, Remember, Semantic};
 use tessar_mcp::api::Tessar;
-use tessar_mcp::args::{AboutArgs, RecallArgs, RememberArgs, UpdateArgs};
+use tessar_mcp::args::{AboutArgs, LessonArgs, RecallArgs, RememberArgs, UpdateArgs};
 use tessar_mcp::when::{Calendar, DAY_MS, days_from_civil};
 
 const DIMS: usize = 64;
@@ -561,7 +561,14 @@ fn bad_input_is_a_tool_error() {
 fn tools_carry_descriptions_and_schemas() {
     use rmcp::ServerHandler;
     let server = tessar_mcp::server::TessarServer::new(fixture().api);
-    for name in ["remember", "recall", "vocabulary", "about", "update"] {
+    for name in [
+        "remember",
+        "recall",
+        "vocabulary",
+        "about",
+        "update",
+        "lesson",
+    ] {
         let tool = server
             .get_tool(name)
             .unwrap_or_else(|| panic!("no tool {name}"));
@@ -1203,4 +1210,170 @@ fn dates_follow_the_calendar_zone_not_utc() {
     assert!(out.contains("(now: 2026-11-09)"), "{out}");
     assert!(!out.contains("future"), "{out}");
     assert!(!out.contains("2026-11-08"), "{out}");
+}
+
+fn lesson(f: &Fixture, v: serde_json::Value) -> Result<String, String> {
+    f.api
+        .lesson(serde_json::from_value::<LessonArgs>(v).unwrap())
+}
+
+fn lessons_topic(space: &str) -> serde_json::Value {
+    json!({"entity": {"key": "lessons", "kind": "topic", "space": space}})
+}
+
+#[test]
+fn lesson_is_a_dated_statement_about_the_lessons_topic() {
+    let f = fixture();
+    let out = lesson(
+        &f,
+        json!({"text": "  Before declaring a bug in the cache, read its key.  "}),
+    )
+    .unwrap();
+    assert!(out.contains("created"), "{out}");
+    let h = handle(&out);
+    let list = about(&f, lessons_topic("project")).unwrap();
+    assert!(
+        list.contains("Lesson (2026-11-08): Before declaring a bug in the cache, read its key."),
+        "{list}"
+    );
+    assert!(list.contains(&h), "{list}");
+    // Also reachable by the automatic mention of the project.
+    let by_project = about(&f, json!({"entity": {"key": "tessar", "kind": "project"}})).unwrap();
+    assert!(by_project.contains("Lesson (2026-11-08)"), "{by_project}");
+}
+
+#[test]
+fn lesson_does_not_double_the_prefix() {
+    let f = fixture();
+    lesson(
+        &f,
+        json!({"text": "Lesson (2026-10-01): When X fails, check Y."}),
+    )
+    .unwrap();
+    let list = about(&f, lessons_topic("project")).unwrap();
+    assert!(
+        list.contains("Lesson (2026-10-01): When X fails, check Y."),
+        "{list}"
+    );
+    assert!(!list.contains("Lesson (2026-11-08)"), "{list}");
+    assert!(!list.contains("): Lesson ("), "{list}");
+}
+
+#[test]
+fn lesson_in_the_user_space_and_with_extra_mentions() {
+    let f = fixture();
+    let out = lesson(
+        &f,
+        json!({"text": "Before editing settings, ask.", "space": "user",
+               "mentions": [{"key": "Claude Code", "kind": "item"}]}),
+    )
+    .unwrap();
+    assert!(out.contains("space `user`"), "{out}");
+    let list = about(&f, lessons_topic("user")).unwrap();
+    assert!(list.contains("Before editing settings, ask."), "{list}");
+    assert!(list.contains("[user]"), "{list}");
+    let tool = about(
+        &f,
+        json!({"entity": {"key": "Claude Code", "kind": "item", "space": "user"}}),
+    )
+    .unwrap();
+    assert!(tool.contains("Before editing settings, ask."), "{tool}");
+    // Not in the project space.
+    let project = about(&f, lessons_topic("project")).unwrap();
+    assert!(!project.contains("Before editing settings"), "{project}");
+}
+
+#[test]
+fn an_empty_lesson_is_refused_and_names_its_own_tool() {
+    let f = fixture();
+    let refused =
+        remember(&f, json!({"facts": [{"kind": "statement", "text": "  "}]})).unwrap_err();
+    for text in ["   ", "", "Lesson (2026-01-03):", "Lesson (2026-01-03):  "] {
+        let err = lesson(&f, json!({"text": text})).unwrap_err();
+        assert_eq!(
+            err,
+            refused
+                .replace("`remember`", "`lesson`")
+                .replace("fact 1: ", "")
+        );
+        assert!(
+            err.contains("call `lesson` again") && !err.contains("remember"),
+            "{err}"
+        );
+    }
+    assert!(
+        !about(&f, lessons_topic("project"))
+            .unwrap_or_default()
+            .contains("Lesson (")
+    );
+}
+
+#[test]
+fn loose_prefixes_get_the_date_added() {
+    let f = fixture();
+    lesson(&f, json!({"text": "Lesson (from review): check Y"})).unwrap();
+    lesson(&f, json!({"text": "Lesson ("})).unwrap();
+    let list = about(&f, lessons_topic("project")).unwrap();
+    assert!(
+        list.contains("Lesson (2026-11-08): Lesson (from review): check Y"),
+        "{list}"
+    );
+    assert!(list.contains("Lesson (2026-11-08): Lesson ("), "{list}");
+}
+
+#[test]
+fn the_lessons_topic_follows_the_lessons_space_in_either_order() {
+    // Project lesson first, then a user one, then another project one.
+    let f = fixture();
+    lesson(&f, json!({"text": "Project one."})).unwrap();
+    let out = lesson(&f, json!({"text": "User one.", "space": "user"})).unwrap();
+    assert!(out.contains("space `user`"), "{out}");
+    lesson(&f, json!({"text": "Project two."})).unwrap();
+    let user = about(&f, lessons_topic("user")).unwrap();
+    assert!(
+        user.contains("User one.") && !user.contains("Project"),
+        "{user}"
+    );
+    let project = about(&f, lessons_topic("project")).unwrap();
+    assert!(
+        project.contains("Project one.")
+            && project.contains("Project two.")
+            && !project.contains("User one."),
+        "{project}"
+    );
+    // The reverse order, on a fresh memory.
+    let g = fixture();
+    lesson(&g, json!({"text": "User first.", "space": "user"})).unwrap();
+    let out = lesson(&g, json!({"text": "Project after."})).unwrap();
+    assert!(out.contains("space `tessar`"), "{out}");
+    let user = about(&g, lessons_topic("user")).unwrap();
+    assert!(
+        user.contains("User first.") && !user.contains("Project after."),
+        "{user}"
+    );
+    let project = about(&g, lessons_topic("project")).unwrap();
+    assert!(
+        project.contains("Project after.") && !project.contains("User first."),
+        "{project}"
+    );
+}
+
+#[test]
+fn the_date_is_the_calendars_day_not_the_utc_day() {
+    use chrono::FixedOffset;
+    let f = fixture();
+    // 23:30 UTC on 2026-11-08 is already the 9th at +03:00.
+    f.clock.set(Timestamp::from_millis(
+        days_from_civil(2026, 11, 8) * DAY_MS + 23 * 3_600_000 + 1_800_000,
+    ));
+    let api = Tessar::bootstrap(f.mem.clone(), f.clock.clone(), "tessar", &|w| panic!("{w}"))
+        .unwrap()
+        .with_calendar(Calendar::Fixed(FixedOffset::east_opt(3 * 3600).unwrap()));
+    api.lesson(serde_json::from_value(json!({"text": "Near midnight."})).unwrap())
+        .unwrap();
+    let list = about(&f, lessons_topic("project")).unwrap();
+    assert!(
+        list.contains("Lesson (2026-11-09): Near midnight."),
+        "{list}"
+    );
 }

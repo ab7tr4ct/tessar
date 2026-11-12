@@ -9,7 +9,7 @@ use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabiliti
 use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 
 use crate::api::{Rendered, Tessar};
-use crate::args::{AboutArgs, RecallArgs, RememberArgs, UpdateArgs};
+use crate::args::{AboutArgs, LessonArgs, RecallArgs, RememberArgs, UpdateArgs};
 
 const INSTRUCTIONS: &str = "\
 tessar is the user's long-term memory, shared across conversations and projects. \
@@ -102,6 +102,18 @@ with the same subject and predicate and the new value already replaces the old o
 for statements, events, many-valued attributes, and facts that are only to be closed or \
 declared wrong.";
 
+const LESSON: &str = "\
+Record a lesson from your own mistake so that later sessions see it. Call it after the user \
+corrects you, after a diagnosis you gave turns out wrong, after a review finds a defect in your \
+work, after you revert a change. One sentence, phrased through the situation that should trigger \
+it: \"Before declaring a bug in X, read Y\", \"When a test fails only in CI, check Z first\". Not a \
+conclusion such as \"be more careful\", which nobody can act on. `space`: `project` (the default) \
+for lessons about this repository, `user` for lessons that hold in every repository. `mentions` \
+lists other entities the lesson is about. It is a fact written like `remember` does and returns \
+the same report, with the `fNN` handle; it is dated today and about the topic {key: \"lessons\", \
+kind: \"topic\"}. `about` on that topic lists this project's lessons; with `space: \"user\"` on the \
+entity it lists the general ones. `update` fixes or closes a lesson.";
+
 /// The MCP server: tools over one [`Tessar`].
 #[derive(Clone)]
 pub struct TessarServer {
@@ -154,6 +166,11 @@ impl TessarServer {
     #[tool(description = REMEMBER_HEAD)]
     async fn remember(&self, Parameters(args): Parameters<RememberArgs>) -> Result<String, String> {
         self.blocking(move |api| api.remember(args)).await
+    }
+
+    #[tool(description = LESSON)]
+    async fn lesson(&self, Parameters(args): Parameters<LessonArgs>) -> Result<String, String> {
+        self.blocking(move |api| api.lesson(args)).await
     }
 
     #[tool(description = RECALL)]

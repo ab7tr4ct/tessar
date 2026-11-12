@@ -68,6 +68,9 @@ USAGE:
                                destroy the content of facts by handle (starts
                                the daemon if needed); with --purge also erase
                                it from the journal file, as `tessar purge`
+    tessar lesson \"TEXT\" [--space project|user] [--home DIR]
+                               record a lesson from a mistake, as the `lesson`
+                               tool does (starts the daemon if needed)
     tessar purge [--home DIR]  erase redacted content from the journal file and
                                drop the vector cache. Stops the daemon first;
                                the next session starts it again
@@ -213,6 +216,11 @@ enum Cli {
         home: PathBuf,
         kind: HookKind,
     },
+    Lesson {
+        home: PathBuf,
+        text: String,
+        user: bool,
+    },
     Version,
     Help,
 }
@@ -256,6 +264,7 @@ fn main() -> ExitCode {
             purge,
         }) => run_redact(&home, &handles, purge),
         Ok(Cli::Hook { home, kind }) => run_hook(&home, kind),
+        Ok(Cli::Lesson { home, text, user }) => run_lesson(&home, &text, user),
         Ok(Cli::Help) => {
             println!("{USAGE}");
             ExitCode::SUCCESS
@@ -285,6 +294,9 @@ fn parse(args: &[String], env: impl Fn(&str) -> Option<std::ffi::OsString>) -> R
     }
     if command == "redact" {
         return parse_redact(&args[1..], env);
+    }
+    if command == "lesson" {
+        return parse_lesson(&args[1..], env);
     }
     if command == "purge" {
         return parse_purge(&args[1..], env);
@@ -381,6 +393,50 @@ fn parse_redact(
         handles,
         purge,
     })
+}
+
+fn parse_lesson(
+    args: &[String],
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<Cli, String> {
+    let mut home = None;
+    let mut user = false;
+    let mut text = None;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        let space = match arg.as_str() {
+            "--home" => {
+                home = Some(PathBuf::from(it.next().ok_or("--home needs a directory")?));
+                continue;
+            }
+            a if a.starts_with("--home=") => {
+                home = Some(PathBuf::from(&a["--home=".len()..]));
+                continue;
+            }
+            "--space" => it.next().ok_or("--space needs project or user")?.as_str(),
+            a if a.starts_with("--space=") => &a["--space=".len()..],
+            a if a.starts_with('-') => {
+                return Err(format!("unexpected argument `{a}`\n\n{USAGE}"));
+            }
+            t => {
+                if text.replace(t.to_owned()).is_some() {
+                    return Err(format!("`lesson` takes one text, in quotes\n\n{USAGE}"));
+                }
+                continue;
+            }
+        };
+        user = match space {
+            "project" => false,
+            "user" => true,
+            other => return Err(format!("--space is project or user, not `{other}`")),
+        };
+    }
+    let text = text.ok_or_else(|| format!("`lesson` wants a text, in quotes\n\n{USAGE}"))?;
+    let home = match home {
+        Some(home) => home,
+        None => default_home(env)?,
+    };
+    Ok(Cli::Lesson { home, text, user })
 }
 
 fn parse_purge(
@@ -958,6 +1014,40 @@ fn run_redact(home: &Path, handles: &[String], purge: bool) -> ExitCode {
     }
 }
 
+/// Writes a lesson through the daemon, as the `lesson` tool does, and prints
+/// the one-line result.
+fn run_lesson(home: &Path, text: &str, user: bool) -> ExitCode {
+    if let Err(e) = create_home(home) {
+        return fail(&e);
+    }
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let project = project_name(&cwd);
+    let runtime = match runtime() {
+        Ok(r) => r,
+        Err(e) => return fail(&e),
+    };
+    let space = if user { "user" } else { "project" };
+    let result: Result<String, String> = runtime.block_on(async {
+        let opened = proxy::open_current(home, &project, &cwd, DAEMON_WAIT, false).await?;
+        let (server, link) = opened.serve().await?;
+        let line = proxy::call_tool_text(
+            &server.daemon(),
+            "lesson",
+            serde_json::json!({"text": text, "space": space}),
+        )
+        .await;
+        drop((server, link));
+        line
+    });
+    match result {
+        Ok(line) => {
+            println!("{line}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => fail(&e),
+    }
+}
+
 /// Stops the daemon if one runs, rewrites the journal without redacted
 /// content and drops the vector cache.
 fn run_purge(home: &Path) -> ExitCode {
@@ -1181,6 +1271,42 @@ mod tests {
         assert!(p(&["redact"], &[("HOME", "/u")]).is_err());
         assert!(p(&["redact", "--purge"], &[("HOME", "/u")]).is_err());
         assert!(p(&["redact", "f1", "--bogus"], &[("HOME", "/u")]).is_err());
+    }
+
+    #[test]
+    fn lesson_takes_a_text_and_a_space() {
+        assert_eq!(
+            p(&["lesson", "Before X, read Y", "--home", "/d"], &[]).unwrap(),
+            Cli::Lesson {
+                home: "/d".into(),
+                text: "Before X, read Y".into(),
+                user: false
+            }
+        );
+        assert_eq!(
+            p(
+                &["lesson", "--space", "user", "T"],
+                &[("TESSAR_HOME", "/t")]
+            )
+            .unwrap(),
+            Cli::Lesson {
+                home: "/t".into(),
+                text: "T".into(),
+                user: true
+            }
+        );
+        assert_eq!(
+            p(&["lesson", "T", "--space=project"], &[("HOME", "/u")]).unwrap(),
+            Cli::Lesson {
+                home: "/u/.tessar".into(),
+                text: "T".into(),
+                user: false
+            }
+        );
+        assert!(p(&["lesson"], &[("HOME", "/u")]).is_err());
+        assert!(p(&["lesson", "a", "b"], &[("HOME", "/u")]).is_err());
+        assert!(p(&["lesson", "T", "--space", "all"], &[("HOME", "/u")]).is_err());
+        assert!(p(&["lesson", "T", "--bogus"], &[("HOME", "/u")]).is_err());
     }
 
     #[test]

@@ -33,6 +33,7 @@ pub mod args;
 pub mod daemon;
 pub mod fingerprint;
 pub mod hook;
+pub mod lesson;
 pub mod lifecycle;
 pub mod private;
 pub mod project;

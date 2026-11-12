@@ -22,9 +22,10 @@ use tessar_core::store::{
 use tessar_core::vocab;
 
 use crate::args::{
-    AboutArgs, Entity, Fact as FactArgs, FactKind, RecallArgs, RecallSpace, RememberArgs, Space,
-    UpdateArgs, UpdateReason,
+    AboutArgs, Entity, Fact as FactArgs, FactKind, LessonArgs, RecallArgs, RecallSpace,
+    RememberArgs, Space, UpdateArgs, UpdateReason,
 };
+use crate::lesson;
 use crate::when::{Calendar, Tense};
 
 /// The entity kinds defined in both spaces.
@@ -206,6 +207,51 @@ impl Tessar {
         }
         out.pop();
         out
+    }
+
+    // ---- lesson ----------------------------------------------------
+
+    /// The `lesson` tool: a statement written through [`Tessar::remember`],
+    /// dated today and mentioning the `lessons` topic.
+    pub fn lesson(&self, args: LessonArgs) -> Result<String, String> {
+        let trimmed = args.text.trim();
+        // An empty text goes on unchanged, so `remember` refuses it the way
+        // it refuses an empty statement.
+        let text = if trimmed.is_empty() {
+            String::new()
+        } else {
+            let today = self.calendar.ymd(self.clock.now());
+            lesson::text(&today, trimmed)
+        };
+        // The topic lives in the lesson's own space, never wherever an entity
+        // of that name happens to exist already.
+        let space = args.space.unwrap_or(Space::Project);
+        let mut mentions = vec![Entity {
+            key: lesson::ENTITY_KEY.to_owned(),
+            kind: lesson::ENTITY_KIND.to_owned(),
+            space: Some(space),
+        }];
+        mentions.extend(args.mentions);
+        let request = RememberArgs {
+            space: Some(space),
+            source: None,
+            facts: vec![FactArgs {
+                kind: FactKind::Statement,
+                text: Some(text),
+                when: None,
+                subject: None,
+                predicate: None,
+                value: None,
+                single: None,
+                predicate_description: None,
+                synonym_of: None,
+                force_new_predicate: None,
+                mentions,
+            }],
+        };
+        // Same checks and report as `remember`, which names itself in its errors.
+        self.remember(request)
+            .map_err(|e| e.replace("`remember`", "`lesson`").replace("fact 1: ", ""))
     }
 
     // ---- remember --------------------------------------------------

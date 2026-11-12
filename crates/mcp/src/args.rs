@@ -101,6 +101,19 @@ pub struct RememberArgs {
     pub facts: Vec<Fact>,
 }
 
+/// Input of `lesson`.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct LessonArgs {
+    /// The lesson in one sentence, phrased through the situation that should trigger it ("Before declaring a bug in X, read Y"), not through a conclusion.
+    pub text: String,
+    /// Where the lesson belongs. Default `project`; `user` for lessons that hold in every repository.
+    #[serde(default)]
+    pub space: Option<Space>,
+    /// Other entities the lesson is about (a tool, a crate, a file), besides the `lessons` topic.
+    #[serde(default)]
+    pub mentions: Vec<Entity>,
+}
+
 /// Input of `recall`.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct RecallArgs {

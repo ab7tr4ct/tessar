@@ -345,18 +345,19 @@ pub async fn open_current_with(
     Ok(opened)
 }
 
-/// Calls the daemon's `update` tool with `reason: "redact"` for `handle`
-/// and returns the text it answers: the success line, or the error text
-/// the tool gave.
-pub async fn redact_fact(peer: &Peer<RoleClient>, handle: &str) -> Result<String, String> {
-    let mut params = rmcp::model::CallToolRequestParams::new("update");
-    params.arguments = serde_json::json!({"fact": handle, "reason": "redact"})
-        .as_object()
-        .cloned();
+/// Calls the daemon's tool `name` with `arguments` (a JSON object) and
+/// returns the text it answers: the result, or the error text the tool gave.
+pub async fn call_tool_text(
+    peer: &Peer<RoleClient>,
+    name: &'static str,
+    arguments: serde_json::Value,
+) -> Result<String, String> {
+    let mut params = rmcp::model::CallToolRequestParams::new(name);
+    params.arguments = arguments.as_object().cloned();
     let result = peer
         .call_tool(params)
         .await
-        .map_err(|e| format!("{handle}: the daemon failed the call: {e}"))?;
+        .map_err(|e| format!("the daemon failed the call: {e}"))?;
     let text = result
         .content
         .iter()
@@ -364,10 +365,23 @@ pub async fn redact_fact(peer: &Peer<RoleClient>, handle: &str) -> Result<String
         .collect::<Vec<_>>()
         .join("\n");
     if result.is_error == Some(true) {
-        Err(format!("{handle}: {text}"))
+        Err(text)
     } else {
         Ok(text)
     }
+}
+
+/// Calls the daemon's `update` tool with `reason: "redact"` for `handle`
+/// and returns the text it answers: the success line, or the error text
+/// the tool gave.
+pub async fn redact_fact(peer: &Peer<RoleClient>, handle: &str) -> Result<String, String> {
+    call_tool_text(
+        peer,
+        "update",
+        serde_json::json!({"fact": handle, "reason": "redact"}),
+    )
+    .await
+    .map_err(|e| format!("{handle}: {e}"))
 }
 
 /// Serves `server` on `transport` until the session ends or the daemon
