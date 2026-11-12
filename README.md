@@ -3,14 +3,13 @@
 A memory engine for AI agents, in Rust. Deterministic, local, no LLM
 inside.
 
-An agent (today Claude Code, through MCP tools and hooks) writes typed facts and
-reads them back across conversations and projects. The core keeps every
-version of every fact in an append-only journal, answers "what is true
-now" and "what was true on that date", finds facts by the entities,
-words and meaning of a question, and explains every hit. Embeddings come
-from `voyage-4-nano` running in the same process (pure Rust on candle by
-default, or llama.cpp).
-Nothing leaves the machine.
+An agent (today Claude Code, through MCP tools and hooks) writes typed
+facts and reads them back across conversations and projects. The core
+keeps every version of every fact in an append-only journal, answers
+"what is true now" and "what was true on that date", finds facts by the
+entities, words and meaning of a question, and explains every hit.
+Embeddings come from `voyage-4-nano`, which runs in the same process
+(pure Rust, on candle). Nothing leaves the machine.
 
 Status: version 0.1. The core and the MCP server work end to end on macOS
 with Apple Silicon; Linux and CUDA are untested. The API is not stable.
@@ -21,6 +20,96 @@ next round of tests: a local decision log records what the hooks show an
 agent, what they hold back, and which memory tools the agent then calls.
 What to build next, if anything, will be decided from those numbers.
 Everything on `main` works as described below.
+
+## Install
+
+```sh
+cargo install --locked tessar
+tessar setup
+```
+
+`tessar setup` does the rest, one step at a time, and ends each step
+with a line saying whether it was done, was already in place, or was
+left to you:
+
+1. It downloads the embedding model (about 375 MB) and the tokenizer
+   (about 7 MB) into `~/.tessar/models` with `curl`. Both files are
+   pinned to a commit of their Hugging Face repository and checked
+   against a SHA-256 sum; a file that fails the check is not used.
+2. It registers the binary as the MCP server `tessar` in Claude Code,
+   in the user scope (`claude mcp add --scope user`). It asks first.
+3. It merges four hooks into `~/.claude/settings.json`, leaving the rest
+   of the file as it is, and keeps the old file next to it as
+   `settings.json.tessar-backup-<UTC time>`. It asks first.
+
+The first step does not ask. Without a terminal the answer to a question
+is no, and `setup` prints the command to run by hand; `--yes` answers
+yes. `tessar setup --dry-run` changes nothing and prints what it would
+do. Every step is idempotent, so running it again is safe. The exit
+status is 0 when everything requested is done or was in place, 1 when a
+step failed and 2 when some steps were left to you. Afterwards restart
+Claude Code (or run `/mcp` in it).
+
+Prerequisites: Rust 1.89 or newer, `curl`, and the Claude Code CLI
+(`claude`) on `PATH`. Tested on macOS with Apple Silicon; Linux is
+untested. If you decline a step, or `claude` is missing, do it by hand
+(`setup` prints the command it could not run):
+
+```sh
+# the model and the tokenizer; the SHA-256 sums are
+#   c6ed6cc898d50ae1a4492809affadc6c0d023f8ac05c07a37abe20c563152560
+#   c0382117ea329cdf097041132f6d735924b697924d6f6fc3945713e96ce87539
+mkdir -p ~/.tessar/models/voyage-4-nano
+curl -L --fail -o ~/.tessar/models/voyage-4-nano-Q8_0.gguf \
+  https://huggingface.co/MongoDB/voyage-4-nano-GGUF/resolve/03547551689253732502486d62de4cd0970d6564/voyage-4-nano-Q8_0.gguf
+curl -L --fail -o ~/.tessar/models/voyage-4-nano/tokenizer.json \
+  https://huggingface.co/MongoDB/voyage-4-nano/resolve/5fb34e870f49f19e79c94d5e118f5ee730133279/tokenizer.json
+shasum -a 256 ~/.tessar/models/voyage-4-nano-Q8_0.gguf \
+  ~/.tessar/models/voyage-4-nano/tokenizer.json
+
+# the MCP server
+claude mcp add --scope user tessar -- "$(command -v tessar)" mcp
+
+# the hooks: print the snippet, merge it into ~/.claude/settings.json
+tessar hook config
+```
+
+To undo the installation:
+
+```sh
+tessar daemon stop                    # if a daemon is running
+claude mcp remove tessar --scope user
+rm -r ~/.tessar                       # the memory itself: its journal too
+cargo uninstall tessar
+```
+
+and take the four tessar hooks (`PreToolUse`, `SessionStart`,
+`SubagentStart`, `UserPromptSubmit`; their commands end in
+`tessar hook agent|session|subagent|prompt`) out of
+`~/.claude/settings.json`, or put back the
+`settings.json.tessar-backup-<UTC time>` that `setup` left beside it,
+which also drops any change made to the file since. If
+`CLAUDE_CONFIG_DIR` is set, Claude Code's files are there, not in
+`~/.claude`. `~/.tessar` holds the journal, so keep a copy of it if you
+may want the memory back.
+
+After that Claude Code has six tools: `remember`, `lesson`, `recall`,
+`vocabulary`, `update` and `about`. The tool descriptions are the agent's
+manual. Memory lives in `~/.tessar/journal.jsonl`; the project space is
+named after the repository's `origin`. `tessar mcp` talks to a daemon
+that holds the memory and the model for all sessions; it starts the
+daemon when none runs and replaces it when it is an older build (the new
+daemon takes over from the old one). The vector cache, which spares
+re-embedding the facts at start, is keyed by a fingerprint of the model
+file, the tokenizer, the embedding settings and a revision number of the
+embedding code, so a change in any of them starts a fresh cache.
+`TESSAR_MODEL` and `TESSAR_TOKENIZER` point to the model and tokenizer
+files if they live elsewhere. On macOS the first start of a build may
+take longer while Metal compiles the candle kernels (seen once at about
+15 s, usually well under a second); the daemon warms them up at start
+and logs the time. The candle CPU path on Linux is not measured yet.
+The commands, the hooks and the environment variables are in
+[`crates/mcp/README.md`](crates/mcp/README.md).
 
 ## What it does
 
@@ -121,61 +210,37 @@ llama.cpp (cosine 1.0000 on 200 texts) in 676 MB of memory, at about
 throughput; the measurements, including the fusions and custom Metal
 kernels that did not pay off, are in `crates/embed-candle/EXPERIMENT.md`.
 
-## Quick start
-
-Prerequisites: a recent stable Rust (edition 2024). No C++ toolchain is
-needed for the default build, which embeds with candle (Metal on macOS,
-CPU elsewhere).
-
-```sh
-git clone https://github.com/ab7tr4ct/tessar.git && cd tessar
-cargo build --release -p tessar-mcp   # the `tessar` binary
-
-mkdir -p ~/.tessar/models/voyage-4-nano
-curl -L -o ~/.tessar/models/voyage-4-nano-Q8_0.gguf \
-  https://huggingface.co/MongoDB/voyage-4-nano-GGUF/resolve/main/voyage-4-nano-Q8_0.gguf
-curl -L -o ~/.tessar/models/voyage-4-nano/tokenizer.json \
-  https://huggingface.co/voyageai/voyage-4-nano/resolve/main/tokenizer.json
-
-claude mcp add tessar -- "$PWD/target/release/tessar" mcp
-```
-
-Claude Code then has six tools: `remember`, `lesson`, `recall`,
-`vocabulary`, `update` and `about`. The tool descriptions are the agent's
-manual. To add the hooks, run `tessar hook config` and merge the output into
-`~/.claude/settings.json`. Memory lives in
-`~/.tessar/journal.jsonl`; the project space is named after the
-repository's `origin`. `tessar mcp` talks to a daemon that holds the memory and the model for all
-sessions; it starts the daemon when none runs and replaces it when it is an
-older build (the new daemon takes over from the old one). The vector cache,
-which spares re-embedding the facts at start, is keyed by a fingerprint of
-the model file, the tokenizer, the embedding settings and a revision number
-of the embedding code, so a change in any of them starts a fresh cache.
-Details, including `.mcp.json` and environment variables, are in [`crates/mcp/README.md`](crates/mcp/README.md).
-
-To embed with llama.cpp instead, install `cmake` and a C++ toolchain (Xcode
-Command Line Tools on macOS), run `scripts/setup.sh` (the submodule, a few
-minutes to compile) and build with
-`cargo build --release -p tessar-mcp --no-default-features --features llama`;
-`TESSAR_EMBEDDER=candle|llama` picks the embedder at run time when both are
-built. On macOS the first start of a build may take longer while Metal
-compiles the candle kernels (seen once at about 15 s, usually well under a
-second); the daemon warms them up at start and logs the time. The candle CPU
-path on Linux is not measured yet, so llama.cpp stays available through the
-feature. `TESSAR_MODEL` and `TESSAR_TOKENIZER` point to
-the model and tokenizer files if they live elsewhere.
-
 ## Using the core as a library
 
-The flow in a few lines; the complete, compiled version is
-[`crates/mcp/examples/library.rs`](crates/mcp/examples/library.rs)
-(`cargo run --release -p tessar-mcp --features llama --example library`; it needs cmake).
+Depend on `tessar-core` (the model, the store, recall and the ports),
+`tessar-journal` (the file journal) and `tessar-embed-candle` (the
+embedder); `tessar-embed-cache` puts a persistent vector cache in front
+of any embedder. The flow in a few lines, where `model.gguf` and
+`tokenizer.json` are the files `tessar setup` downloads:
 
 ```rust
+use std::sync::Arc;
+use tessar_core::clock::SystemClock;
+use tessar_core::model::{Cardinality, Key, Name, Origin, SpaceKind, Value, ValueType};
+use tessar_core::store::{
+    BodyDraft, EntityRef, FactDraft, Memory, ObjectDraft, Op, PredicateDraft, Recall, Remember,
+    Semantic,
+};
+use tessar_embed_candle::CandleEmbedder;
+use tessar_journal::FileJournal;
+
+let journal = FileJournal::<Op>::open("journal.jsonl")?;
+let embedder = Arc::new(CandleEmbedder::voyage_nano_gguf("model.gguf", "tokenizer.json")?);
+let semantic = Semantic { embedder, dims: 1024, near_bonus: 0.05, predicate_threshold: 0.70 };
 let memory = Memory::open_with(journal, Arc::new(SystemClock), semantic)?;
 let space = memory.create_space(Key::new("notes")?, SpaceKind::LongTerm, None)?;
 let person = memory.define_kind(space, Name::new("person")?)?;
-let lives_in = memory.define_predicate_unchecked(space, PredicateDraft { /* lives_in, Single */ })?;
+let lives_in = memory.define_predicate_unchecked(space, PredicateDraft {
+    name: Name::new("lives_in")?,
+    description: "the place where the subject lives".into(),
+    object: ValueType::Text,
+    cardinality: Cardinality::Single,
+})?;
 
 memory.remember(Remember {
     space,
@@ -195,7 +260,31 @@ let found = memory.recall(&Recall::new("where does Anna live?"));
 
 Writing "Anna lives in Munich" later supersedes the Berlin version;
 `memory.history(lineage)` returns both, and a `Recall` with
-`View::TrueAt(date)` returns the one that held on that date.
+`View::TrueAt(date)` returns the one that held on that date. The
+complete example, with the second write and the history, is
+[`crates/embed-llama/examples/library.rs`](crates/embed-llama/examples/library.rs);
+it uses the llama.cpp embedder (see below).
+
+## Building from source
+
+```sh
+git clone https://github.com/ab7tr4ct/tessar.git && cd tessar
+cargo build --release -p tessar     # target/release/tessar
+target/release/tessar setup
+```
+
+`setup` registers the binary that runs it, so a source build is
+registered by its path in `target/release`. The default build is pure
+Rust: no cmake, no C++ toolchain; it embeds with candle (Metal on macOS,
+CPU elsewhere). `cargo test -p tessar` needs no model and no GPU.
+
+The llama.cpp embedder is not part of the binary. It lives in the
+`tessar-embed-llama` crate, which is not published and is used for the
+comparison tests against candle and for the example above. Building it
+needs cmake, a C++ toolchain (Xcode Command Line Tools on macOS) and
+`scripts/setup.sh`, which checks out the parts of the `third_party/llama.cpp`
+submodule that the build needs. `TESSAR_EMBEDDER` accepts `candle`; `llama`
+is an error.
 
 ## Layout
 
@@ -203,12 +292,15 @@ Writing "Anna lives in Munich" later supersedes the Berlin version;
 |---|---|
 | `crates/core` | data model, store, recall, ports (`Log`, `Clock`, `Embedder`). No I/O, no network, no LLM. |
 | `crates/journal` | the file journal: JSON Lines, CRC-32 per line, `fsync`, torn-write recovery, file lock. |
-| `crates/embed-candle` | default in-process embedder: pure Rust on candle, GGUF Q8; Metal on macOS, CPU elsewhere. |
-| `crates/embed-llama` | optional in-process embedder (cargo feature `llama`): a small C++ shim over llama.cpp bridged with `cxx`; needs cmake. |
+| `crates/embed-candle` | the in-process embedder: pure Rust on candle, GGUF Q8; Metal on macOS, CPU elsewhere. |
 | `crates/embed-cache` | a persistent vector cache in front of any embedder, keyed by a fingerprint. |
-| `crates/embed` | HTTP embedder for `llama-server` and embedding APIs. |
-| `crates/mcp` | the `tessar` binary: an MCP server on stdio, the daemon, the hooks and the `lesson`, `redact` and `purge` commands. |
-| `third_party/llama.cpp` | git submodule (release b12189); `scripts/setup.sh` checks out only the parts the build needs (only for the `llama` feature). |
+| `crates/mcp` | the package `tessar`: an MCP server on stdio, the daemon, the hooks and the `setup`, `lesson`, `redact` and `purge` commands. |
+| `crates/embed` | HTTP embedder for `llama-server` and embedding APIs. Not published. |
+| `crates/embed-llama` | llama.cpp embedder, a small C++ shim bridged with `cxx`; needs cmake. Not published; for comparison tests. |
+| `third_party/llama.cpp` | git submodule (release b12189), only for `embed-llama`. |
+
+The first five crates are published: `tessar`, `tessar-core`,
+`tessar-journal`, `tessar-embed-cache` and `tessar-embed-candle`.
 
 Principles: the core has no LLM and is deterministic; nothing is deleted;
 exact keys come before vectors; every result is explainable; spaces from
