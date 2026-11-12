@@ -168,3 +168,18 @@ fn purging_a_clean_journal_succeeds_and_says_so() {
             .contains("no journal")
     );
 }
+
+#[test]
+fn purge_removes_the_decision_log() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(journal_path(home.path()), "").unwrap();
+    let log = home.path().join("decisions.jsonl");
+    std::fs::write(&log, "{\"message\":\"secret\"}\n").unwrap();
+    let done = purge_home(home.path()).unwrap();
+    assert!(done.decision_log);
+    assert!(!log.exists());
+    assert!(summary(&done, false).contains("decision log removed"));
+    let again = purge_home(home.path()).unwrap();
+    assert!(!again.decision_log);
+    assert!(!summary(&again, false).contains("decision log"));
+}

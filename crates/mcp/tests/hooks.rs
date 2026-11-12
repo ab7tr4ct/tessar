@@ -395,8 +395,13 @@ async fn session_briefing_of_an_empty_memory() {
     )
     .await
     .unwrap();
-    assert_eq!(out.lines().count(), 1, "{out}");
+    // The memory is empty, and so is the lessons block but for its hint.
+    assert_eq!(out.lines().count(), 2, "{out}");
     assert!(out.contains("empty") && out.contains("`remember`"), "{out}");
+    assert!(
+        out.lines().nth(1).unwrap().starts_with("Record a lesson"),
+        "{out}"
+    );
     daemon.shutdown().await;
 }
 
@@ -422,7 +427,8 @@ async fn run_prompt_uses_the_running_daemon_and_the_cwd_project() {
     assert!(
         hook::run_prompt(home.path(), "not json", &Settings::default())
             .await
-            .is_err()
+            .error
+            .is_some()
     );
     daemon.shutdown().await;
 }
@@ -671,4 +677,423 @@ fn hook_prompt_binary_does_not_wait_for_a_daemon() {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+// ---- the decision log and lessons ---------------------------------------
+
+fn records(home: &Path) -> Vec<Value> {
+    std::fs::read_to_string(home.join("decisions.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+async fn remember_lesson(hook: &Hook, space: &str, text: &str) {
+    let r = call(
+        hook,
+        "remember",
+        json!({"space": space, "facts": [{"kind": "statement", "text": text,
+            "mentions": [{"key": "lessons", "kind": "topic", "space": space}]}]}),
+    )
+    .await;
+    assert_ne!(r.is_error, Some(true), "{r:?}");
+}
+
+fn stdin_for(session: &str, prompt: &str) -> String {
+    json!({"session_id": session, "cwd": "/work/x", "prompt": prompt}).to_string()
+}
+
+/// Runs the prompt hook as the binary does: the output is handed to a
+/// closure, then the record is written. Returns what was printed and
+/// whether the log already existed when it was printed.
+async fn run_logged(home: &Path, stdin: &str, settings: &Settings) -> (String, bool) {
+    let run =
+        hook::run_prompt_recorded(home, stdin, settings, Duration::from_secs(20), &no_spawn())
+            .await;
+    let log = home.join("decisions.jsonl");
+    let mut seen = None;
+    run.finish(home, |text| seen = Some((text.to_owned(), log.exists())));
+    seen.expect("the output was printed")
+}
+
+/// The session hook the same way.
+async fn session_logged(
+    hook: &Hook,
+    start: &HookInput,
+    settings: &Settings,
+    home: &Path,
+) -> String {
+    let run = hook::session_recorded(&hook.peer, start, "alpha", settings, home)
+        .await
+        .unwrap();
+    let mut printed = String::new();
+    run.finish(home, |text| printed = text.to_owned());
+    printed
+}
+
+#[tokio::test]
+async fn a_prompt_run_is_logged_after_its_output() {
+    use std::os::unix::fs::PermissionsExt;
+    let (home, daemon, hook) = with_memory().await;
+    remember_lesson(
+        &hook,
+        "project",
+        "Lesson (2026-11-09): when the journal checksum fails, read the journal first",
+    )
+    .await;
+    let message = "in which language should the user be talked to, and the journal checksum";
+    let (out, log_existed) = run_logged(
+        home.path(),
+        &stdin_for("sess-1", message),
+        &Settings::default(),
+    )
+    .await;
+    assert!(out.contains("Russian"), "{out}");
+    assert!(!log_existed, "the record is written after the output");
+
+    let recs = records(home.path());
+    assert_eq!(recs.len(), 1);
+    let r = &recs[0];
+    assert_eq!(r["kind"], "prompt");
+    assert_eq!(r["session"], "sess-1");
+    assert_eq!(r["message"], message);
+    assert_eq!(r["message_chars"], message.chars().count());
+    assert!(r["ts"].as_str().unwrap().ends_with('Z'));
+    assert_eq!(r["thresholds"]["lesson_min_similarity"], 0.35);
+    assert_eq!(r["thresholds"]["budget"], 1500);
+    assert_eq!(r["printed_chars"], out.chars().count());
+    assert!(r["elapsed_ms"].is_u64());
+    let candidates = r["candidates"].as_array().unwrap();
+    assert!(!candidates.is_empty());
+    for c in candidates {
+        assert!(c["id"].as_str().unwrap().starts_with('f'));
+        assert!(c["channels"].is_array() && c["lesson"].is_boolean());
+        match c["decision"].as_str().unwrap() {
+            "shown" => assert!(c["reason"].is_null()),
+            "held" => assert!(
+                [
+                    "below_threshold",
+                    "already_shown",
+                    "over_limit",
+                    "over_budget"
+                ]
+                .contains(&c["reason"].as_str().unwrap()),
+                "{c}"
+            ),
+            other => panic!("{other}"),
+        }
+    }
+    assert!(
+        candidates.iter().any(|c| c["lesson"] == true),
+        "the lesson is a candidate: {candidates:?}"
+    );
+    let shown = candidates
+        .iter()
+        .filter(|c| c["decision"] == "shown")
+        .count();
+    assert_eq!(shown, out.lines().count() - 1, "{out}");
+
+    let mode = std::fs::metadata(home.path().join("decisions.jsonl"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600);
+
+    // The same prompt again: what was shown is held as already shown.
+    run_logged(
+        home.path(),
+        &stdin_for("sess-1", message),
+        &Settings::default(),
+    )
+    .await;
+    let recs = records(home.path());
+    assert_eq!(recs.len(), 2);
+    assert!(
+        recs[1]["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["reason"] == "already_shown")
+    );
+    daemon.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_lesson_is_printed_with_its_handle_by_the_prompt_hook() {
+    let (home, daemon, hook) = with_memory().await;
+    remember_lesson(
+        &hook,
+        "project",
+        "Lesson (2026-11-09): when the journal checksum fails, read the journal first",
+    )
+    .await;
+    let out = hook::prompt(
+        &hook.peer,
+        &input("s", "the journal checksum fails again, what now"),
+        &Settings::default(),
+        home.path(),
+    )
+    .await
+    .unwrap();
+    let line = out
+        .lines()
+        .find(|l| l.starts_with("- lesson f"))
+        .unwrap_or_else(|| panic!("{out}"));
+    assert!(
+        line.contains("]: when the journal checksum fails"),
+        "{line}"
+    );
+    assert!(!out.contains("Lesson ("), "{out}");
+    daemon.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_skipped_prompt_is_logged_with_its_reason() {
+    let home = tempfile::tempdir().unwrap();
+    let (out, _) = run_logged(
+        home.path(),
+        &stdin_for("s", "/compact now please"),
+        &Settings::default(),
+    )
+    .await;
+    assert_eq!(out, "");
+    run_logged(
+        home.path(),
+        &stdin_for("s", "ok thanks"),
+        &Settings::default(),
+    )
+    .await;
+    let recs = records(home.path());
+    assert_eq!(recs.len(), 2);
+    assert_eq!(recs[0]["kind"], "prompt");
+    assert_eq!(recs[0]["skipped"], "slash_command");
+    assert_eq!(recs[1]["skipped"], "short_message");
+    assert_eq!(recs[1]["candidates"], json!([]));
+    assert!(recs[1]["project"].is_null());
+}
+
+#[tokio::test]
+async fn a_failed_log_write_leaves_the_output_alone() {
+    let (home, daemon, _hook) = with_memory().await;
+    let message = "in which language should the user be talked to";
+    let (with_log, _) =
+        run_logged(home.path(), &stdin_for("a", message), &Settings::default()).await;
+    // A directory where the log should be: opening it for writing fails.
+    std::fs::remove_file(home.path().join("decisions.jsonl")).unwrap();
+    std::fs::create_dir(home.path().join("decisions.jsonl")).unwrap();
+    let (without, _) =
+        run_logged(home.path(), &stdin_for("b", message), &Settings::default()).await;
+    assert_eq!(with_log, without);
+    daemon.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_session_hook_adds_the_lessons_block_and_logs_it() {
+    let (home, daemon, hook) = with_memory().await;
+    remember_lesson(
+        &hook,
+        "project",
+        "Lesson (2026-11-01): when a test flakes, look for a sleep",
+    )
+    .await;
+    remember_lesson(
+        &hook,
+        "user",
+        "Lesson (2026-11-05): when asked for a plan, give one option",
+    )
+    .await;
+    // A fact of the same entity that is not a lesson is not counted.
+    remember(&hook, "project", "The lessons topic is where lessons live").await;
+    let start = HookInput::parse(
+        &json!({"session_id": "s", "cwd": "/work/x", "source": "startup"}).to_string(),
+    )
+    .unwrap();
+    let out = session_logged(&hook, &start, &Settings::default(), home.path()).await;
+    assert!(
+        out.contains("Lessons: 1 for this project, 1 for you; latest:"),
+        "{out}"
+    );
+    let latest: Vec<&str> = out
+        .lines()
+        .filter(|l| l.starts_with("- f") && l.contains("[2026-"))
+        .collect();
+    assert!(out.contains("when asked for a plan"), "{out}");
+    assert!(out.contains("when a test flakes"), "{out}");
+    assert!(
+        !out[out.find("Lessons:").unwrap()..].contains("Lesson ("),
+        "{out}"
+    );
+    assert!(!latest.is_empty());
+    assert!(out.trim_end().ends_with("that should trigger it."), "{out}");
+    assert!(out.chars().count() <= 3000);
+
+    let recs = records(home.path());
+    assert_eq!(recs.len(), 1);
+    let r = &recs[0];
+    assert_eq!(r["kind"], "session");
+    assert_eq!(r["project"], "alpha");
+    assert_eq!(r["source"], "startup");
+    assert_eq!(r["lessons_project"], 1);
+    assert_eq!(r["lessons_user"], 1);
+    assert_eq!(r["printed_chars"], out.chars().count());
+    let blocks = r["blocks"].as_array().unwrap();
+    let size = |n: &str| {
+        blocks.iter().find(|b| b["name"] == n).unwrap()["chars"]
+            .as_u64()
+            .unwrap()
+    };
+    assert!(size("lessons") > 0 && size("lessons") <= 601);
+    assert_eq!(
+        (size("briefing") + size("lessons")) as usize,
+        out.chars().count()
+    );
+
+    // Lessons are not listed twice: not among the facts about you.
+    assert_eq!(out.matches("when asked for a plan").count(), 1, "{out}");
+    assert!(out.contains("2 facts about you, 2 about project"), "{out}");
+
+    // A budget too small for the block's room (a fifth of it) leaves it out;
+    // the briefing stays.
+    let tight = Settings {
+        session_budget: 400,
+        ..Settings::default()
+    };
+    let out = session_logged(&hook, &start, &tight, home.path()).await;
+    assert!(out.chars().count() <= 400, "{}", out.chars().count());
+    assert!(out.contains("About you:"), "{out}");
+    assert!(
+        !out.contains("Lessons:") && !out.contains("Record a lesson"),
+        "{out}"
+    );
+    daemon.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_full_briefing_still_has_the_lessons_block() {
+    let home = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(home.path(), None);
+    let hook = connect(home.path(), "alpha").await;
+    for n in 0..40 {
+        remember(
+            &hook,
+            "user",
+            &format!("User fact number {n} about habit {n} and food {n}"),
+        )
+        .await;
+        remember(
+            &hook,
+            "project",
+            &format!("Project fact number {n} on part {n}"),
+        )
+        .await;
+    }
+    remember_lesson(
+        &hook,
+        "project",
+        "Lesson (2026-11-01): when a test flakes, look for a sleep",
+    )
+    .await;
+    let start =
+        HookInput::parse(&json!({"session_id": "s", "source": "startup"}).to_string()).unwrap();
+    let out = session_logged(&hook, &start, &Settings::default(), home.path()).await;
+    assert!(out.chars().count() <= 3000, "{}", out.chars().count());
+    assert!(
+        out.contains("Lessons: 1 for this project, 0 for you"),
+        "{out}"
+    );
+    assert!(
+        out.contains("Record a lesson with the `lesson` tool"),
+        "{out}"
+    );
+    assert!(
+        out.contains("About you:") && out.contains("About this project:"),
+        "{out}"
+    );
+    daemon.shutdown().await;
+}
+
+#[tokio::test]
+async fn ordinary_lines_come_from_the_best_eight_hits_only() {
+    let home = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(home.path(), None);
+    let hook = connect(home.path(), "alpha").await;
+    for n in 0..12 {
+        remember(
+            &hook,
+            "project",
+            &format!("the harbour crane schedule note {n}"),
+        )
+        .await;
+    }
+    let (out, _) = run_logged(
+        home.path(),
+        &stdin_for("s", "the harbour crane schedule note"),
+        &Settings::default(),
+    )
+    .await;
+    assert_eq!(out.lines().count() - 1, 8, "{out}");
+    let recs = records(home.path());
+    let held: Vec<&Value> = recs[0]["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["decision"] == "held")
+        .collect();
+    assert!(!held.is_empty());
+    assert!(held.iter().all(|c| c["reason"] == "over_limit"), "{held:?}");
+    daemon.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_failed_prompt_run_is_logged_with_its_reason() {
+    let home = tempfile::tempdir().unwrap();
+    // No daemon: the hook starts none (the test spawner refuses) and fails.
+    let run = hook::run_prompt_recorded(
+        home.path(),
+        &stdin_for("s1", "what do I prefer to eat for lunch"),
+        &Settings::default(),
+        Duration::from_secs(5),
+        &no_spawn(),
+    )
+    .await;
+    assert!(run.error.is_some() && run.output.is_empty());
+    run.finish(home.path(), |_| panic!("nothing is printed on a failure"));
+    let recs = records(home.path());
+    assert_eq!(recs.len(), 1);
+    assert_eq!(recs[0]["kind"], "prompt");
+    assert_eq!(recs[0]["session"], "s1");
+    assert!(
+        recs[0]["error"].as_str().unwrap().contains("daemon"),
+        "{}",
+        recs[0]
+    );
+    assert!(recs[0]["elapsed_ms"].is_u64());
+    assert_eq!(recs[0]["candidates"], json!([]));
+}
+
+#[tokio::test]
+async fn a_memory_of_only_lessons_is_not_called_empty() {
+    let home = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(home.path(), None);
+    let hook = connect(home.path(), "alpha").await;
+    remember_lesson(
+        &hook,
+        "project",
+        "Lesson (2026-11-01): when a test flakes, look for a sleep",
+    )
+    .await;
+    let start =
+        HookInput::parse(&json!({"session_id": "s", "source": "startup"}).to_string()).unwrap();
+    let out = session_logged(&hook, &start, &Settings::default(), home.path()).await;
+    assert!(!out.contains("empty"), "{out}");
+    assert!(
+        out.starts_with("tessar memory has no facts about you or project `alpha` yet."),
+        "{out}"
+    );
+    assert!(
+        out.contains("`remember`") && out.contains("Lessons: 1 for this project"),
+        "{out}"
+    );
+    daemon.shutdown().await;
 }

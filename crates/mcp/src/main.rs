@@ -1092,8 +1092,8 @@ fn run_hook(home: &Path, kind: HookKind) -> ExitCode {
         return ExitCode::SUCCESS;
     }
     let settings = hook::Settings::from_env(|name| std::env::var(name).ok());
-    let result = runtime().and_then(|rt| {
-        let result = rt.block_on(async {
+    let run = runtime().map(|rt| {
+        let run = rt.block_on(async {
             match kind {
                 HookKind::Prompt => hook::run_prompt(home, &stdin, &settings).await,
                 _ => hook::run_session(home, &stdin, &settings).await,
@@ -1102,14 +1102,15 @@ fn run_hook(home: &Path, kind: HookKind) -> ExitCode {
         // Do not wait for work the time limit left behind (a `git` that
         // hangs): the process is about to exit.
         rt.shutdown_background();
-        result
+        run
     });
-    match result {
-        Ok(text) => {
+    match run {
+        // The output goes out first; the decision log is written after it.
+        Ok(run) => run.finish(home, |text| {
             let mut out = std::io::stdout().lock();
             let _ = out.write_all(text.as_bytes());
             let _ = out.flush();
-        }
+        }),
         Err(e) => logln!("tessar hook: {e}"),
     }
     ExitCode::SUCCESS

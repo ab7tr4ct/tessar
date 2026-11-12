@@ -2,7 +2,8 @@
 //!
 //! A redaction removes content from memory, but the journal is append-only
 //! and still holds the original text. Purging rewrites the journal without
-//! it and drops the vector cache, which may hold vectors of redacted texts.
+//! it, drops the vector cache, which may hold vectors of redacted texts, and
+//! removes the decision log, which keeps the text of the user's messages.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -23,6 +24,8 @@ pub struct Purged {
     pub bytes_after: u64,
     /// Vector cache files deleted.
     pub caches: usize,
+    /// Whether a decision log (`decisions.jsonl`) was removed.
+    pub decision_log: bool,
 }
 
 /// Where the journal lives under `home`.
@@ -39,6 +42,7 @@ pub fn purge_home(home: &Path) -> Result<Purged, String> {
     if !path.exists() {
         return Err(format!("no journal at {}", path.display()));
     }
+    let decision_log = remove_decision_log(home)?;
     let mut counts = None;
     let report = FileJournal::<Op>::rewrite(&path, |commits| {
         let (commits, report) = purge_with_report(commits);
@@ -53,7 +57,19 @@ pub fn purge_home(home: &Path) -> Result<Purged, String> {
         bytes_before: report.bytes_before,
         bytes_after: report.bytes_after,
         caches: drop_vector_caches(home)?,
+        decision_log,
     })
+}
+
+/// Deletes the decision log: it holds message text, so it may hold text
+/// that was redacted since.
+fn remove_decision_log(home: &Path) -> Result<bool, String> {
+    let path = crate::decisions::log_path(home);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!("cannot delete {}: {e}", path.display())),
+    }
 }
 
 /// Deletes the vector caches under `home/index`; they are rebuilt on the
@@ -82,14 +98,19 @@ pub fn summary(p: &Purged, stopped: bool) -> String {
     } else {
         ""
     };
+    let log = if p.decision_log {
+        "; decision log removed"
+    } else {
+        ""
+    };
     if p.facts == 0 && p.episodes == 0 {
         return format!(
-            "{daemon}nothing to purge: the journal holds no redacted content ({} bytes); vector cache files deleted: {}",
+            "{daemon}nothing to purge: the journal holds no redacted content ({} bytes); vector cache files deleted: {}{log}",
             p.bytes_after, p.caches
         );
     }
     format!(
-        "{daemon}purged {} fact(s) and {} episode(s); journal {} bytes before, {} after; vector cache files deleted: {}",
+        "{daemon}purged {} fact(s) and {} episode(s); journal {} bytes before, {} after; vector cache files deleted: {}{log}",
         p.facts, p.episodes, p.bytes_before, p.bytes_after, p.caches
     )
 }

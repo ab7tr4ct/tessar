@@ -45,7 +45,18 @@ fn header_len(text: &str) -> Option<usize> {
         4 | 7 => b == b'-',
         _ => b.is_ascii_digit(),
     });
-    (shaped && rest[10..].starts_with("):")).then_some(PREFIX.len() + 12)
+    // A real calendar day: `2026-13-45` has the shape but is not a date.
+    let real = shaped && chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_ok();
+    (real && rest[10..].starts_with("):")).then_some(PREFIX.len() + 12)
+}
+
+/// The text of a lesson without its `Lesson (date):` header; `text` as it is
+/// when it is not a lesson.
+pub fn body(text: &str) -> &str {
+    match header_len(text) {
+        Some(n) if is_lesson(text) => text[n..].trim_start(),
+        _ => text,
+    }
 }
 
 #[cfg(test)]
@@ -76,8 +87,18 @@ mod tests {
         assert!(!is_lesson("Lesson (2026-01-03):   "));
         assert!(!is_lesson("Lesson (2026-01-03):x"));
         assert!(!is_lesson("Lesson (2026-1-03): x"));
+        assert!(!is_lesson("Lesson (2026-13-45): x"));
+        assert!(!is_lesson("Lesson (2026-02-30): x"));
+        assert!(is_lesson("Lesson (2024-02-29): x"));
         assert!(!is_lesson("Lesson (2026-01-03 ): x"));
         assert!(!is_lesson("Lesson (2026-01-0\u{e9}): x"));
+    }
+
+    #[test]
+    fn the_body_drops_the_header() {
+        assert_eq!(body("Lesson (2026-11-09): read the log"), "read the log");
+        assert_eq!(body("Lesson (2026-13-45): x"), "Lesson (2026-13-45): x");
+        assert_eq!(body("plain"), "plain");
     }
 
     #[test]

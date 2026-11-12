@@ -16,7 +16,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rmcp::model::CallToolRequestParams;
 use rmcp::{Peer, RoleClient};
@@ -24,6 +24,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::daemon::socket_path;
+use crate::decisions::{self, Block, Candidate, PromptRecord, Record, SessionRecord, Thresholds};
+use crate::lesson;
 use crate::lifecycle;
 use crate::project::project_name;
 use crate::proxy;
@@ -35,6 +37,12 @@ pub const DEFAULT_MIN_SIMILARITY: f64 = 0.45;
 pub const DEFAULT_ENTITY_MIN_SIMILARITY: f64 = 0.35;
 /// At most this many hits pass through the entity rule alone.
 pub const DEFAULT_ENTITY_MAX: usize = 2;
+/// A lesson is kept when its similarity is at least this: lessons are
+/// phrased through a situation and compete badly under the general
+/// threshold.
+pub const LESSON_MIN_SIMILARITY: f64 = 0.35;
+/// At most this many lessons are printed per prompt.
+pub const LESSON_MAX: usize = 2;
 /// Characters the `prompt` hook may print.
 pub const DEFAULT_BUDGET: usize = 1500;
 /// Characters the `session` hook may print.
@@ -49,8 +57,13 @@ pub const SESSION_WAIT: Duration = Duration::from_secs(60);
 
 /// A prompt with fewer words than this is not worth a search.
 const MIN_WORDS: usize = 3;
-/// How many facts `recall` is asked for.
-const RECALL_LIMIT: usize = 8;
+/// How many facts `recall` is asked for: more than the ordinary window, so
+/// that lessons, which rank below the facts the general threshold keeps, are
+/// among them.
+const RECALL_LIMIT: usize = 16;
+/// Ordinary facts are taken only from this many best hits, as before lessons
+/// had a slot of their own.
+const ORDINARY_WINDOW: usize = 8;
 /// A pasted log is not a query: only this many characters are searched.
 const MAX_QUERY_CHARS: usize = 2000;
 /// Below this many characters left, a hit that does not fit is dropped
@@ -137,8 +150,19 @@ impl Settings {
 /// True for a prompt the `prompt` hook leaves alone: fewer than three words,
 /// or a slash command.
 pub fn skip_prompt(prompt: &str) -> bool {
+    skip_reason(prompt).is_some()
+}
+
+/// Why [`skip_prompt`] is true, as the decision log names it.
+fn skip_reason(prompt: &str) -> Option<&'static str> {
     let prompt = prompt.trim();
-    prompt.starts_with('/') || prompt.split_whitespace().count() < MIN_WORDS
+    if prompt.starts_with('/') {
+        Some("slash_command")
+    } else if prompt.split_whitespace().count() < MIN_WORDS {
+        Some("short_message")
+    } else {
+        None
+    }
 }
 
 /// One hit of `recall` or `about`, as the structured content gives it.
@@ -173,6 +197,27 @@ impl Hit {
     fn short_line(&self) -> String {
         format!("- [{}] {}", self.recorded, one_line(&self.text))
     }
+
+    /// True for a lesson, as [`lesson::is_lesson`] says.
+    pub fn is_lesson(&self) -> bool {
+        lesson::is_lesson(&self.text)
+    }
+
+    /// The lesson without its `Lesson (date):` header, on one line.
+    fn lesson_body(&self) -> String {
+        one_line(lesson::body(&self.text))
+    }
+
+    /// `- lesson f88 [date]: body`: the handle comes first so that the
+    /// agent can act on it.
+    fn lesson_line(&self) -> String {
+        format!(
+            "- lesson {} [{}]: {}",
+            self.id,
+            self.recorded,
+            self.lesson_body()
+        )
+    }
 }
 
 fn one_line(text: &str) -> String {
@@ -205,31 +250,107 @@ pub fn parse_hits(structured: &Value) -> Vec<Hit> {
         .collect()
 }
 
-/// The hits worth showing, in order, not shown yet in this session. A hit
-/// passes when its similarity is at least `min_similarity`, or when the
-/// entity channel found it and its similarity is at least
-/// `entity_min_similarity`; at most `entity_max` hits pass by the second
-/// rule alone, since a prompt naming the project would otherwise pull in
-/// every fact linked to it.
-pub fn select(hits: Vec<Hit>, settings: &Settings, shown: &HashSet<String>) -> Vec<Hit> {
+/// Why a hit was held back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hold {
+    /// Shown earlier in this session.
+    AlreadyShown,
+    /// Its similarity is under the threshold of its rule.
+    BelowThreshold,
+    /// It passes a rule, but that rule's quota is used up.
+    OverLimit,
+    /// It did not fit in the character budget.
+    OverBudget,
+}
+
+impl Hold {
+    /// The name in the decision log.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::AlreadyShown => "already_shown",
+            Self::BelowThreshold => "below_threshold",
+            Self::OverLimit => "over_limit",
+            Self::OverBudget => "over_budget",
+        }
+    }
+}
+
+/// What the rules say about one hit, before the budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    Ordinary,
+    Lesson,
+    Held(Hold),
+}
+
+/// Judges every hit, in order. A hit passes when its similarity is at least
+/// `min_similarity`, or when the entity channel found it and its similarity
+/// is at least `entity_min_similarity`; at most `entity_max` hits pass by the
+/// second rule alone, since a prompt naming the project would otherwise pull
+/// in every fact linked to it. With `lessons` on, a lesson has its own rule:
+/// at least [`LESSON_MIN_SIMILARITY`], at most [`LESSON_MAX`] of them.
+fn judge(
+    hits: Vec<Hit>,
+    settings: &Settings,
+    shown: &HashSet<String>,
+    lessons: bool,
+) -> Vec<(Hit, Verdict)> {
     let mut by_entity = 0;
+    let mut lesson_count = 0;
     hits.into_iter()
-        .filter(|h| !shown.contains(&h.id))
-        .filter(|h| {
-            let Some(sim) = h.similarity else {
-                return false;
+        .map(|h| {
+            let verdict = if shown.contains(&h.id) {
+                Verdict::Held(Hold::AlreadyShown)
+            } else if let Some(sim) = h.similarity {
+                if lessons && h.is_lesson() {
+                    if sim < LESSON_MIN_SIMILARITY.min(settings.min_similarity) {
+                        Verdict::Held(Hold::BelowThreshold)
+                    } else if lesson_count >= LESSON_MAX {
+                        Verdict::Held(Hold::OverLimit)
+                    } else {
+                        lesson_count += 1;
+                        Verdict::Lesson
+                    }
+                } else if sim >= settings.min_similarity {
+                    Verdict::Ordinary
+                } else if h.channels.iter().any(|c| c == "entity")
+                    && sim >= settings.entity_min_similarity
+                {
+                    if by_entity < settings.entity_max {
+                        by_entity += 1;
+                        Verdict::Ordinary
+                    } else {
+                        Verdict::Held(Hold::OverLimit)
+                    }
+                } else {
+                    Verdict::Held(Hold::BelowThreshold)
+                }
+            } else {
+                Verdict::Held(Hold::BelowThreshold)
             };
-            if sim >= settings.min_similarity {
-                return true;
-            }
-            let entity = h.channels.iter().any(|c| c == "entity");
-            if entity && sim >= settings.entity_min_similarity && by_entity < settings.entity_max {
-                by_entity += 1;
-                return true;
-            }
-            false
+            (h, verdict)
         })
         .collect()
+}
+
+/// The hits worth showing, in order, not shown yet in this session; see
+/// [`judge`] for the rules. Lessons are not told apart here.
+pub fn select(hits: Vec<Hit>, settings: &Settings, shown: &HashSet<String>) -> Vec<Hit> {
+    judge(hits, settings, shown, false)
+        .into_iter()
+        .filter(|(_, v)| *v == Verdict::Ordinary)
+        .map(|(h, _)| h)
+        .collect()
+}
+
+/// Holds back the ordinary hits after the first [`ORDINARY_WINDOW`]: only
+/// lessons are taken from further down the list.
+fn limit_ordinary(judged: &mut [(Hit, Verdict)]) {
+    for (_, verdict) in judged.iter_mut().skip(ORDINARY_WINDOW) {
+        if *verdict == Verdict::Ordinary {
+            *verdict = Verdict::Held(Hold::OverLimit);
+        }
+    }
 }
 
 /// Shortens `text` to `max` characters, ending in an ellipsis.
@@ -267,13 +388,28 @@ fn fit(lines: &[String], used: usize, budget: usize) -> Vec<String> {
 /// The text the `prompt` hook prints for `hits`, and the ids in it. Empty
 /// when nothing fits.
 pub fn render_prompt(hits: &[Hit], budget: usize) -> (String, Vec<String>) {
-    let lines: Vec<String> = hits.iter().map(Hit::line).collect();
+    render_prompt_with_lessons(hits, &[], budget)
+}
+
+/// [`render_prompt`] with `lessons` after the ordinary hits, inside the same
+/// budget. What does not fit is cut from the end, lessons first.
+pub fn render_prompt_with_lessons(
+    hits: &[Hit],
+    lessons: &[Hit],
+    budget: usize,
+) -> (String, Vec<String>) {
+    let lines: Vec<String> = hits
+        .iter()
+        .map(Hit::line)
+        .chain(lessons.iter().map(Hit::lesson_line))
+        .collect();
     let fitted = fit(&lines, PROMPT_HEADER.chars().count() + 1, budget);
     if fitted.is_empty() {
         return (String::new(), Vec::new());
     }
     let ids = hits
         .iter()
+        .chain(lessons)
         .take(fitted.len())
         .map(|h| h.id.clone())
         .collect();
@@ -334,6 +470,65 @@ fn section(title: &str, lines: &[String], cap: usize) -> (String, usize) {
     }
     let used = title_len + fitted.iter().map(|l| l.chars().count() + 1).sum::<usize>();
     (format!("\n{title}\n{}", fitted.join("\n")), used)
+}
+
+/// Longest lessons block of the briefing, in characters.
+const LESSONS_BLOCK_MAX: usize = 600;
+/// How many recent lessons the briefing lists.
+const LESSONS_LISTED: usize = 3;
+/// Characters of a lesson in the briefing's list.
+const LESSON_LIST_CHARS: usize = 90;
+
+const LESSON_HINT: &str = "Record a lesson with the `lesson` tool when the user corrects you, a \
+     diagnosis turns out wrong, a review finds a defect in your work, or you revert; phrase it \
+     through the situation that should trigger it.";
+
+/// The lessons block of the briefing: the counts, the newest lessons and
+/// when to record one; only the last with no lessons. At most `room`
+/// characters (and [`LESSONS_BLOCK_MAX`]): the list is cut from its end,
+/// then the counts, then the block is left out. Empty when nothing fits.
+pub fn render_lessons_block(project: &[Hit], user: &[Hit], room: usize) -> String {
+    let room = room.min(LESSONS_BLOCK_MAX);
+    let mut newest: Vec<&Hit> = project.iter().chain(user).collect();
+    // Handles grow with time.
+    newest.sort_by_key(|h| std::cmp::Reverse(handle_number(&h.id)));
+    newest.truncate(LESSONS_LISTED);
+    let lines: Vec<String> = newest
+        .iter()
+        .map(|h| {
+            format!(
+                "- {} [{}] {}",
+                h.id,
+                h.recorded,
+                cut(&h.lesson_body(), LESSON_LIST_CHARS)
+            )
+        })
+        .collect();
+    if !project.is_empty() || !user.is_empty() {
+        let head = format!(
+            "Lessons: {} for this project, {} for you; latest:",
+            project.len(),
+            user.len()
+        );
+        for keep in (0..=lines.len()).rev() {
+            let mut parts = vec![head.as_str()];
+            parts.extend(lines[..keep].iter().map(String::as_str));
+            parts.push(LESSON_HINT);
+            let text = parts.join("\n");
+            if text.chars().count() <= room {
+                return text;
+            }
+        }
+    }
+    if LESSON_HINT.chars().count() <= room {
+        LESSON_HINT.to_owned()
+    } else {
+        String::new()
+    }
+}
+
+fn handle_number(id: &str) -> u64 {
+    id.trim_start_matches('f').parse().unwrap_or(0)
 }
 
 // ---- the session's `.shown` file ---------------------------------------
@@ -430,8 +625,20 @@ pub async fn prompt(
     settings: &Settings,
     home: &Path,
 ) -> Result<String, String> {
+    prompt_traced(peer, input, settings, home)
+        .await
+        .map(|(text, _)| text)
+}
+
+/// [`prompt`] and what it decided about each fact it looked at.
+async fn prompt_traced(
+    peer: &Peer<RoleClient>,
+    input: &HookInput,
+    settings: &Settings,
+    home: &Path,
+) -> Result<(String, Vec<Candidate>), String> {
     if skip_prompt(&input.prompt) {
-        return Ok(String::new());
+        return Ok((String::new(), Vec::new()));
     }
     let query: String = input.prompt.trim().chars().take(MAX_QUERY_CHARS).collect();
     let found = structured(
@@ -441,14 +648,42 @@ pub async fn prompt(
     )
     .await?;
     let shown = read_shown(home, &input.session_id);
-    let chosen = select(parse_hits(&found), settings, &shown);
-    let (text, ids) = render_prompt(&chosen, settings.budget);
+    let mut judged = judge(parse_hits(&found), settings, &shown, true);
+    limit_ordinary(&mut judged);
+    let pick = |wanted: Verdict| -> Vec<Hit> {
+        judged
+            .iter()
+            .filter(|(_, v)| *v == wanted)
+            .map(|(h, _)| h.clone())
+            .collect()
+    };
+    let (ordinary, lessons) = (pick(Verdict::Ordinary), pick(Verdict::Lesson));
+    let (text, ids) = render_prompt_with_lessons(&ordinary, &lessons, settings.budget);
     if !ids.is_empty()
         && let Err(e) = append_shown(home, &input.session_id, &ids)
     {
         logln!("tessar hook: cannot record shown facts: {e}");
     }
-    Ok(text)
+    let candidates = judged
+        .into_iter()
+        .map(|(h, verdict)| {
+            let hold = match verdict {
+                Verdict::Held(hold) => Some(hold),
+                _ if ids.contains(&h.id) => None,
+                _ => Some(Hold::OverBudget),
+            };
+            Candidate {
+                lesson: h.is_lesson(),
+                id: h.id,
+                space: h.space,
+                channels: h.channels,
+                similarity: h.similarity,
+                decision: if hold.is_some() { "held" } else { "shown" },
+                reason: hold.map(Hold::name),
+            }
+        })
+        .collect();
+    Ok((text, candidates))
 }
 
 /// The `SessionStart` hook: forgets what was shown and prints a briefing of
@@ -460,9 +695,45 @@ pub async fn session(
     settings: &Settings,
     home: &Path,
 ) -> Result<String, String> {
+    session_traced(peer, input, project, settings, home)
+        .await
+        .map(|(text, _)| text)
+}
+
+/// The lessons of one space; a failure counts as none, since the lessons
+/// are an extra on top of the briefing.
+async fn lessons_in(peer: &Peer<RoleClient>, space: &str) -> Vec<Hit> {
+    let args = json!({ "entity": {
+        "key": lesson::ENTITY_KEY, "kind": lesson::ENTITY_KIND, "space": space,
+    } });
+    match structured(peer, "about", args).await {
+        Ok(found) => parse_hits(&found)
+            .into_iter()
+            .filter(Hit::is_lesson)
+            .collect(),
+        Err(e) => {
+            logln!("tessar hook: no lessons from the {space} space: {e}");
+            Vec::new()
+        }
+    }
+}
+
+/// [`session`] and the record of the run for the decision log.
+async fn session_traced(
+    peer: &Peer<RoleClient>,
+    input: &HookInput,
+    project: &str,
+    settings: &Settings,
+    home: &Path,
+) -> Result<(String, SessionRecord), String> {
+    let started = Instant::now();
     reset_shown(home, &input.session_id);
+    // Lessons have their own block; they are not listed twice.
     let newest_first = |found: Value| {
-        let mut hits = parse_hits(&found);
+        let mut hits: Vec<Hit> = parse_hits(&found)
+            .into_iter()
+            .filter(|h| !h.is_lesson())
+            .collect();
         hits.reverse();
         hits
     };
@@ -482,12 +753,66 @@ pub async fn session(
         )
         .await?,
     );
-    Ok(render_briefing(
-        project,
-        &user,
-        &project_hits,
-        settings.session_budget,
-    ))
+    // The lessons block is built first, with a room of its own, so that a
+    // full briefing cannot crowd it out; the briefing gets the rest.
+    let lessons_project = lessons_in(peer, "project").await;
+    let lessons_user = lessons_in(peer, "user").await;
+    let block = render_lessons_block(
+        &lessons_project,
+        &lessons_user,
+        LESSONS_BLOCK_MAX.min(settings.session_budget / 5),
+    );
+    // The block's closing newline is part of what it costs.
+    let lessons_chars = if block.is_empty() {
+        0
+    } else {
+        block.chars().count() + 1
+    };
+    let mut text = if user.is_empty()
+        && project_hits.is_empty()
+        && !(lessons_project.is_empty() && lessons_user.is_empty())
+    {
+        // Not an empty memory: it holds lessons, which have their own block.
+        format!(
+            "tessar memory has no facts about you or project `{project}` yet. Call `remember` \
+             to save facts: about the user to the `user` space, about this project to the \
+             `project` space.\n"
+        )
+    } else {
+        render_briefing(
+            project,
+            &user,
+            &project_hits,
+            settings.session_budget.saturating_sub(lessons_chars),
+        )
+    };
+    let briefing_chars = text.chars().count();
+    if !block.is_empty() {
+        text.push_str(&block);
+        text.push('\n');
+    }
+    let record = SessionRecord {
+        ts: decisions::now(),
+        session: input.session_id.clone(),
+        project: Some(project.to_owned()),
+        source: input.source.clone(),
+        elapsed_ms: elapsed_ms(started),
+        error: None,
+        blocks: vec![
+            Block {
+                name: "briefing",
+                chars: briefing_chars,
+            },
+            Block {
+                name: "lessons",
+                chars: lessons_chars,
+            },
+        ],
+        printed_chars: text.chars().count(),
+        lessons_project: lessons_project.len(),
+        lessons_user: lessons_user.len(),
+    };
+    Ok((text, record))
 }
 
 /// The project for a hook: the one of the hook's `cwd`, else of the
@@ -514,15 +839,15 @@ fn note_build(hello: &crate::daemon::Hello) {
 
 /// Connects to the daemon (starting it if none runs), runs `work` on the
 /// connection and gives up after `wait`.
-async fn with_daemon<F, Fut>(
+async fn with_daemon<T, F, Fut>(
     home: &Path,
     input: &HookInput,
     wait: Duration,
     work: F,
-) -> Result<String, String>
+) -> Result<T, String>
 where
     F: FnOnce(Peer<RoleClient>, String) -> Fut,
-    Fut: std::future::Future<Output = Result<String, String>>,
+    Fut: std::future::Future<Output = Result<T, String>>,
 {
     let (project, cwd) = project_and_cwd(&input.cwd);
     let attempt = async {
@@ -546,13 +871,56 @@ where
         })
 }
 
+/// What a hook run produced: the text for Claude Code, a failure to log and
+/// the record for the decision log. The binary prints the text, then calls
+/// [`HookRun::finish`]; the record is written only after the output is out.
+#[derive(Debug)]
+pub struct HookRun {
+    /// What to print: empty on a failure.
+    pub output: String,
+    /// Why the run failed, if it did; it goes to stderr, never to the model.
+    pub error: Option<String>,
+    /// The line for the decision log, when the run reached a decision.
+    pub record: Option<Record>,
+}
+
+impl HookRun {
+    fn failed(error: String, record: Option<Record>) -> Self {
+        Self {
+            output: String::new(),
+            error: Some(error),
+            record,
+        }
+    }
+
+    /// Hands the output to `print` (nothing on a failure, which is logged to
+    /// stderr instead), then appends the record, ignoring any error of its.
+    pub fn finish(self, home: &Path, print: impl FnOnce(&str)) {
+        match &self.error {
+            Some(e) => logln!("tessar hook: {e}"),
+            None => print(&self.output),
+        }
+        if let Some(record) = &self.record {
+            decisions::append(home, record);
+        }
+    }
+
+    /// The output, or the failure.
+    pub fn into_result(self) -> Result<String, String> {
+        match self.error {
+            Some(e) => Err(e),
+            None => Ok(self.output),
+        }
+    }
+}
+
 /// `tessar hook prompt` over the daemon in `home`.
-pub async fn run_prompt(home: &Path, stdin: &str, settings: &Settings) -> Result<String, String> {
-    run_prompt_with(home, stdin, settings, PROMPT_WAIT, &proxy::own_daemon()).await
+pub async fn run_prompt(home: &Path, stdin: &str, settings: &Settings) -> HookRun {
+    run_prompt_recorded(home, stdin, settings, PROMPT_WAIT, &proxy::own_daemon()).await
 }
 
 /// [`run_prompt`] with its time limit and the way to start a daemon spelled
-/// out.
+/// out, returning only the text.
 ///
 /// It only connects. If nothing listens, it starts a daemon through `spawn`
 /// without waiting for it (unless something already holds the journal: a
@@ -567,14 +935,59 @@ pub async fn run_prompt_with(
     cap: Duration,
     spawn: &proxy::Spawn,
 ) -> Result<String, String> {
-    let input = HookInput::parse(stdin)?;
-    if skip_prompt(&input.prompt) {
-        return Ok(String::new());
+    run_prompt_recorded(home, stdin, settings, cap, spawn)
+        .await
+        .into_result()
+}
+
+/// [`run_prompt_with`] with the record of the run: a decision, a deliberate
+/// silence or a failure (the latter with its reason and the time it took).
+#[doc(hidden)]
+pub async fn run_prompt_recorded(
+    home: &Path,
+    stdin: &str,
+    settings: &Settings,
+    cap: Duration,
+    spawn: &proxy::Spawn,
+) -> HookRun {
+    let started = Instant::now();
+    let input = match HookInput::parse(stdin) {
+        Ok(input) => input,
+        Err(e) => return HookRun::failed(e, None),
+    };
+    let record = |project, skipped, printed: &str, candidates, error| {
+        Record::Prompt(PromptRecord {
+            ts: decisions::now(),
+            session: input.session_id.clone(),
+            project,
+            message_chars: input.prompt.chars().count(),
+            message: decisions::clip_message(&input.prompt),
+            thresholds: Thresholds {
+                min_similarity: settings.min_similarity,
+                entity_min_similarity: settings.entity_min_similarity,
+                entity_max: settings.entity_max,
+                lesson_min_similarity: LESSON_MIN_SIMILARITY,
+                lesson_max: LESSON_MAX,
+                budget: settings.budget,
+            },
+            elapsed_ms: elapsed_ms(started),
+            skipped,
+            error,
+            printed_chars: printed.chars().count(),
+            candidates,
+        })
+    };
+    if let Some(why) = skip_reason(&input.prompt) {
+        return HookRun {
+            output: String::new(),
+            error: None,
+            record: Some(record(None, Some(why), "", Vec::new(), None)),
+        };
     }
     let hook_input = &input;
     let attempt = async {
         let Ok(stream) = tokio::net::UnixStream::connect(socket_path(home)).await else {
-            return Err(start_for_the_next_prompt(home, spawn));
+            return Err((None, start_for_the_next_prompt(home, spawn)));
         };
         // `git` runs off the runtime's threads so that the limit holds
         // even if it hangs.
@@ -582,22 +995,42 @@ pub async fn run_prompt_with(
             let cwd = hook_input.cwd.clone();
             tokio::task::spawn_blocking(move || project_and_cwd(&cwd))
         };
-        let (project, cwd) = named.await.map_err(|e| format!("internal error: {e}"))?;
-        let opened = proxy::open(stream, &project, &cwd).await?;
-        note_build(opened.hello());
-        let (server, link) = opened.serve().await?;
-        let out = prompt(&server.daemon(), hook_input, settings, home).await;
-        drop(link);
-        out
+        let (project, cwd) = named
+            .await
+            .map_err(|e| (None, format!("internal error: {e}")))?;
+        let known = Some(project.clone());
+        let work = async {
+            let opened = proxy::open(stream, &project, &cwd).await?;
+            note_build(opened.hello());
+            let (server, link) = opened.serve().await?;
+            let out = prompt_traced(&server.daemon(), hook_input, settings, home).await;
+            drop(link);
+            out
+        };
+        match work.await {
+            Ok((text, candidates)) => Ok((text, candidates, project)),
+            Err(e) => Err((known, e)),
+        }
     };
-    tokio::time::timeout(cap, attempt)
+    let result = tokio::time::timeout(cap, attempt)
         .await
         .unwrap_or_else(|_| {
-            Err(format!(
-                "no answer from the daemon within {} ms",
-                cap.as_millis()
+            Err((
+                None,
+                format!("no answer from the daemon within {} ms", cap.as_millis()),
             ))
-        })
+        });
+    match result {
+        Ok((text, candidates, project)) => HookRun {
+            record: Some(record(Some(project), None, &text, candidates, None)),
+            output: text,
+            error: None,
+        },
+        Err((project, e)) => HookRun::failed(
+            e.clone(),
+            Some(record(project, None, "", Vec::new(), Some(e))),
+        ),
+    }
 }
 
 /// Starts a daemon for `home` and does not wait for it. Returns what to
@@ -617,13 +1050,60 @@ fn start_for_the_next_prompt(home: &Path, spawn: &proxy::Spawn) -> String {
 }
 
 /// `tessar hook session` over the daemon in `home`.
-pub async fn run_session(home: &Path, stdin: &str, settings: &Settings) -> Result<String, String> {
-    let input = HookInput::parse(stdin)?;
+pub async fn run_session(home: &Path, stdin: &str, settings: &Settings) -> HookRun {
+    let started = Instant::now();
+    let input = match HookInput::parse(stdin) {
+        Ok(input) => input,
+        Err(e) => return HookRun::failed(e, None),
+    };
     let hook_input = &input;
-    with_daemon(home, hook_input, SESSION_WAIT, |peer, project| async move {
-        session(&peer, hook_input, &project, settings, home).await
+    let ran = with_daemon(home, hook_input, SESSION_WAIT, |peer, project| async move {
+        session_traced(&peer, hook_input, &project, settings, home).await
     })
-    .await
+    .await;
+    match ran {
+        Ok((output, record)) => HookRun {
+            output,
+            error: None,
+            record: Some(Record::Session(record)),
+        },
+        Err(e) => {
+            let record = Record::Session(SessionRecord {
+                ts: decisions::now(),
+                session: input.session_id.clone(),
+                project: None,
+                source: input.source.clone(),
+                elapsed_ms: elapsed_ms(started),
+                error: Some(e.clone()),
+                blocks: Vec::new(),
+                printed_chars: 0,
+                lessons_project: 0,
+                lessons_user: 0,
+            });
+            HookRun::failed(e, Some(record))
+        }
+    }
+}
+
+/// [`session`] with the record of the run, for tests.
+#[doc(hidden)]
+pub async fn session_recorded(
+    peer: &Peer<RoleClient>,
+    input: &HookInput,
+    project: &str,
+    settings: &Settings,
+    home: &Path,
+) -> Result<HookRun, String> {
+    let (output, record) = session_traced(peer, input, project, settings, home).await?;
+    Ok(HookRun {
+        output,
+        error: None,
+        record: Some(Record::Session(record)),
+    })
+}
+
+fn elapsed_ms(since: Instant) -> u64 {
+    u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 // ---- tessar hook config ------------------------------------------------
@@ -984,5 +1464,149 @@ mod tests {
             v["hooks"]["SessionStart"][0]["hooks"][0]["command"],
             r"'/My Apps/it'\''s/tessar' hook session"
         );
+    }
+
+    fn lesson(id: &str, similarity: Option<f64>, body: &str) -> Hit {
+        hit(
+            id,
+            similarity,
+            &["meaning"],
+            &format!("Lesson (2026-11-09): {body}"),
+        )
+    }
+
+    fn verdicts(hits: Vec<Hit>, shown: &HashSet<String>) -> Vec<(String, Verdict)> {
+        judge(hits, &Settings::default(), shown, true)
+            .into_iter()
+            .map(|(h, v)| (h.id, v))
+            .collect()
+    }
+
+    #[test]
+    fn a_lesson_passes_below_the_general_threshold_and_an_ordinary_fact_does_not() {
+        let hits = vec![
+            lesson("f1", Some(0.40), "read the log first"),
+            hit("f2", Some(0.40), &["meaning"], "an ordinary fact"),
+            lesson("f3", Some(0.30), "too far"),
+        ];
+        assert_eq!(
+            verdicts(hits, &HashSet::new()),
+            [
+                ("f1".to_owned(), Verdict::Lesson),
+                ("f2".to_owned(), Verdict::Held(Hold::BelowThreshold)),
+                ("f3".to_owned(), Verdict::Held(Hold::BelowThreshold)),
+            ]
+        );
+    }
+
+    #[test]
+    fn at_most_two_lessons_and_none_repeated() {
+        let hits = vec![
+            lesson("f1", Some(0.9), "a"),
+            lesson("f2", Some(0.8), "b"),
+            lesson("f3", Some(0.7), "c"),
+            lesson("f4", Some(0.6), "d"),
+        ];
+        let shown: HashSet<String> = ["f1".to_owned()].into();
+        assert_eq!(
+            verdicts(hits, &shown),
+            [
+                ("f1".to_owned(), Verdict::Held(Hold::AlreadyShown)),
+                ("f2".to_owned(), Verdict::Lesson),
+                ("f3".to_owned(), Verdict::Lesson),
+                ("f4".to_owned(), Verdict::Held(Hold::OverLimit)),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_entity_quota_is_named_over_limit() {
+        let hits: Vec<Hit> = (1..=3)
+            .map(|n| hit(&format!("f{n}"), Some(0.40), &["entity"], "named"))
+            .collect();
+        let v = verdicts(hits, &HashSet::new());
+        assert_eq!(v[2].1, Verdict::Held(Hold::OverLimit));
+    }
+
+    #[test]
+    fn lesson_lines_start_with_the_handle_and_drop_the_prefix() {
+        let l = lesson("f88", Some(0.5), "before declaring a bug, read the log");
+        let (text, ids) =
+            render_prompt_with_lessons(&[hit("f1", Some(0.9), &[], "Ordinary.")], &[l], 1500);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[1], "- [2026-11-08] [user] Ordinary.");
+        assert_eq!(
+            lines[2],
+            "- lesson f88 [2026-11-08]: before declaring a bug, read the log"
+        );
+        assert_eq!(ids, ["f1", "f88"]);
+        assert!(!text.contains("Lesson ("));
+    }
+
+    #[test]
+    fn the_budget_holds_with_lessons_and_cuts_them_first() {
+        let ordinary = vec![hit("f1", Some(0.9), &[], "Ordinary fact.")];
+        let lessons = vec![
+            lesson("f2", Some(0.5), &"long ".repeat(60)),
+            lesson("f3", Some(0.5), "second"),
+        ];
+        for budget in [60, 100, 200, 400, 1500] {
+            let (text, ids) = render_prompt_with_lessons(&ordinary, &lessons, budget);
+            assert!(text.chars().count() <= budget, "{budget}: {text}");
+            if !ids.is_empty() {
+                assert_eq!(ids[0], "f1", "the ordinary fact goes first");
+            }
+        }
+        let (_, ids) = render_prompt_with_lessons(&ordinary, &lessons, 120);
+        assert_eq!(ids, ["f1"]);
+    }
+
+    fn lessons_n(n: usize) -> Vec<Hit> {
+        (0..n)
+            .map(|i| {
+                lesson(
+                    &format!("f{}", 10 + i),
+                    None,
+                    &format!("when the situation {i} arises, do the right thing"),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_lessons_block_with_zero_two_and_five_lessons() {
+        let zero = render_lessons_block(&[], &[], 600);
+        assert_eq!(zero, LESSON_HINT);
+        assert!(!zero.contains("Lessons:"));
+
+        let two = render_lessons_block(&lessons_n(2), &[], 600);
+        let lines: Vec<&str> = two.lines().collect();
+        assert_eq!(lines[0], "Lessons: 2 for this project, 0 for you; latest:");
+        // Newest first, handle first, no prefix.
+        assert!(
+            lines[1].starts_with("- f11 [2026-11-08] when the situation 1"),
+            "{two}"
+        );
+        assert!(lines[2].starts_with("- f10 "), "{two}");
+        assert_eq!(lines[3], LESSON_HINT);
+        assert!(!two.contains("Lesson ("));
+
+        let five = render_lessons_block(&lessons_n(3), &lessons_n(2), 600);
+        assert!(five.contains("3 for this project, 2 for you"));
+        assert_eq!(five.lines().filter(|l| l.starts_with("- f")).count(), 3);
+        assert!(five.chars().count() <= 600, "{}", five.chars().count());
+    }
+
+    #[test]
+    fn the_lessons_block_is_cut_to_the_room_and_hint_goes_last() {
+        let all = render_lessons_block(&lessons_n(3), &lessons_n(2), 600);
+        let tight = all.chars().count() - 10;
+        let cut_list = render_lessons_block(&lessons_n(3), &lessons_n(2), tight);
+        assert!(cut_list.chars().count() <= tight);
+        assert!(cut_list.ends_with(LESSON_HINT));
+        assert!(cut_list.lines().filter(|l| l.starts_with("- f")).count() < 3);
+        let only_hint = render_lessons_block(&lessons_n(3), &[], LESSON_HINT.chars().count());
+        assert_eq!(only_hint, LESSON_HINT);
+        assert_eq!(render_lessons_block(&lessons_n(3), &[], 20), "");
     }
 }
