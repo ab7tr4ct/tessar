@@ -380,12 +380,13 @@ pub fn append_shown(home: &Path, session_id: &str, ids: &[String]) -> std::io::R
         return Ok(());
     };
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+        crate::private::create_own_dir_all(dir)?;
     }
-    let mut file = std::fs::OpenOptions::new()
+    let mut file = crate::private::file_options()
         .create(true)
         .append(true)
         .open(path)?;
+    crate::private::tighten_file(&file);
     for id in ids {
         writeln!(file, "{id}")?;
     }
@@ -525,7 +526,7 @@ where
 {
     let (project, cwd) = project_and_cwd(&input.cwd);
     let attempt = async {
-        std::fs::create_dir_all(home)
+        crate::private::create_home(home)
             .map_err(|e| format!("cannot create {}: {e}", home.display()))?;
         let stream = proxy::connect_or_start(home, wait).await?;
         let opened = proxy::open(stream, &project, &cwd).await?;
@@ -605,7 +606,7 @@ fn start_for_the_next_prompt(home: &Path, spawn: &proxy::Spawn) -> String {
     if lifecycle::journal_in_use(home) {
         return "no daemon is listening yet, but one holds the journal (it is starting)".to_owned();
     }
-    let started = std::fs::create_dir_all(home)
+    let started = crate::private::create_home(home)
         .map_err(|e| format!("cannot create {}: {e}", home.display()))
         .and_then(|()| spawn(home, proxy::Start::Fresh));
     match started {
@@ -669,6 +670,24 @@ pub fn config_snippet(exe: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_hooks_directory_and_shown_files_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        append_shown(home.path(), "s1", &["a".to_owned()]).unwrap();
+        let file = shown_path(home.path(), "s1").unwrap();
+        let dir = home.path().join("hooks");
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&file), 0o600);
+        // What an older build left behind is tightened.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        append_shown(home.path(), "s1", &["b".to_owned()]).unwrap();
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&file), 0o600);
+    }
 
     fn hit(id: &str, similarity: Option<f64>, channels: &[&str], text: &str) -> Hit {
         Hit {

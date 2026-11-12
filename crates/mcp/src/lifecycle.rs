@@ -70,7 +70,14 @@ pub fn pid_path(home: &Path) -> PathBuf {
 /// Records the current process as the daemon of `home`. The daemon calls
 /// this as soon as it holds the journal lock.
 pub fn write_pid_file(home: &Path) -> std::io::Result<()> {
-    std::fs::write(pid_path(home), format!("{}\n", std::process::id()))
+    use std::io::Write;
+    let mut file = crate::private::file_options()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(pid_path(home))?;
+    crate::private::tighten_file(&file);
+    writeln!(file, "{}", std::process::id())
 }
 
 /// Removes the pid file, if it still names this process.
@@ -393,6 +400,20 @@ fn duration(secs: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_pid_file_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let path = pid_path(home.path());
+        let mode = || std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        write_pid_file(home.path()).unwrap();
+        assert_eq!(mode(), 0o600);
+        assert_eq!(read_pid_file(home.path()), Some(std::process::id()));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_pid_file(home.path()).unwrap();
+        assert_eq!(mode(), 0o600);
+    }
+
     use std::process::Child;
 
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};

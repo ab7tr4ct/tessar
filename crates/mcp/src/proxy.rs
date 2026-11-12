@@ -686,16 +686,23 @@ async fn await_daemon(
     }
 }
 
+/// Opens the daemon log for appending; the log is private to the user.
+fn open_log(log: &Path) -> Result<std::fs::File, String> {
+    let out = crate::private::file_options()
+        .create(true)
+        .append(true)
+        .open(log)
+        .map_err(|e| format!("cannot open {}: {e}", log.display()))?;
+    crate::private::tighten_file(&out);
+    Ok(out)
+}
+
 /// Starts `tessar daemon` in its own process group, so it outlives this
 /// proxy and the terminal's signals, with its output appended to `log`.
 fn spawn_daemon(home: &Path, log: &Path, start: Start) -> Result<Child, String> {
     use std::os::unix::process::CommandExt;
     let exe = std::env::current_exe().map_err(|e| format!("cannot find my own binary: {e}"))?;
-    let out = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log)
-        .map_err(|e| format!("cannot open {}: {e}", log.display()))?;
+    let out = open_log(log)?;
     let err = out
         .try_clone()
         .map_err(|e| format!("cannot open {}: {e}", log.display()))?;
@@ -715,6 +722,19 @@ fn spawn_daemon(home: &Path, log: &Path, start: Start) -> Result<Child, String> 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_daemon_log_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let log = home.path().join(LOG_FILE);
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        open_log(&log).unwrap();
+        assert_eq!(mode(&log), 0o600);
+        std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o644)).unwrap();
+        open_log(&log).unwrap();
+        assert_eq!(mode(&log), 0o600);
+    }
+
     use super::*;
 
     #[test]

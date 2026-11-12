@@ -33,6 +33,7 @@ pub mod args;
 pub mod daemon;
 pub mod hook;
 pub mod lifecycle;
+pub mod private;
 pub mod project;
 pub mod proxy;
 pub mod purge;

@@ -614,7 +614,8 @@ fn runtime() -> Result<tokio::runtime::Runtime, String> {
 }
 
 fn create_home(home: &Path) -> Result<(), String> {
-    std::fs::create_dir_all(home).map_err(|e| format!("cannot create {}: {e}", home.display()))
+    tessar_mcp::private::create_home(home)
+        .map_err(|e| format!("cannot create {}: {e}", home.display()))
 }
 
 // ---- tessar mcp --standalone ---------------------------------------
@@ -986,7 +987,6 @@ fn run_proxy(home: &Path, keep_daemon: bool) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-
     #[test]
     fn vector_cache_lives_under_the_model_in_the_home() {
         assert_eq!(

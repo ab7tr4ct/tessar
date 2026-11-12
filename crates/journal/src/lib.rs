@@ -209,11 +209,14 @@ impl<T: Serialize + DeserializeOwned> FileJournal<T> {
         tmp_name.push(".tmp");
         let tmp = path.with_file_name(tmp_name);
         let written = (|| {
-            let mut new = OpenOptions::new()
+            let mut new = file_options()
                 .write(true)
                 .create(true)
                 .truncate(true)
                 .open(&tmp)?;
+            // A stale temporary file keeps its old mode; the journal must
+            // come out private.
+            tighten_file(&new);
             new.write_all(&out)?;
             new.sync_all()?;
             fs::rename(&tmp, path)?;
@@ -318,6 +321,37 @@ fn lock_waiting(file: &File) -> Result<(), LogError> {
     }
 }
 
+/// Options for a file that is created `0600` if it does not exist, so the
+/// journal is private to the user. An existing file keeps its mode; see
+/// [`tighten_file`].
+fn file_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
+}
+
+/// Removes group and other access from `file` if it has any, because older
+/// builds created journals `0644`. Never loosens; a failure (the file is not
+/// ours) is ignored, as the journal still works.
+fn tighten_file(file: &File) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = file.metadata() {
+            let mode = meta.permissions().mode();
+            if mode & 0o077 != 0 {
+                let _ = file.set_permissions(fs::Permissions::from_mode(mode & !0o077));
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = file;
+}
+
 /// Opens the file at `path` (creating it with `create`) and locks it with
 /// `lock`. The lock belongs to the file that was opened, and a rewrite may
 /// rename a new file over the path between the open and the lock; a lock on
@@ -332,11 +366,12 @@ fn lock_file(
     lock: impl Fn(&File) -> Result<(), LogError>,
 ) -> Result<File, LogError> {
     for _ in 0..LOCK_ATTEMPTS {
-        let file = OpenOptions::new()
+        let file = file_options()
             .read(true)
             .append(true)
             .create(create)
             .open(path)?;
+        tighten_file(&file);
         lock(&file)?;
         if still_at(&file, path)? {
             return Ok(file);
@@ -485,6 +520,50 @@ mod tests {
     use std::cell::Cell;
 
     use super::*;
+
+    fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    fn widen(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    // Shows the creation mode only when the umask leaves group and other
+    // bits free; the tests that widen first prove the tightening.
+    #[test]
+    fn a_new_journal_is_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.log");
+        drop(FileJournal::<()>::open(&path).unwrap());
+        assert_eq!(mode(&path), 0o600);
+    }
+
+    #[test]
+    fn an_old_wide_journal_is_tightened_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.log");
+        drop(FileJournal::<()>::open(&path).unwrap());
+        widen(&path, 0o644);
+        drop(FileJournal::<()>::open(&path).unwrap());
+        assert_eq!(mode(&path), 0o600);
+    }
+
+    #[test]
+    fn a_rewritten_journal_is_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.log");
+        drop(FileJournal::<()>::open(&path).unwrap());
+        widen(&path, 0o644);
+        // A temporary file left wide by a crash.
+        let tmp = dir.path().join("journal.log.tmp");
+        fs::write(&tmp, "junk").unwrap();
+        widen(&tmp, 0o666);
+        FileJournal::<()>::rewrite(&path, |commits| commits).unwrap();
+        assert_eq!(mode(&path), 0o600);
+    }
 
     #[test]
     fn a_path_that_keeps_naming_another_file_is_given_up_on() {
