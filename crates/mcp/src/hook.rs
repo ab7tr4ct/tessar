@@ -372,7 +372,7 @@ fn judge(
 }
 
 /// The hits worth showing, in order, not shown yet in this session; see
-/// [`judge`] for the rules. Lessons are not told apart here.
+/// `judge` for the rules. Lessons are not told apart here.
 pub fn select(hits: Vec<Hit>, settings: &Settings, shown: &HashSet<String>) -> Vec<Hit> {
     judge(hits, settings, shown, false)
         .into_iter()
@@ -431,7 +431,7 @@ pub fn render_prompt(hits: &[Hit], budget: usize) -> (String, Vec<String>) {
 }
 
 /// [`render_prompt`] with `lessons`. The lessons are fitted first, each cut
-/// to [`LESSON_LINE_CHARS`] characters, so that a long ordinary fact cannot
+/// to `LESSON_LINE_CHARS` characters, so that a long ordinary fact cannot
 /// crowd them out; the ordinary lines get what is left of the budget. They
 /// are printed in the other order: ordinary lines, then lessons. Returns the
 /// text, the ids printed and the ids of lessons that were cut.
@@ -553,7 +553,7 @@ const LESSON_HINT: &str = "Record a lesson with the `lesson` tool when the user 
 
 /// The lessons block of the briefing: the counts, the newest lessons and
 /// when to record one; only the last with no lessons. At most `room`
-/// characters (and [`LESSONS_BLOCK_MAX`]): the list is cut from its end,
+/// characters (and `LESSONS_BLOCK_MAX`): the list is cut from its end,
 /// then the counts, then the block is left out. Empty when nothing fits.
 pub fn render_lessons_block(project: &[Hit], user: &[Hit], room: usize) -> String {
     let room = room.min(LESSONS_BLOCK_MAX);

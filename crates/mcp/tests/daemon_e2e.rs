@@ -5,7 +5,7 @@
 //! `TESSAR_MODEL`) and uses the GPU, so it is ignored by default:
 //!
 //! ```sh
-//! cargo test -p tessar-mcp --test daemon_e2e -- --ignored --nocapture
+//! cargo test -p tessar --test daemon_e2e -- --ignored --nocapture
 //! ```
 
 use std::io::{BufRead, BufReader, Write};

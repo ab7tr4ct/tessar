@@ -1,6 +1,6 @@
 #!/bin/sh
-# Fetches the llama.cpp submodule (needed only to build tessar-mcp with
-# `--features llama`; the default candle build does not use it) and checks
+# Fetches the llama.cpp submodule (needed only for crates/embed-llama; the
+# tessar binary and its candle embedder do not use it) and checks
 # out only what the build needs:
 # ggml, the library sources, headers, cmake files and vendored headers.
 # Tools, examples, tests, docs, models and the web UI stay out (about

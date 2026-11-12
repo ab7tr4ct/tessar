@@ -28,6 +28,32 @@
 //! with group or other bits are tightened (never loosened) on open, and a
 //! failure to tighten is ignored.
 //!
+//! # Example
+//!
+//! ```
+//! use std::sync::Arc;
+//! use tessar_core::embed::{EmbedError, Embedder};
+//! use tessar_embed_cache::CachedEmbedder;
+//!
+//! struct Toy;
+//! impl Embedder for Toy {
+//!     fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
+//!         Ok(texts.iter().map(|t| vec![t.len() as f32, 1.0]).collect())
+//!     }
+//!     fn embed_query(&self, text: &str) -> Result<Vec<f32>, EmbedError> {
+//!         Ok(vec![text.len() as f32, 1.0])
+//!     }
+//! }
+//!
+//! let dir = tempfile::tempdir()?;
+//! let path = dir.path().join("index").join("toy-1").join("vectors.bin");
+//! let cached = CachedEmbedder::open(&path, "toy-1", Arc::new(Toy))?;
+//! let vectors = cached.embed_documents(&["hello".to_owned()])?;
+//! assert_eq!(vectors, vec![vec![5.0, 1.0]]);
+//! assert_eq!(cached.len(), 1);
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
+//!
 //! # File format
 //!
 //! ```text

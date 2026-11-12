@@ -4,7 +4,7 @@ A persistent vector cache in front of any `tessar_core::embed::Embedder`.
 
 Opening a memory embeds every fact again, because vectors are derived data
 and never go to the journal. `CachedEmbedder` keeps them on disk, keyed by
-model and text, so a reopen embeds only the facts that are new. The core
+fingerprint and text, so a reopen embeds only the facts that are new. The core
 is unchanged: the cache is an ordinary embedder adapter.
 
 - `embed_documents` looks every text up, embeds only the misses in one call
@@ -16,32 +16,48 @@ is unchanged: the cache is an ordinary embedder adapter.
   model does: the key and the file header include the model name, and
   opening a file written for another model fails, so pick another path.
 
+## Fingerprint
+
+The fingerprint is an opaque string chosen by the caller. It must change
+whenever the vectors a text produces could change: model name, model file,
+tokenizer, prompts, context length. The header and every key include it. A
+file written for another fingerprint or format version is never served: it is
+emptied and refilled. The cache is a rebuildable index, so losing it only
+costs time. A fingerprint is 1 to 256 bytes with no spaces or newlines.
+
+The `tessar` binary keeps one file per fingerprint,
+`<home>/index/<fingerprint>/vectors.bin`, so two setups never empty each
+other's cache. The library takes any path.
+
 ## File format
 
 ```text
-tessar-vectors 1 <model> <dims>\n
-record*      record = key (32 bytes) ++ dims * f32 little-endian
+tessar-vectors 2 <fingerprint> <dims>\n
+record*   where record = key (32 bytes) ++ dims * f32 (little-endian)
 ```
 
-The key is SHA-256 of `model`, a NUL byte, and the text. A trailing partial
-record (a torn write) is cut off on open.
+The key is SHA-256 of the fingerprint, a NUL byte and the text. A trailing
+partial record (a torn write) is cut off on open.
 
 ## Memory
 
-The whole file is loaded on open. A vector costs `dims * 4` bytes plus the
-32-byte key and map overhead: about `dims * 4 + 80` bytes, roughly 4 KiB per
-fact at 1024 dimensions.
+The whole file is loaded on open: about `dims * 4 + 80` bytes per vector,
+roughly 4 KiB per fact at 1024 dimensions.
 
-## Wiring
+## Use
 
-```rust
-let embedder = CachedEmbedder::open(
-    home.join("index/voyage-4-nano/vectors.bin"),
-    "voyage-4-nano",
-    Arc::new(LlamaEmbedder::new(/* ... */)?),
+```rust,ignore
+// `inner` is any `Arc<dyn tessar_core::embed::Embedder>`, for example the
+// one from `tessar-embed-candle`.
+let cached = CachedEmbedder::open(
+    home.join("index").join(fingerprint).join("vectors.bin"),
+    fingerprint,
+    inner,
 )?;
 let memory = Memory::open_with(journal, clock, Semantic {
-    embedder: Arc::new(embedder),
+    embedder: Arc::new(cached),
     ..semantic
 })?;
 ```
+
+A complete example that compiles is in the crate documentation on docs.rs.

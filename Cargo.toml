@@ -5,15 +5,19 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+# Checked with `cargo +1.89 check --locked` on the published crates; 1.88 lacks `File::lock`.
+rust-version = "1.89"
 license = "MIT"
+repository = "https://github.com/ab7tr4ct/tessar"
+# Only the crates that `cargo install tessar` needs override this; see their manifests.
 publish = false
 
 [workspace.dependencies]
-tessar-core = { path = "crates/core" }
-tessar-journal = { path = "crates/journal" }
+tessar-core = { path = "crates/core", version = "0.1.0" }
+tessar-journal = { path = "crates/journal", version = "0.1.0" }
 tessar-embed-llama = { path = "crates/embed-llama" }
-tessar-embed-cache = { path = "crates/embed-cache" }
-tessar-embed-candle = { path = "crates/embed-candle" }
+tessar-embed-cache = { path = "crates/embed-cache", version = "0.1.0" }
+tessar-embed-candle = { path = "crates/embed-candle", version = "0.1.0" }
 candle-core = "0.11"
 candle-nn = "0.11"
 tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }

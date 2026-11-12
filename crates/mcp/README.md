@@ -1,4 +1,4 @@
-# tessar-mcp
+# tessar
 
 The `tessar` binary. `tessar mcp` serves the memory as an
 [MCP](https://modelcontextprotocol.io) server on stdio (through a [daemon](#daemon)), so an agent such as
@@ -6,19 +6,26 @@ Claude Code can remember facts between conversations and recall them later.
 
 The memory is deterministic and local: typed facts with validity periods and
 version history in an append-only journal, recalled by entity, words and
-meaning (voyage-4-nano running in-process, on candle or llama.cpp). No LLM and no
+meaning (voyage-4-nano running in-process, on candle). No LLM and no
 network are involved.
+
+## Install
+
+```sh
+cargo install tessar     # candle embedder, pure Rust: no cmake, no C++
+```
+
+The embedding model is not part of the package; see below.
 
 ## Build
 
 ```sh
-cargo build --release -p tessar-mcp     # candle embedder, pure Rust
+cargo build --release -p tessar     # candle embedder, pure Rust
 ```
 
-For llama.cpp instead, run `scripts/setup.sh` (submodule) and build with
-`--no-default-features --features llama` (needs cmake and a C++ toolchain).
-`TESSAR_EMBEDDER=candle|llama` picks the embedder at run time; the default
-is candle if compiled in. The daemon log names the one in use.
+The llama.cpp embedder is not part of this binary. It lives in the
+`tessar-embed-llama` crate of the repository (needs cmake, a C++ toolchain and
+`scripts/setup.sh`) and is used for the comparison tests against candle.
 
 The binary is `target/release/tessar`. It needs the embedding model at
 `~/.tessar/models/voyage-4-nano-Q8_0.gguf` (or `$TESSAR_HOME/models/…`, or
@@ -316,15 +323,14 @@ limit from the core: a chain whose every version is purged loses its
 
 ## Logging
 
-Stdout carries only the protocol. Messages for humans, including llama.cpp's
-errors, go to stderr. Set `TESSAR_LLAMA_LOG=1` to see all llama.cpp output.
+Stdout carries only the protocol. Messages for humans go to stderr.
 
 ## Tests
 
 ```sh
-cargo test -p tessar-mcp                                  # no model, no GPU
-cargo test -p tessar-mcp --test stdio -- --ignored        # real model, GPU
-cargo test -p tessar-mcp --test daemon_e2e -- --ignored   # real model, GPU
+cargo test -p tessar                                  # no model, no GPU
+cargo test -p tessar --test stdio -- --ignored        # real model, GPU
+cargo test -p tessar --test daemon_e2e -- --ignored   # real model, GPU
 ```
 
 The default tests include the daemon and the proxy over a real socket in a

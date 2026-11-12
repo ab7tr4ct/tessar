@@ -3,8 +3,12 @@ name = "tessar-core"
 description = "Core of tessar: data model, memory rules and ports"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
-publish.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["memory","agents","ai","bitemporal","knowledge"]
+categories = ["data-structures"]
 
 [features]
 # Contract tests that every `Log` implementation must pass.

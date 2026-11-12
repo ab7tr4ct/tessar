@@ -1,10 +1,17 @@
 [package]
-name = "tessar-mcp"
+name = "tessar"
 description = "MCP server for tessar: memory for Claude Code and other agents over stdio"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
-publish.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["mcp","memory","agents","claude","ai"]
+categories = ["command-line-utilities"]
+
+[lib]
+name = "tessar_mcp"
 
 [[bin]]
 name = "tessar"
@@ -14,11 +21,8 @@ path = "src/main.rs"
 default = ["candle"]
 # Pure-Rust embedder (Metal on macOS, CPU elsewhere); no C++ toolchain.
 candle = ["dep:tessar-embed-candle"]
-# llama.cpp embedder; needs cmake, a C++ toolchain and the submodule.
-llama = ["dep:tessar-embed-llama"]
 
 [dependencies]
-tessar-embed-llama = { workspace = true, optional = true }
 tessar-core.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 tessar-journal.workspace = true
@@ -35,10 +39,6 @@ tessar-embed-candle = { workspace = true, features = ["metal"], optional = true 
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 tessar-embed-candle = { workspace = true, optional = true }
-
-[[example]]
-name = "library"
-required-features = ["llama"]
 
 [dev-dependencies]
 tessar-core = { workspace = true, features = ["testing"] }

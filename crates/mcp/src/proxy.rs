@@ -736,6 +736,35 @@ fn spawn_daemon(home: &Path, log: &Path, start: Start) -> Result<Child, String> 
 
 #[cfg(test)]
 mod tests {
+    /// What the running binary was stamped with: the version, a git hash (or
+    /// `unknown` outside a checkout) and a build time.
+    #[test]
+    fn the_build_id_has_a_version_a_hash_and_a_build_time() {
+        let id = crate::BUILD_ID;
+        let (version, rest) = id.split_once('+').unwrap();
+        assert_eq!(version, env!("CARGO_PKG_VERSION"));
+        let (hash, _) = rest.rsplit_once('.').unwrap();
+        assert!(!hash.is_empty());
+        assert!(build_stamp(id).is_some_and(|t| t > 1_700_000_000));
+    }
+
+    /// Built from crates.io there is no git hash: the id then reads
+    /// `<version>+unknown.<time>` and must still order and differ by time.
+    #[test]
+    fn stamps_without_a_git_hash_still_order_by_build_time() {
+        let old = "0.1.0+unknown.1700000000";
+        let new = "0.1.0+unknown.1700000100";
+        assert_eq!(build_stamp(old), Some(1_700_000_000));
+        assert_eq!(build_stamp(new), Some(1_700_000_100));
+        assert!(daemon_is_newer(old, new));
+        assert!(!daemon_is_newer(new, old));
+        // A newer binary retires an older daemon, never the other way round.
+        assert!(needs_restart(new, old, false));
+        assert!(!needs_restart(old, new, false));
+        // The same build needs no restart.
+        assert!(!needs_restart(new, new, false));
+    }
+
     #[test]
     fn the_daemon_log_is_private() {
         use std::os::unix::fs::PermissionsExt;

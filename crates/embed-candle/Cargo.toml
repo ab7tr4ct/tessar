@@ -1,10 +1,17 @@
 [package]
 name = "tessar-embed-candle"
-description = "Pure-Rust in-process embedder for tessar on candle (experiment)"
+description = "Pure-Rust in-process embedder for tessar: voyage-4-nano on candle, no cmake"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
-publish.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["embeddings","candle","voyage","ai","inference"]
+categories = ["science"]
+
+# The experiment log is for the repository, not the package.
+exclude = ["EXPERIMENT.md"]
 
 [features]
 default = []

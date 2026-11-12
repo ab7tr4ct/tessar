@@ -4,7 +4,7 @@
 //! Run with the model at `~/.tessar/models/voyage-4-nano-Q8_0.gguf`:
 //!
 //! ```sh
-//! cargo run --release -p tessar-mcp --features llama --example library
+//! cargo run --release -p tessar-embed-llama --example library
 //! ```
 
 use std::error::Error;

@@ -3,8 +3,12 @@ name = "tessar-journal"
 description = "File journal for tessar: append-only JSON Lines with checksums"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
-publish.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["journal","append-only","jsonl","storage","wal"]
+categories = ["database-implementations"]
 
 [dependencies]
 tessar-core.workspace = true

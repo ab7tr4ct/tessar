@@ -305,7 +305,7 @@ impl Projects {
 /// Reads the header line, answers with the hello, then serves MCP on the
 /// rest of `stream` until the peer closes it or `stop` fires. A status
 /// request gets the extended hello and nothing more. A peer that sends no
-/// header within [`HEADER_WAIT`], or before `stop` fires, is dropped.
+/// header within `HEADER_WAIT`, or before `stop` fires, is dropped.
 pub async fn serve_connection<S>(
     stream: S,
     projects: Arc<Projects>,

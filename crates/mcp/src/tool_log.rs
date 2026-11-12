@@ -1,6 +1,6 @@
 //! The tool half of the decision log: one `"tool"` record per MCP tool call,
 //! written by the process that owns the memory (the daemon, or `tessar mcp
-//! --standalone`) from [`crate::server::TessarServer::call_tool`], the one
+//! --standalone`) from `TessarServer::call_tool`, the one
 //! place every call passes through. The proxy only forwards and never logs.
 //!
 //! A record is built after the result exists, from the request's arguments

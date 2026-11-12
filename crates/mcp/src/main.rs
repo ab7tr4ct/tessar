@@ -40,8 +40,8 @@ macro_rules! logln {
     };
 }
 
-#[cfg(not(any(feature = "candle", feature = "llama")))]
-compile_error!("enable at least one embedder feature of tessar-mcp: `candle` (default) or `llama`");
+#[cfg(not(feature = "candle"))]
+compile_error!("enable the `candle` feature of tessar");
 
 const USAGE: &str = "\
 tessar: a memory engine for AI agents
@@ -88,8 +88,7 @@ The memory lives in DIR (default: $TESSAR_HOME, else ~/.tessar): journal.jsonl,
 tessar.sock, tessar.pid and daemon.log, and the embedding model in
 models/voyage-4-nano-Q8_0.gguf (and models/voyage-4-nano/tokenizer.json for
 the candle embedder). Set TESSAR_MODEL or TESSAR_TOKENIZER to use files from
-elsewhere. TESSAR_EMBEDDER=candle|llama picks the embedder (default: candle,
-else llama, whichever this build has).";
+elsewhere. TESSAR_EMBEDDER=candle names the embedder (the only one in this build).";
 
 /// Vector length in the index.
 const INDEX_DIMS: usize = 1024;
@@ -569,7 +568,6 @@ fn model_path(home: &Path) -> Result<PathBuf, String> {
 /// The tokenizer of the candle embedder: `$TESSAR_TOKENIZER`, else
 /// `<home>/models/voyage-4-nano/tokenizer.json`, else the same under
 /// `~/.tessar`.
-#[cfg(feature = "candle")]
 fn tokenizer_path(home: &Path) -> Result<PathBuf, String> {
     if let Some(path) = std::env::var_os("TESSAR_TOKENIZER").filter(|p| !p.is_empty()) {
         let path = PathBuf::from(path);
@@ -602,31 +600,19 @@ fn tokenizer_path(home: &Path) -> Result<PathBuf, String> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Backend {
     Candle,
-    Llama,
 }
 
-/// `$TESSAR_EMBEDDER` (`candle` or `llama`), else candle if compiled in,
-/// else llama. Asking for a backend this build lacks is an error.
+/// `$TESSAR_EMBEDDER`: `candle`, or unset. The llama.cpp embedder lives in
+/// `tessar-embed-llama`, which this binary does not link.
 fn choose_backend(requested: Option<&str>) -> Result<Backend, String> {
-    let compiled = |b: Backend| match b {
-        Backend::Candle => cfg!(feature = "candle"),
-        Backend::Llama => cfg!(feature = "llama"),
-    };
     match requested.map(str::trim).filter(|r| !r.is_empty()) {
-        None => Ok(if compiled(Backend::Candle) {
-            Backend::Candle
-        } else {
-            Backend::Llama
-        }),
-        Some("candle") if compiled(Backend::Candle) => Ok(Backend::Candle),
-        Some("llama") if compiled(Backend::Llama) => Ok(Backend::Llama),
-        Some(f @ ("candle" | "llama")) => Err(format!(
-            "TESSAR_EMBEDDER={f} is not compiled into this binary; rebuild with \
-             `cargo build --release -p tessar-mcp --features {f}` \
-             (add `--no-default-features` to drop the other embedder)"
-        )),
+        None | Some("candle") => Ok(Backend::Candle),
+        Some("llama") => Err(
+            "TESSAR_EMBEDDER=llama is not available: this binary has only the candle embedder"
+                .to_owned(),
+        ),
         Some(other) => Err(format!(
-            "TESSAR_EMBEDDER={other:?} is unknown; use `candle` or `llama`"
+            "TESSAR_EMBEDDER={other:?} is unknown; use `candle`"
         )),
     }
 }
@@ -642,7 +628,6 @@ struct Loaded {
     settings: String,
 }
 
-#[cfg(feature = "candle")]
 fn load_candle(home: &Path, model: &Path) -> Result<Loaded, String> {
     let tokenizer = tokenizer_path(home)?;
     let e = tessar_embed_candle::CandleEmbedder::voyage_nano_gguf(model, &tokenizer)
@@ -656,44 +641,6 @@ fn load_candle(home: &Path, model: &Path) -> Result<Loaded, String> {
         settings: tessar_embed_candle::CandleEmbedder::voyage_nano_gguf_settings(),
         embedder: Arc::new(e),
     })
-}
-
-#[cfg(not(feature = "candle"))]
-fn load_candle(_: &Path, _: &Path) -> Result<Loaded, String> {
-    unreachable!("choose_backend refuses candle when it is not compiled")
-}
-
-#[cfg(feature = "llama")]
-fn load_llama(model: &Path) -> Result<Loaded, String> {
-    let e = tessar_embed_llama::LlamaEmbedder::voyage_nano(model)
-        .map_err(|e| format!("cannot load the model: {e}"))?;
-    Ok(Loaded {
-        dims: e.dims(),
-        description: "llama.cpp".to_string(),
-        backend: "llama.cpp",
-        tokenizer: None,
-        settings: llama_settings(),
-        embedder: Arc::new(e),
-    })
-}
-
-/// What `LlamaEmbedder::voyage_nano` sets that shapes the vectors: the Voyage
-/// prompts and the default options (context 8192, cut longer texts). The
-/// crate exposes no description of its own; change this with its defaults.
-#[cfg(feature = "llama")]
-fn llama_settings() -> String {
-    let prompts = tessar_core::embed::Prompts::voyage();
-    format!(
-        "revision={};query={:?};document={:?};context=8192;truncate=true",
-        tessar_embed_llama::VECTOR_REVISION,
-        prompts.query,
-        prompts.document
-    )
-}
-
-#[cfg(not(feature = "llama"))]
-fn load_llama(_: &Path) -> Result<Loaded, String> {
-    unreachable!("choose_backend refuses llama when it is not compiled")
 }
 
 /// Opens the journal, which takes its file lock.
@@ -712,7 +659,6 @@ fn open_memory(
     let backend = choose_backend(std::env::var("TESSAR_EMBEDDER").ok().as_deref())?;
     let loaded = match backend {
         Backend::Candle => load_candle(home, &model)?,
-        Backend::Llama => load_llama(&model)?,
     };
     logln!("tessar: embedder {}", loaded.description);
     // The index holds 1024 components per vector; a shorter model cannot fill it.
@@ -1208,20 +1154,12 @@ mod tests {
     }
 
     #[test]
-    fn embedder_choice_follows_the_compiled_features() {
+    fn embedder_choice_accepts_candle_only() {
         assert!(choose_backend(Some("bogus")).is_err());
-        assert!(choose_backend(None).is_ok());
+        assert_eq!(choose_backend(None), Ok(Backend::Candle));
         assert_eq!(choose_backend(Some("")), choose_backend(None));
-        let candle = choose_backend(Some("candle"));
-        assert_eq!(candle.is_ok(), cfg!(feature = "candle"));
-        if let Err(e) = candle {
-            assert!(e.contains("--features candle"), "{e}");
-        }
-        let llama = choose_backend(Some("llama"));
-        assert_eq!(llama.is_ok(), cfg!(feature = "llama"));
-        if let Err(e) = llama {
-            assert!(e.contains("--features llama"), "{e}");
-        }
+        assert_eq!(choose_backend(Some("candle")), Ok(Backend::Candle));
+        assert!(choose_backend(Some("llama")).is_err());
     }
     use super::*;
 

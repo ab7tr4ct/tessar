@@ -2375,6 +2375,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "tessar"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "rmcp",
+ "schemars",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tessar-core",
+ "tessar-embed-cache",
+ "tessar-embed-candle",
+ "tessar-journal",
+ "tokio",
+]
+
+[[package]]
 name = "tessar-core"
 version = "0.1.0"
 dependencies = [
@@ -2428,6 +2446,7 @@ dependencies = [
  "tempfile",
  "tessar-core",
  "tessar-embed-candle",
+ "tessar-journal",
  "ureq",
 ]
 
@@ -2441,25 +2460,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tessar-core",
-]
-
-[[package]]
-name = "tessar-mcp"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "rmcp",
- "schemars",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tempfile",
- "tessar-core",
- "tessar-embed-cache",
- "tessar-embed-candle",
- "tessar-embed-llama",
- "tessar-journal",
- "tokio",
 ]
 
 [[package]]
