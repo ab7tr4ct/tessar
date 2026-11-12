@@ -42,6 +42,7 @@ pub mod project;
 pub mod proxy;
 pub mod purge;
 pub mod server;
+pub mod setup;
 pub mod stash;
 pub mod tool_log;
 pub mod when;

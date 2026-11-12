@@ -30,6 +30,7 @@ use tessar_mcp::project::project_name;
 use tessar_mcp::proxy;
 use tessar_mcp::purge;
 use tessar_mcp::server::TessarServer;
+use tessar_mcp::setup;
 use tessar_mcp::tool_log::ToolLog;
 use tokio::net::{UnixListener, UnixStream};
 
@@ -81,6 +82,21 @@ USAGE:
                                (PreToolUse on Agent) prints nothing: it leaves
                                the memory for `subagent` (SubagentStart)
     tessar hook config         print the hooks snippet for ~/.claude/settings.json
+    tessar setup [--yes] [--dry-run] [--no-models] [--no-mcp] [--no-hooks]
+                 [--allow-unverified] [--home DIR]
+                               install: download the embedding model into DIR/models
+                               (with curl, checked against pinned SHA-256 sums),
+                               register this binary as the `tessar` MCP server of
+                               Claude Code (user scope) and merge the hooks into
+                               ~/.claude/settings.json. Each step is idempotent;
+                               registering and editing settings ask first (--yes
+                               answers yes; without a terminal the answer is no
+                               and the manual command is printed); --dry-run
+                               changes nothing. Exit status: 0 when every step
+                               is done or was in place, 1 when one failed, 2
+                               when some were left to you (declined, no claude).
+                               --home needs --no-mcp --no-hooks: the registered
+                               commands use the default home
     tessar --version           print the build id
     tessar --help              show this text
 
@@ -223,6 +239,11 @@ enum Cli {
         text: String,
         user: bool,
     },
+    Setup {
+        home: PathBuf,
+        opts: setup::Options,
+        yes: bool,
+    },
     Version,
     Help,
 }
@@ -269,6 +290,7 @@ fn main() -> ExitCode {
         }) => run_redact(&home, &handles, purge),
         Ok(Cli::Hook { home, kind }) => run_hook(&home, kind),
         Ok(Cli::Lesson { home, text, user }) => run_lesson(&home, &text, user),
+        Ok(Cli::Setup { home, opts, yes }) => run_setup(&home, opts, yes),
         Ok(Cli::Help) => {
             println!("{USAGE}");
             ExitCode::SUCCESS
@@ -304,6 +326,9 @@ fn parse(args: &[String], env: impl Fn(&str) -> Option<std::ffi::OsString>) -> R
     }
     if command == "purge" {
         return parse_purge(&args[1..], env);
+    }
+    if command == "setup" {
+        return parse_setup(&args[1..], env);
     }
     if !matches!(command, "mcp" | "daemon") {
         return Err(format!("unknown command `{command}`\n\n{USAGE}"));
@@ -463,6 +488,58 @@ fn parse_purge(
         None => default_home(env)?,
     };
     Ok(Cli::Purge { home })
+}
+
+fn parse_setup(
+    args: &[String],
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<Cli, String> {
+    let mut home = None;
+    let mut yes = false;
+    let mut opts = setup::Options {
+        dry_run: false,
+        models: true,
+        mcp: true,
+        hooks: true,
+        allow_unverified: false,
+    };
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--home" => {
+                home = Some(PathBuf::from(it.next().ok_or("--home needs a directory")?));
+            }
+            a if a.starts_with("--home=") => home = Some(PathBuf::from(&a["--home=".len()..])),
+            "--yes" | "-y" => yes = true,
+            "--dry-run" => opts.dry_run = true,
+            "--no-models" => opts.models = false,
+            "--no-mcp" => opts.mcp = false,
+            "--no-hooks" => opts.hooks = false,
+            "--allow-unverified" => opts.allow_unverified = true,
+            other => return Err(format!("unexpected argument `{other}`\n\n{USAGE}")),
+        }
+    }
+    // The server and the hooks that setup registers are plain `tessar mcp` and
+    // `tessar hook ...`, like the output of `hook config`: they look for the
+    // memory in the default place. With another home they would not find
+    // the models that setup put there.
+    let explicit = home.is_some() || env("TESSAR_HOME").is_some_and(|h| !h.is_empty());
+    let home = match home {
+        Some(home) => home,
+        None => default_home(&env)?,
+    };
+    let default = env("HOME")
+        .filter(|h| !h.is_empty())
+        .map(|h| PathBuf::from(h).join(".tessar"));
+    if explicit && (opts.mcp || opts.hooks) && default.as_deref() != Some(home.as_path()) {
+        return Err(format!(
+            "setup registers the MCP server and the hooks without a home, so they would use \
+             ~/.tessar, not {}.\nSet up the models there with --no-mcp --no-hooks, or leave \
+             --home and TESSAR_HOME out.",
+            home.display()
+        ));
+    }
+    Ok(Cli::Setup { home, opts, yes })
 }
 
 fn parse_hook(
@@ -1037,6 +1114,35 @@ fn run_purge(home: &Path) -> ExitCode {
     }
 }
 
+// ---- tessar setup --------------------------------------------------
+
+fn run_setup(home: &Path, opts: setup::Options, yes: bool) -> ExitCode {
+    let exe = match std::env::current_exe().and_then(|exe| exe.canonicalize()) {
+        Ok(exe) => exe,
+        Err(e) => return fail(&format!("cannot find my own binary: {e}")),
+    };
+    let cwd = match std::env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(e) => return fail(&format!("cannot find the current directory: {e}")),
+    };
+    let plan = match setup::Plan::system(home, exe, cwd, |name| std::env::var_os(name)) {
+        Ok(plan) => plan,
+        Err(e) => return fail(&e),
+    };
+    let mut prompt = setup::Terminal { yes };
+    let mut out = std::io::stdout();
+    let outcome = setup::Setup::new(
+        &plan,
+        opts,
+        &setup::Curl,
+        &setup::System,
+        &mut prompt,
+        &mut out,
+    )
+    .run();
+    ExitCode::from(outcome.exit_code())
+}
+
 // ---- tessar hook ---------------------------------------------------
 
 /// Runs a hook. Whatever goes wrong, the status is 0 and stdout is empty:
@@ -1353,6 +1459,73 @@ mod tests {
         assert!(p(&["daemon", "--idle-exit", "0"], &[("HOME", "/u")]).is_err());
         assert!(p(&["daemon", "--idle-exit", "soon"], &[("HOME", "/u")]).is_err());
         assert!(p(&["daemon", "--standalone"], &[("HOME", "/u")]).is_err());
+    }
+
+    #[test]
+    fn setup_flags() {
+        let all = setup::Options {
+            dry_run: false,
+            models: true,
+            mcp: true,
+            hooks: true,
+            allow_unverified: false,
+        };
+        assert_eq!(
+            p(&["setup"], &[("HOME", "/u")]).unwrap(),
+            Cli::Setup {
+                home: "/u/.tessar".into(),
+                opts: all,
+                yes: false
+            }
+        );
+        assert_eq!(
+            p(
+                &[
+                    "setup",
+                    "--yes",
+                    "--dry-run",
+                    "--no-models",
+                    "--no-mcp",
+                    "--no-hooks",
+                    "--allow-unverified",
+                    "--home",
+                    "/h"
+                ],
+                &[]
+            )
+            .unwrap(),
+            Cli::Setup {
+                home: "/h".into(),
+                opts: setup::Options {
+                    dry_run: true,
+                    models: false,
+                    mcp: false,
+                    hooks: false,
+                    allow_unverified: true
+                },
+                yes: true
+            }
+        );
+        assert!(p(&["setup", "--bogus"], &[("HOME", "/u")]).is_err());
+        // Another home cannot be combined with registering anything.
+        let err = p(&["setup", "--home", "/h"], &[("HOME", "/u")]).unwrap_err();
+        assert!(err.contains("--no-mcp --no-hooks"), "{err}");
+        assert!(
+            p(
+                &["setup", "--no-hooks"],
+                &[("HOME", "/u"), ("TESSAR_HOME", "/h")]
+            )
+            .is_err()
+        );
+        assert!(
+            p(
+                &["setup", "--no-mcp", "--no-hooks"],
+                &[("HOME", "/u"), ("TESSAR_HOME", "/h")]
+            )
+            .is_ok()
+        );
+        // The default home given out loud is still the default.
+        assert!(p(&["setup", "--home", "/u/.tessar"], &[("HOME", "/u")]).is_ok());
     }
 
     #[test]

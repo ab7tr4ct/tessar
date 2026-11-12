@@ -1396,7 +1396,7 @@ fn elapsed_ms(since: Instant) -> u64 {
 // ---- tessar hook config ------------------------------------------------
 
 /// Quotes `path` for a shell command line when it needs it.
-fn shell_word(path: &str) -> String {
+pub(crate) fn shell_word(path: &str) -> String {
     let plain = !path.is_empty()
         && path
             .chars()
