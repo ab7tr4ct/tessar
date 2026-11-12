@@ -3,7 +3,7 @@
 A memory engine for AI agents, in Rust. Deterministic, local, no LLM
 inside.
 
-An agent (Claude Code today, a voice agent next) writes typed facts and
+An agent (today Claude Code, through MCP tools and hooks) writes typed facts and
 reads them back across conversations and projects. The core keeps every
 version of every fact in an append-only journal, answers "what is true
 now" and "what was true on that date", finds facts by the entities,
@@ -67,6 +67,35 @@ refuses to open rather than silently losing data. The in-memory state is
 rebuilt by replaying the journal through the same code that applies live
 writes, so the two can never diverge.
 
+**Lessons.** An agent records its own mistakes with the `lesson` tool (or
+you do, with `tessar lesson "TEXT"`). A lesson is an ordinary dated statement
+about the topic `lessons`, in the project space or in `user` for lessons that
+hold everywhere. The prompt hook shows a lesson when a later prompt is close
+in meaning to it (at most two per prompt).
+
+**Hooks.** `tessar hook config` prints a snippet for
+`~/.claude/settings.json` with four Claude Code hooks: `prompt`
+(UserPromptSubmit) prints the facts and lessons that fit the user's message;
+`session` (SessionStart) prints a short summary of what memory holds;
+`agent` (PreToolUse on the Agent tool) and `subagent` (SubagentStart) give a
+subagent memory that fits its brief: the first picks the facts and leaves them
+in a short-lived file in `~/.tessar/hooks/`, the second hands them to the
+agent. When several unnamed agents of one type run in parallel, one may
+receive another's memory.
+
+**Forgetting and privacy.** `update` can mark a fact as changed, as never
+true (`wrong`) or destroy its content (`redact`). Because the journal is
+append-only, `tessar purge` then rewrites it without the redacted content and
+drops the vector cache, the decision log and the hooks' leftover files;
+`tessar redact fNN... [--purge]` does both steps from a shell. `~/.tessar`
+is created `0700` and the files in it `0600`. The hooks also keep a local
+decision log, `~/.tessar/decisions.jsonl`: what they showed or held back
+and which tools were called afterwards. It holds the text of the user's
+messages, of the briefs given to subagents and of `recall` queries (each cut
+to 2000 characters) and the error text of failed tool calls, never the texts
+of facts; it is never sent anywhere and
+`tessar purge` removes it.
+
 ## Results
 
 On LongMemEval (S, knowledge-update and temporal-reasoning, 179 test
@@ -111,11 +140,18 @@ curl -L -o ~/.tessar/models/voyage-4-nano/tokenizer.json \
 claude mcp add tessar -- "$PWD/target/release/tessar" mcp
 ```
 
-Claude Code then has four tools: `remember`, `recall`, `vocabulary` and
-`about`. The tool descriptions are the agent's manual. Memory lives in
+Claude Code then has six tools: `remember`, `lesson`, `recall`,
+`vocabulary`, `update` and `about`. The tool descriptions are the agent's
+manual. To add the hooks, run `tessar hook config` and merge the output into
+`~/.claude/settings.json`. Memory lives in
 `~/.tessar/journal.jsonl`; the project space is named after the
-repository's `origin`. Details, including `.mcp.json` and environment
-variables, are in [`crates/mcp/README.md`](crates/mcp/README.md).
+repository's `origin`. `tessar mcp` talks to a daemon that holds the memory and the model for all
+sessions; it starts the daemon when none runs and replaces it when it is an
+older build (the new daemon takes over from the old one). The vector cache,
+which spares re-embedding the facts at start, is keyed by a fingerprint of
+the model file, the tokenizer, the embedding settings and a revision number
+of the embedding code, so a change in any of them starts a fresh cache.
+Details, including `.mcp.json` and environment variables, are in [`crates/mcp/README.md`](crates/mcp/README.md).
 
 To embed with llama.cpp instead, install `cmake` and a C++ toolchain (Xcode
 Command Line Tools on macOS), run `scripts/setup.sh` (the submodule, a few
@@ -169,28 +205,22 @@ Writing "Anna lives in Munich" later supersedes the Berlin version;
 | `crates/journal` | the file journal: JSON Lines, CRC-32 per line, `fsync`, torn-write recovery, file lock. |
 | `crates/embed-candle` | default in-process embedder: pure Rust on candle, GGUF Q8; Metal on macOS, CPU elsewhere. |
 | `crates/embed-llama` | optional in-process embedder (cargo feature `llama`): a small C++ shim over llama.cpp bridged with `cxx`; needs cmake. |
+| `crates/embed-cache` | a persistent vector cache in front of any embedder, keyed by a fingerprint. |
 | `crates/embed` | HTTP embedder for `llama-server` and embedding APIs. |
-| `crates/mcp` | the `tessar` binary: an MCP server on stdio. |
+| `crates/mcp` | the `tessar` binary: an MCP server on stdio, the daemon, the hooks and the `lesson`, `redact` and `purge` commands. |
 | `third_party/llama.cpp` | git submodule (release b12189); `scripts/setup.sh` checks out only the parts the build needs (only for the `llama` feature). |
 
 Principles: the core has no LLM and is deterministic; nothing is deleted;
 exact keys come before vectors; every result is explainable; spaces from
 day one; no feature without a measurement.
 
-## Roadmap
+## Where it stands
 
-- A lessons log: the agent records its own mistakes with the situation
-  that should trigger them, and the prompt hook surfaces them when that
-  situation comes back.
-- Write-back at the end of a session: a hook that asks the agent what it
-  learned, the first step towards consolidation (inferred facts that never
-  override asserted ones).
-- A profile block at session start, contradiction candidates on every
-  write, import and export of memories kept by other tools.
-- A voice agent as the second consumer: memory between calls within a
-  latency budget.
-- Memory about code and documents: symbols and files with edges from the
-  compiler (SCIP) and tree-sitter.
+The core, the MCP server, the daemon and the hooks are built and in daily
+use by the author. The decision log exists so that the next steps can be
+chosen from data about what the hooks show and what agents do with it. The
+only consumers today are the author and Claude Code. Nothing beyond what is
+described above is promised.
 
 ## License
 
