@@ -15,6 +15,13 @@ Nothing leaves the machine.
 Status: version 0.1. The core and the MCP server work end to end on macOS
 with Apple Silicon; Linux and CUDA are untested. The API is not stable.
 
+**Paused since 2026-11-12, for about two weeks.** No new features are
+being built while the system runs in daily use and collects data for the
+next round of tests: a local decision log records what the hooks show an
+agent, what they hold back, and which memory tools the agent then calls.
+What to build next, if anything, will be decided from those numbers.
+Everything on `main` works as described below.
+
 ## What it does
 
 **Typed facts, not blobs.** A fact is a `statement` (a sentence), an
