@@ -631,7 +631,7 @@ fn model_path(home: &Path) -> Result<PathBuf, String> {
     match default_models_dir().map(|d| d.join(MODEL_FILE)) {
         Some(default) if default.is_file() => Ok(default),
         Some(default) => Err(format!(
-            "embedding model not found: expected {} (download voyage-4-nano in Q8_0 GGUF there, \
+            "embedding model not found: expected {} (run `tessar setup` to download it, \
              or set TESSAR_MODEL)",
             default.display()
         )),
@@ -666,8 +666,8 @@ fn tokenizer_path(home: &Path) -> Result<PathBuf, String> {
         .filter(|p| p.is_file());
     default.ok_or_else(|| {
         format!(
-            "tokenizer not found: expected {} (it is `tokenizer.json` from the \
-             `voyageai/voyage-4-nano` repository on Hugging Face; or set TESSAR_TOKENIZER)",
+            "tokenizer not found: expected {} (run `tessar setup` to download it, \
+             or set TESSAR_TOKENIZER)",
             local.display()
         )
     })
