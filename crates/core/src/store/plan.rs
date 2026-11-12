@@ -32,6 +32,10 @@ struct SingleWrite<'a> {
     episode: Option<EpisodeId>,
     expected_version: Option<NonZeroU32>,
     valid_from: Timestamp,
+    /// The `valid_from` the draft gave, if it gave one.
+    dated: Option<Timestamp>,
+    /// Not resolved yet: a write that changes nothing creates no entity.
+    mentions: &'a [EntityRef],
 }
 
 /// What a write of a single-valued fact came to.
@@ -273,9 +277,11 @@ impl<'s> Planner<'s> {
     /// (one per lineage). The next write resolves the contradiction: the
     /// head recorded last (ties: the highest id) continues with the new
     /// version, and the other current heads are closed as changed at the
-    /// same moment, with no successor. A value equal to any current head is
-    /// [`Outcome::Unchanged`]. A pair with no current head continues its
-    /// latest lineage.
+    /// same moment, with no successor. A pair with no current head
+    /// continues its latest lineage; the new version may not start before
+    /// the earlier values of the pair stopped being true
+    /// ([`StoreError::ChangeBeforeValid`]). Corrected and redacted
+    /// versions do not count: they are true in no view.
     ///
     /// An [`Origin::Inferred`] write never replaces an [`Origin::Asserted`]
     /// current value. If it differs from one, it continues a current
@@ -285,9 +291,35 @@ impl<'s> Planner<'s> {
     /// heads as above, and continues the latest asserted one if there is
     /// one.
     ///
+    /// A value that is already current in a head the write may keep (any
+    /// equal head for an inferred write, an asserted one for an asserted
+    /// write; an asserted head first, then the one recorded last) gets no
+    /// new version. The write closes the other heads it may close, with
+    /// no successor: [`Outcome::Resolved`], or [`Outcome::Unchanged`] if
+    /// there are none. `expected_version` is then checked against the
+    /// kept head, and mentions are not resolved.
+    ///
+    /// An asserted write of a value that is current only as inferred
+    /// confirms it with a new asserted version
+    /// ([`Outcome::Superseded`]). Beside an asserted head of another
+    /// value this is an ordinary change of the asserted lineage. Alone,
+    /// the new version follows the inferred head and, unless the draft
+    /// is dated, starts when the inferred one did; the inferred head is
+    /// closed as changed at the later of the two starts, so it is true
+    /// at no time and a `TrueAt` read shows the value once, with no
+    /// change in it, while `KnownAt` and the history still show that it
+    /// was inferred first.
+    ///
+    /// A new version is dated against the version it follows only
+    /// ([`StoreError::ChangeBeforeValid`]); a head closed with no
+    /// successor stops at the new start or at its own, whichever is
+    /// later.
+    ///
     /// A write with the same value and another `text` is
     /// [`Outcome::Unchanged`] and does not store the new text (see
-    /// [`FactBody::same_content`]).
+    /// [`FactBody::same_content`]). An unchanged write plans nothing, not
+    /// even the entities its mentions name, and its mentions are not
+    /// checked at all: an unknown entity id or kind in them goes unnoticed.
     fn remember_fact(
         &mut self,
         space: SpaceId,
@@ -297,7 +329,6 @@ impl<'s> Planner<'s> {
     ) -> Result<Recorded, StoreError> {
         let state = self.state;
         let body = self.body(draft.body)?;
-        let mentions = self.resolve_all(&draft.mentions)?;
         let valid_from = draft.valid_from.unwrap_or(self.at);
         let mut outcome = Outcome::Created;
 
@@ -320,8 +351,10 @@ impl<'s> Planner<'s> {
                         episode,
                         expected_version: draft.expected_version,
                         valid_from,
+                        dated: draft.valid_from,
+                        mentions: &draft.mentions,
                     };
-                    match self.resolve_single(subject, predicate, &write, &body, &mentions)? {
+                    match self.resolve_single(subject, predicate, &write, &body)? {
                         Resolved::Done(recorded) => return Ok(recorded),
                         Resolved::Beside { asserted } => {
                             outcome = Outcome::Conflicting { current: asserted };
@@ -345,6 +378,9 @@ impl<'s> Planner<'s> {
             }
         }
 
+        // Only now, past every `Unchanged` return: resolving a mention may
+        // plan a new entity.
+        let mentions = self.resolve_all(&draft.mentions)?;
         let id = mint(&mut self.next.facts, FactId::new)?;
         self.ops.push(Op::AddFact(Fact {
             id,
@@ -371,7 +407,6 @@ impl<'s> Planner<'s> {
         predicate: PredicateId,
         write: &SingleWrite<'_>,
         body: &FactBody,
-        mentions: &[EntityId],
     ) -> Result<Resolved, StoreError> {
         let state = self.state;
         let SingleWrite {
@@ -380,6 +415,8 @@ impl<'s> Planner<'s> {
             episode,
             expected_version,
             valid_from,
+            dated,
+            mentions,
         } = *write;
         let heads: Vec<&'s Fact> = state
             .lineages_of_pair(subject, predicate)
@@ -401,11 +438,16 @@ impl<'s> Planner<'s> {
                 return Ok(Resolved::Fresh);
             };
             check_expected(expected_version, Some(head.lineage), None)?;
+            check_lower_bound(state, &heads, valid_from)?;
+            // `head` was closed before this version existed and an end is
+            // set once, so it keeps `end.next == None`: across this gap
+            // the chain is linked by `prev` only.
+            let mentions = self.resolve_all(mentions)?;
             let id = self.push_version(
                 head,
                 space,
                 body.clone(),
-                mentions.to_vec(),
+                mentions,
                 episode,
                 origin,
                 valid_from,
@@ -420,36 +462,68 @@ impl<'s> Planner<'s> {
             .iter()
             .copied()
             .partition(|h| is_asserted(&h.origin));
-        // An inferred write never replaces an asserted value: it closes
+        // An inferred write never closes an asserted value: it may close
         // only the inferred heads, and if there are none it starts a
-        // lineage of its own. Any other write closes all current heads
+        // lineage of its own. Any other write may close all current heads
         // and continues the latest asserted one (else the latest of all).
-        let (closing, target) = match origin {
-            Origin::Inferred { .. } if !asserted.is_empty() => {
-                let target = latest(&inferred);
-                (inferred, target)
-            }
-            Origin::Inferred { .. } | Origin::Asserted { .. } => {
-                let target = latest(&asserted).or_else(|| latest(&current));
-                (current.clone(), target)
-            }
+        let beside_asserted = !is_asserted(origin) && !asserted.is_empty();
+        let closing = if beside_asserted {
+            inferred.clone()
+        } else {
+            current.clone()
         };
+        // A head closed with no successor stops being true when the new
+        // value starts, or at its own start if that is later: then it is
+        // true at no time, and no end ever precedes its start.
+        let stopped = |h: &Fact, at: Timestamp| Ending::Changed {
+            valid_to: at.max(h.valid_from),
+        };
+        let equal: Vec<&'s Fact> = current
+            .iter()
+            .copied()
+            .filter(|h| self.same_content(&h.body, body))
+            .collect();
 
-        if let Some(head) = target {
-            check_expected(expected_version, Some(head.lineage), Some(head.version))?;
-        }
-        if let Some(same) = current.iter().find(|h| self.same_content(&h.body, body)) {
+        // The value is already current in a head the write may keep (any
+        // equal head for an inferred write, an asserted one for an asserted
+        // write): no new version. The write only closes the other heads it
+        // may close.
+        let keep = equal
+            .iter()
+            .copied()
+            .filter(|h| !is_asserted(origin) || is_asserted(&h.origin))
+            .max_by_key(|h| (is_asserted(&h.origin), h.recorded_at, h.id));
+        if let Some(keep) = keep {
+            check_expected(expected_version, Some(keep.lineage), Some(keep.version))?;
+            let others: Vec<&'s Fact> = closing
+                .iter()
+                .copied()
+                .filter(|h| h.id != keep.id)
+                .collect();
+            for other in &others {
+                self.close(other.id, stopped(other, valid_from), None);
+            }
+            let outcome = match latest(&others) {
+                None => Outcome::Unchanged,
+                Some(last) => Outcome::Resolved {
+                    closed: last.id,
+                    others: u32::try_from(others.len() - 1).unwrap_or(u32::MAX),
+                },
+            };
             return Ok(Resolved::Done(Recorded {
-                fact: same.id,
-                outcome: Outcome::Unchanged,
+                fact: keep.id,
+                outcome,
             }));
         }
-        if let Some(late) = closing.iter().find(|h| valid_from < h.valid_from) {
-            return Err(StoreError::ChangeBeforeValid {
-                at: valid_from,
-                valid_from: late.valid_from,
-            });
-        }
+
+        // Left in `equal`: inferred heads under an asserted write, which
+        // confirms the value with a new asserted version.
+        let confirmed = latest(&equal);
+        let target = if beside_asserted {
+            latest(&inferred)
+        } else {
+            latest(&asserted).or(confirmed).or_else(|| latest(&current))
+        };
         let Some(head) = target else {
             // Only reachable for an inferred write beside asserted heads.
             check_expected(expected_version, None, None)?;
@@ -459,22 +533,37 @@ impl<'s> Planner<'s> {
                 asserted: beside.id,
             });
         };
-        let id = self.push_version(
-            head,
-            space,
-            body.clone(),
-            mentions.to_vec(),
-            episode,
-            origin,
-            valid_from,
-        )?;
-        let ending = Ending::Changed {
-            valid_to: valid_from,
+        check_expected(expected_version, Some(head.lineage), Some(head.version))?;
+        let starts = if confirmed.is_some_and(|c| c.id == head.id) {
+            // The value did not change, only who vouches for it: unless
+            // the write is dated, the asserted version takes over the
+            // whole period of the inferred one, which then is true at no
+            // time (`stopped`), so no read shows the value twice or a
+            // change that did not happen. A dated confirmation is taken
+            // at its word, earlier or later.
+            // Reaching back before the inferred value's own start may not
+            // cross an earlier value of the pair. From that start on, any
+            // overlap is with another lineage: the conflict that was
+            // already there, and this write is what resolves it.
+            let starts = dated.unwrap_or(head.valid_from);
+            if starts < head.valid_from {
+                check_lower_bound(state, &heads, starts)?;
+            }
+            starts
+        } else if valid_from < head.valid_from {
+            return Err(StoreError::ChangeBeforeValid {
+                at: valid_from,
+                valid_from: head.valid_from,
+            });
+        } else {
+            valid_from
         };
+        let mentions = self.resolve_all(mentions)?;
+        let id = self.push_version(head, space, body.clone(), mentions, episode, origin, starts)?;
         for other in closing.iter().filter(|h| h.id != head.id) {
-            self.close(other.id, ending, None);
+            self.close(other.id, stopped(other, starts), None);
         }
-        self.close(head.id, ending, Some(id));
+        self.close(head.id, stopped(head, starts), Some(id));
         Ok(Resolved::Done(Recorded {
             fact: id,
             outcome: Outcome::Superseded { previous: head.id },
@@ -579,6 +668,9 @@ impl<'s> Planner<'s> {
                     ObjectDraft::Value(Value::Entity(id)) => {
                         Value::Entity(self.resolve(&EntityRef::Id(id))?)
                     }
+                    // Checked like every other text of a fact: trimmed, so
+                    // "Moscow " is the value "Moscow", and never empty.
+                    ObjectDraft::Value(Value::Text(text)) => Value::Text(non_empty(text)?),
                     ObjectDraft::Value(value) => value,
                     ObjectDraft::Entity(entity) => Value::Entity(self.resolve(&entity)?),
                 };
@@ -735,6 +827,34 @@ pub(super) fn mint<I>(next: &mut usize, make: fn(u32) -> I) -> Result<I, StoreEr
     let raw = u32::try_from(*next).map_err(|_| StoreError::TooManyRecords)?;
     *next += 1;
     Ok(make(raw))
+}
+
+/// A new version of a pair may not start before an earlier value of the
+/// pair ended, or a `TrueAt` read would show two values. Only versions
+/// closed as changed were ever true: a corrected one was not, and a
+/// redacted one is in no view, so neither bounds anything. Every version
+/// of every lineage of the pair counts, not the heads alone: under a
+/// corrected head lies the version it replaced. A close dated in the
+/// future bounds too; an end is set once and cannot be pulled back, so
+/// until then the pair accepts only later values.
+fn check_lower_bound(state: &State, heads: &[&Fact], starts: Timestamp) -> Result<(), StoreError> {
+    let floor = heads
+        .iter()
+        .flat_map(|h| std::iter::successors(Some(*h), |f| f.prev.and_then(|p| state.fact(p))))
+        .filter(|f| !f.is_redacted())
+        .filter_map(|f| match f.end?.ending {
+            // An end at or before the start: true at no time.
+            Ending::Changed { valid_to } => (valid_to > f.valid_from).then_some(valid_to),
+            Ending::Corrected => None,
+        })
+        .max();
+    match floor {
+        Some(floor) if starts < floor => Err(StoreError::ChangeBeforeValid {
+            at: starts,
+            valid_from: floor,
+        }),
+        _ => Ok(()),
+    }
 }
 
 /// Optimistic concurrency: the writer must have seen the current version.

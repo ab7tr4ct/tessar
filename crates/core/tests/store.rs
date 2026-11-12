@@ -2,13 +2,19 @@ mod common;
 
 use std::num::NonZeroU32;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 use common::*;
-use tessar_core::model::{Cardinality, Ending, EntityId, FactBody, SpaceKind, Value, ValueType};
+use tessar_core::clock::{Clock, ManualClock};
+use tessar_core::log::{Commit, Log, LogError, Seq};
+use tessar_core::model::{
+    Cardinality, Confidence, Ending, EntityId, FactBody, Lineage, Origin, SpaceKind, Timestamp,
+    Value, ValueType,
+};
 use tessar_core::store::{
-    BodyDraft, EntityRef, FactDraft, ObjectDraft, Outcome, Reason, Remember, Replacement,
-    StoreError, Update, View,
+    BodyDraft, EntityRef, FactDraft, Memory, ObjectDraft, Op, Outcome, Reason, Remember,
+    Replacement, StoreError, Update, View,
 };
 
 #[test]
@@ -809,4 +815,503 @@ fn another_when_with_the_same_value_is_a_new_version() {
         w.fact(august).body.when().unwrap(),
         TimeSpan::Range(Interval::new(ts(3_000), ts(4_000)).unwrap())
     );
+}
+
+fn close(w: &World, lineage: Lineage, version: u32, reason: Reason) {
+    let closed = w
+        .memory
+        .update(Update {
+            lineage,
+            expected_version: v(version),
+            reason,
+            replacement: None,
+            origin: origin(),
+        })
+        .unwrap();
+    assert_eq!(closed.outcome, Outcome::Closed);
+}
+
+#[test]
+fn a_reopened_value_cannot_start_before_the_closed_one_ended() {
+    let w = World::new();
+    let a = w.remember_one(w.goal("A"));
+    let lineage = w.fact(a).lineage;
+    w.clock.set(ts(200));
+    close(&w, lineage, 1, Reason::Change { at: None });
+    w.clock.set(ts(300));
+    let commits = w.log.commits();
+    let from = |at: i64| FactDraft {
+        valid_from: Some(ts(at)),
+        ..w.goal("B")
+    };
+
+    for early in [50, 150, 199] {
+        let err = w.try_remember(vec![from(early)]).unwrap_err();
+        assert!(
+            matches!(err, StoreError::ChangeBeforeValid { at, valid_from }
+                if at == ts(early) && valid_from == ts(200)),
+            "{err:?}"
+        );
+    }
+    assert_eq!(w.log.commits(), commits);
+
+    let b = w.remember_one(from(200));
+    assert_eq!(b.outcome, Outcome::Created);
+    let tessar = w.entity(w.project, "tessar");
+    let true_at = |t: i64| -> Vec<_> {
+        let facts = w.memory.facts_about(tessar, View::TrueAt(ts(t)));
+        facts.iter().map(|f| f.id).collect()
+    };
+    assert_eq!(true_at(150), [a.fact]);
+    assert_eq!(true_at(250), [b.fact]);
+}
+
+fn true_at(w: &World, t: i64) -> Vec<tessar_core::model::FactId> {
+    let tessar = w.entity(w.project, "tessar");
+    let facts = w.memory.facts_about(tessar, View::TrueAt(ts(t)));
+    facts.iter().map(|f| f.id).collect()
+}
+
+/// A corrected version was never true, so it bounds nothing.
+#[test]
+fn a_reopened_value_may_start_before_a_corrected_one() {
+    let w = World::new();
+    w.clock.set(ts(500));
+    let x = w.remember_one(w.goal("x"));
+    close(&w, w.fact(x).lineage, 1, Reason::Correction);
+    let mut y = w.goal("y");
+    y.valid_from = Some(ts(300));
+    let y = w.remember_one(y);
+    assert_eq!(y.outcome, Outcome::Created);
+    assert_eq!(w.fact(y).lineage, w.fact(x).lineage);
+    assert_eq!(true_at(&w, 400), [y.fact]);
+    assert_eq!(true_at(&w, 600), [y.fact]);
+}
+
+/// A redacted version is in no view, so it bounds nothing either.
+#[test]
+fn a_reopened_value_may_start_before_a_redacted_one() {
+    let w = World::new();
+    // Redacting the current head closes it as a correction.
+    w.clock.set(ts(800));
+    let secret = w.remember_one(w.goal("secret"));
+    w.memory.redact(secret.fact).unwrap();
+    let mut y = w.goal("y");
+    y.valid_from = Some(ts(600));
+    assert_eq!(w.remember_one(y).outcome, Outcome::Created);
+
+    // A head that was closed as changed, then redacted.
+    let w = World::new();
+    let secret = w.remember_one(w.goal("secret"));
+    w.clock.set(ts(200));
+    close(&w, w.fact(secret).lineage, 1, Reason::Change { at: None });
+    w.memory.redact(secret.fact).unwrap();
+    let mut y = w.goal("y");
+    y.valid_from = Some(ts(150));
+    let y = w.remember_one(y);
+    assert_eq!(y.outcome, Outcome::Created);
+    assert_eq!(true_at(&w, 180), [y.fact]);
+}
+
+/// The bound comes from every version that was true, not from the heads
+/// alone: under a corrected head lies a version that was true until 200.
+#[test]
+fn a_reopened_value_cannot_overlap_a_version_under_a_corrected_head() {
+    let w = World::new();
+    let a = w.remember_one(w.goal("A"));
+    let lineage = w.fact(a).lineage;
+    w.clock.set(ts(200));
+    let b = w.remember_one(w.goal("B"));
+    close(&w, lineage, 2, Reason::Correction);
+    assert_eq!(true_at(&w, 150), [a.fact]);
+
+    w.clock.set(ts(300));
+    let mut c = w.goal("C");
+    c.valid_from = Some(ts(150));
+    let err = w.try_remember(vec![c.clone()]).unwrap_err();
+    assert!(
+        matches!(err, StoreError::ChangeBeforeValid { at, valid_from }
+            if at == ts(150) && valid_from == ts(200)),
+        "{err:?}"
+    );
+    c.valid_from = Some(ts(200));
+    let c = w.remember_one(c);
+    assert_eq!(w.fact(c).prev, Some(b.fact));
+    assert_eq!(true_at(&w, 150), [a.fact]);
+    assert_eq!(true_at(&w, 250), [c.fact]);
+}
+
+/// A close dated in the future keeps the value true until then, so a new
+/// value cannot start earlier: the two would both be true in between.
+/// The end of a version is set once, so the planner cannot pull it back.
+#[test]
+fn a_value_closed_in_the_future_blocks_the_pair_until_then() {
+    let w = World::new();
+    let a = w.remember_one(w.goal("A"));
+    w.clock.set(ts(200));
+    let until = Reason::Change {
+        at: Some(ts(5_000)),
+    };
+    close(&w, w.fact(a).lineage, 1, until);
+    assert_eq!(true_at(&w, 3_000), [a.fact]);
+
+    w.clock.set(ts(2_000));
+    let err = w.try_remember(vec![w.goal("B")]).unwrap_err();
+    assert!(
+        matches!(err, StoreError::ChangeBeforeValid { at, valid_from }
+            if at == ts(2_000) && valid_from == ts(5_000)),
+        "{err:?}"
+    );
+    let mut b = w.goal("B");
+    b.valid_from = Some(ts(5_000));
+    let b = w.remember_one(b);
+    assert_eq!(true_at(&w, 3_000), [a.fact]);
+    assert_eq!(true_at(&w, 5_000), [b.fact]);
+}
+
+/// An agent and a model that keep disagreeing: the asserted value stays
+/// one version; every cycle only closes the guess and takes a new one,
+/// which starts a lineage of its own.
+#[test]
+fn alternating_asserted_and_inferred_values_keep_one_asserted_version() {
+    let w = World::new();
+    let write = |origin: Origin, text: &str| {
+        w.memory
+            .remember(Remember {
+                space: w.space,
+                origin,
+                episode: None,
+                facts: vec![w.goal(text)],
+            })
+            .unwrap()
+            .facts[0]
+    };
+    let inferred = || Origin::Inferred {
+        by: key("model"),
+        confidence: Confidence::new(0.6).unwrap(),
+    };
+    let mut asserted = Vec::new();
+    let mut guesses = Vec::new();
+    for cycle in 0..4 {
+        w.clock.set(ts(100 + cycle * 100));
+        asserted.push(write(origin(), "x"));
+        guesses.push(write(inferred(), "y"));
+    }
+
+    // The asserted side: one version, kept by every repeated write.
+    let first = asserted[0].fact;
+    assert_eq!(asserted[0].outcome, Outcome::Created);
+    for (again, guess) in asserted[1..].iter().zip(&guesses) {
+        let (closed, others) = (guess.fact, 0);
+        assert_eq!(again.outcome, Outcome::Resolved { closed, others });
+        assert_eq!(again.fact, first);
+    }
+    let lineage = w.fact(asserted[0]).lineage;
+    assert_eq!(w.memory.history(lineage).len(), 1);
+    // The inferred side: a lineage of its own every time, because the
+    // asserted write closed the one before.
+    let mut lineages: Vec<_> = guesses.iter().map(|g| w.fact(*g).lineage).collect();
+    lineages.dedup();
+    assert_eq!(lineages.len(), 4);
+    for guess in &guesses {
+        assert_eq!(guess.outcome, Outcome::Conflicting { current: first });
+        assert_eq!(w.fact(*guess).version, v(1));
+    }
+    let tessar = w.entity(w.project, "tessar");
+    let now: Vec<_> = w.memory.values_of(tessar, w.goal);
+    let now: Vec<_> = now.iter().map(|f| f.id).collect();
+    assert_eq!(now, [first, guesses[3].fact]);
+}
+
+/// An asserted confirmation of an inferred value dated before it goes
+/// through, and so does the rest of its batch.
+#[test]
+fn a_backdated_confirmation_does_not_fail_its_batch() {
+    let w = World::new();
+    let inferred = Origin::Inferred {
+        by: key("model"),
+        confidence: Confidence::new(0.6).unwrap(),
+    };
+    let guess = w
+        .memory
+        .remember(Remember {
+            space: w.space,
+            origin: inferred,
+            episode: None,
+            facts: vec![w.goal("x")],
+        })
+        .unwrap()
+        .facts[0];
+    w.clock.set(ts(200));
+    let confirmation = FactDraft {
+        valid_from: Some(ts(50)),
+        ..w.goal("x")
+    };
+    let done = w.remember(vec![w.knows("Zed", "Rust"), confirmation]);
+    assert_eq!(done[0].outcome, Outcome::Created);
+    let previous = guess.fact;
+    assert_eq!(done[1].outcome, Outcome::Superseded { previous });
+    assert_eq!(w.fact(done[1]).valid_from, ts(50));
+    assert_eq!(true_at(&w, 150), [done[1].fact]);
+}
+
+/// A closed lineage of the pair that the new version does not continue
+/// still bounds it: its value was true until it was closed.
+#[test]
+fn a_reopened_value_cannot_overlap_another_closed_lineage_of_the_pair() {
+    let w = World::new();
+    let inferred = Origin::Inferred {
+        by: key("model"),
+        confidence: Confidence::new(0.6).unwrap(),
+    };
+    let a = w.remember_one(w.goal("A"));
+    w.clock.set(ts(150));
+    let beside = w
+        .memory
+        .remember(Remember {
+            space: w.space,
+            origin: inferred,
+            episode: None,
+            facts: vec![w.goal("B")],
+        })
+        .unwrap()
+        .facts[0];
+    assert!(matches!(beside.outcome, Outcome::Conflicting { .. }));
+    // The asserted value held until 400, the inferred one until 200; the
+    // inferred head is the one recorded last.
+    w.clock.set(ts(400));
+    close(&w, w.fact(a).lineage, 1, Reason::Change { at: None });
+    let until = Reason::Change { at: Some(ts(200)) };
+    close(&w, w.fact(beside).lineage, 1, until);
+
+    let mut c = w.goal("C");
+    c.valid_from = Some(ts(250));
+    let err = w.try_remember(vec![c.clone()]).unwrap_err();
+    assert!(
+        matches!(err, StoreError::ChangeBeforeValid { at, valid_from }
+            if at == ts(250) && valid_from == ts(400)),
+        "{err:?}"
+    );
+    c.valid_from = Some(ts(400));
+    let c = w.remember_one(c);
+    assert_eq!(w.fact(c).lineage, w.fact(beside).lineage);
+}
+
+/// After a reopen the closed version has no `next` (its end is set once,
+/// before the new version exists), so only `prev` links the chain.
+#[test]
+fn history_walks_across_a_reopened_gap() {
+    let w = World::new();
+    let a = w.remember_one(w.goal("A"));
+    let lineage = w.fact(a).lineage;
+    w.clock.set(ts(200));
+    close(&w, lineage, 1, Reason::Change { at: None });
+    w.clock.set(ts(300));
+    let b = w.remember_one(w.goal("B"));
+    w.clock.set(ts(400));
+    let c = w.remember_one(w.goal("C"));
+
+    let (fa, fb, fc) = (w.fact(a), w.fact(b), w.fact(c));
+    assert_eq!(
+        (fb.lineage, fb.version, fb.prev),
+        (lineage, v(2), Some(a.fact))
+    );
+    assert_eq!(fa.next(), None, "the gap: v1 does not point at v2");
+    assert_eq!(fb.next(), Some(c.fact));
+    let ids = |m: &Memory| -> Vec<_> { m.history(lineage).iter().map(|f| f.id).collect() };
+    assert_eq!(ids(&w.memory), [a.fact, b.fact, c.fact]);
+    assert_eq!(w.memory.current(lineage), Some(fc));
+    assert_eq!(ids(&w.reopen()), [a.fact, b.fact, c.fact]);
+}
+
+#[test]
+fn an_unchanged_write_does_not_create_the_entities_it_mentions() {
+    let w = World::new();
+    let first = w.remember_one(w.goal("A"));
+    let rust = w.remember_one(w.knows("Anna", "Rust"));
+    let commits = w.log.commits();
+    let mentioning = |draft: FactDraft| FactDraft {
+        mentions: vec![w.person("Ghost")],
+        ..draft
+    };
+
+    let again = w.remember_one(mentioning(w.goal("A")));
+    assert_eq!(
+        (again.outcome, again.fact),
+        (Outcome::Unchanged, first.fact)
+    );
+    let again = w.remember_one(mentioning(w.knows("Anna", "Rust")));
+    assert_eq!((again.outcome, again.fact), (Outcome::Unchanged, rust.fact));
+    assert_eq!(w.log.commits(), commits, "nothing was written");
+    assert!(w.memory.find_entity(w.space, w.person, "ghost").is_none());
+
+    // A write that does change the value creates it.
+    let changed = w.remember_one(mentioning(w.goal("B")));
+    assert_eq!(
+        changed.outcome,
+        Outcome::Superseded {
+            previous: first.fact
+        }
+    );
+    let ghost = w.entity(w.person, "ghost");
+    assert_eq!(w.fact(changed).mentions, [ghost]);
+    assert_eq!(w.reopen().fact(changed.fact), Some(w.fact(changed)));
+}
+
+#[test]
+fn text_values_are_trimmed_and_must_not_be_empty() {
+    let w = World::new();
+    let first = w.remember_one(w.goal("Moscow"));
+    let commits = w.log.commits();
+    let again = w.remember_one(w.goal("Moscow "));
+    assert_eq!(
+        (again.outcome, again.fact),
+        (Outcome::Unchanged, first.fact)
+    );
+    for empty in ["", "  ", "\n\t"] {
+        let err = w.try_remember(vec![w.goal(empty)]).unwrap_err();
+        assert!(matches!(err, StoreError::EmptyText), "{empty:?}: {err:?}");
+        let err = w.try_remember(vec![w.knows("Anna", empty)]).unwrap_err();
+        assert!(matches!(err, StoreError::EmptyText), "{empty:?}: {err:?}");
+    }
+    assert_eq!(w.log.commits(), commits);
+    assert!(w.memory.find_entity(w.space, w.person, "anna").is_none());
+
+    let berlin = w.remember_one(w.goal("  Berlin\n"));
+    assert_eq!(
+        berlin.outcome,
+        Outcome::Superseded {
+            previous: first.fact
+        }
+    );
+    assert_eq!(text_of(&w.fact(berlin)), "Berlin");
+    let rust = w.remember_one(w.knows("Anna", " Rust "));
+    assert_eq!(text_of(&w.fact(rust)), "Rust");
+    assert_eq!(
+        w.remember_one(w.knows("Anna", "Rust")).outcome,
+        Outcome::Unchanged
+    );
+
+    // An update goes through the same check.
+    let update = |text: &str| {
+        w.memory.update(Update {
+            lineage: w.fact(berlin).lineage,
+            expected_version: v(2),
+            reason: Reason::Correction,
+            replacement: Some(Replacement {
+                body: w.goal(text).body,
+                mentions: vec![],
+            }),
+            origin: origin(),
+        })
+    };
+    assert_eq!(update(" Berlin ").unwrap().outcome, Outcome::Unchanged);
+    assert!(matches!(update(" ").unwrap_err(), StoreError::EmptyText));
+}
+
+/// A log that can be told to fail or to panic on the next append.
+#[derive(Clone, Default)]
+struct FlakyLog {
+    inner: SharedLog,
+    fail: Arc<AtomicBool>,
+    panic: Arc<AtomicBool>,
+}
+
+impl Log<Op> for FlakyLog {
+    fn replay(&mut self) -> Result<Vec<Commit<Op>>, LogError> {
+        self.inner.replay()
+    }
+
+    fn append(&mut self, commit: &Commit<Op>) -> Result<(), LogError> {
+        if self.fail.swap(false, Ordering::SeqCst) {
+            return Err(LogError::Io(std::io::Error::other("disk is full")));
+        }
+        // The commit reaches the log, then the process "dies" on the way
+        // back: the writer cannot know whether it is durable.
+        self.inner.append(commit)?;
+        assert!(!self.panic.swap(false, Ordering::SeqCst), "append panicked");
+        Ok(())
+    }
+
+    fn next_seq(&self) -> Seq {
+        self.inner.next_seq()
+    }
+}
+
+/// A clock that can be told to panic once.
+struct FlakyClock {
+    panic: AtomicBool,
+}
+
+impl Clock for FlakyClock {
+    fn now(&self) -> Timestamp {
+        assert!(!self.panic.swap(false, Ordering::SeqCst), "clock panicked");
+        ts(100)
+    }
+}
+
+fn panics<R>(f: impl FnOnce() -> R) -> bool {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err()
+}
+
+#[test]
+fn a_panic_before_the_log_leaves_the_memory_writable() {
+    let log = FlakyLog::default();
+    let clock = Arc::new(FlakyClock {
+        panic: AtomicBool::new(false),
+    });
+    let memory = Memory::open(log.clone(), clock.clone()).unwrap();
+    let space = |n: &str| memory.create_space(key(n), SpaceKind::LongTerm, None);
+    space("one").unwrap();
+
+    clock.panic.store(true, Ordering::SeqCst);
+    assert!(panics(|| space("two")));
+    assert!(!memory.is_poisoned());
+    assert_eq!(log.inner.commits(), 1);
+    // Nothing was appended or applied, so the next write just works.
+    space("two").unwrap();
+    assert_eq!(log.inner.commits(), 2);
+    assert!(memory.space_named("two").is_some());
+}
+
+#[test]
+fn a_failed_append_leaves_the_memory_writable() {
+    let log = FlakyLog::default();
+    let clock = Arc::new(ManualClock::new(ts(100)));
+    let memory = Memory::open(log.clone(), clock).unwrap();
+    let space = |n: &str| memory.create_space(key(n), SpaceKind::LongTerm, None);
+
+    log.fail.store(true, Ordering::SeqCst);
+    assert!(matches!(space("one"), Err(StoreError::Log(_))));
+    assert!(!memory.is_poisoned());
+    assert!(memory.space_named("one").is_none());
+    space("one").unwrap();
+}
+
+/// A panic once the append has started: the commit may be durable while
+/// the state does not have it, so the memory must refuse further writes.
+#[test]
+fn a_panic_after_the_append_started_poisons_the_memory() {
+    let log = FlakyLog::default();
+    let clock = Arc::new(ManualClock::new(ts(100)));
+    let memory = Memory::open(log.clone(), clock.clone()).unwrap();
+    let space = |n: &str| memory.create_space(key(n), SpaceKind::LongTerm, None);
+    let one = space("one").unwrap();
+
+    log.panic.store(true, Ordering::SeqCst);
+    assert!(panics(|| space("two")));
+    assert!(memory.is_poisoned());
+    assert_eq!(log.inner.commits(), 2, "the commit is in the log");
+    assert!(memory.space_named("two").is_none(), "but not in the state");
+    let err = space("three").unwrap_err();
+    assert!(matches!(err, StoreError::Corrupted), "{err:?}");
+    assert_eq!(log.inner.commits(), 2);
+    // Reads go on, and reopening rebuilds the state from the log.
+    assert_eq!(memory.space_named("one").map(|s| s.id), Some(one));
+    let reopened = Memory::open(log.clone(), clock).unwrap();
+    assert!(!reopened.is_poisoned());
+    assert!(reopened.space_named("two").is_some());
+    reopened
+        .create_space(key("three"), SpaceKind::LongTerm, None)
+        .unwrap();
 }

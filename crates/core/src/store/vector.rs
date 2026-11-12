@@ -11,6 +11,11 @@
 use crate::embed::EmbedError;
 use crate::model::{FactId, PredicateId};
 
+/// The smallest squared norm a vector may have: a norm of 1e-30. With it
+/// every step of the quantization stays a normal `f32` for any index
+/// length the dot product allows.
+const MIN_NORM_SQ: f64 = 1e-60;
+
 /// A vector cut, normalized and quantized for the index.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Quantized {
@@ -38,7 +43,11 @@ impl Quantized {
             norm_sq += f64::from(x) * f64::from(x);
             max_abs = max_abs.max(x.abs());
         }
-        if norm_sq == 0.0 {
+        // A vanishing norm counts as zero: below about 3e-39 its inverse
+        // overflows `f32` and the scale becomes infinite (similarities
+        // turn NaN), and a little above that `127 / max_abs` overflows
+        // and the values are garbage. A real embedding has a norm near 1.
+        if norm_sq < MIN_NORM_SQ {
             return Err(EmbedError("vector is zero".into()));
         }
         let inv_norm = (1.0 / norm_sq.sqrt()) as f32;
@@ -245,6 +254,26 @@ mod tests {
         assert!(Quantized::new(&[0.0, 0.0], 2).is_err(), "zero");
         assert!(Quantized::new(&[1.0, f32::NAN], 2).is_err(), "NaN");
         assert!(Quantized::new(&[f32::INFINITY], 1).is_err(), "infinite");
+    }
+
+    /// A vector too small to normalize in `f32` is rejected like a zero
+    /// one, so no similarity is ever NaN or infinite.
+    #[test]
+    fn rejects_a_vector_with_a_vanishing_norm() {
+        let subnormal = f32::from_bits(1000);
+        assert!(subnormal > 0.0 && !subnormal.is_normal());
+        for tiny in [subnormal, 1e-40, 1e-38, 1e-31] {
+            assert!(Quantized::new(&[tiny, -tiny, 0.0], 3).is_err(), "{tiny:e}");
+        }
+        // The smallest vectors that pass still quantize exactly.
+        for small in [1e-29f32, 1e-20] {
+            let q = Quantized::new(&[small, -small, 0.0], 3).unwrap();
+            assert_eq!(q.values, [127, -127, 0], "{small:e}");
+            let mut index = VectorIndex::new(3);
+            index.push(FactId::new(0), q.clone()).unwrap();
+            let s = index.similarity(&q, FactId::new(0)).unwrap();
+            assert!((s - 1.0).abs() < 0.01, "{small:e}: {s}");
+        }
     }
 
     #[test]

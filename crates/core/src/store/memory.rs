@@ -79,6 +79,14 @@ pub struct Semantic {
 /// [`StoreError::Corrupted`] without touching the state, so nothing is
 /// planned on a diverged state and the log stays replayable. Reads keep
 /// working. Reopening the memory rebuilds the state from the log.
+///
+/// # Panics in a write
+///
+/// A panic in the clock, in planning or in the embedder happens before
+/// anything is appended or applied: the write is lost, the memory is not
+/// poisoned and the next write works. A panic from the moment the append
+/// starts until the commit is applied (in the log or in applying) poisons
+/// the memory as above, because the log and the state may have parted.
 #[derive(Clone)]
 pub struct Memory {
     inner: Arc<Inner>,
@@ -89,7 +97,8 @@ struct Inner {
     state: RwLock<State>,
     clock: Arc<dyn Clock>,
     semantic: Option<Semantic>,
-    /// Set when a durable commit failed to apply; see [`Memory`].
+    /// Set when a durable commit failed to apply, or a writer panicked
+    /// while committing; see [`Memory`].
     poisoned: AtomicBool,
 }
 
@@ -343,7 +352,32 @@ impl Memory {
     ///
     /// Entities named by key are found or created. A triple of a
     /// single-valued predicate replaces the current value as its next
-    /// version. A value that is already current is not written again.
+    /// version. A value that is already current is not written again
+    /// ([`Outcome::Unchanged`](super::Outcome)), and then nothing of that
+    /// fact is written, not even the entities its mentions name. The
+    /// mentions of an unchanged fact are not validated either: an unknown
+    /// entity in them is not reported.
+    ///
+    /// Two cases where a value that is already current still settles
+    /// something. A write of one of several current values of a
+    /// single-valued pair (a conflict, or the result of a predicate
+    /// merge) keeps that version as it is and closes the others
+    /// ([`Outcome::Resolved`](super::Outcome)). An asserted write of a
+    /// value that is current only as inferred confirms it with a new
+    /// asserted version ([`Outcome::Superseded`](super::Outcome)); unless
+    /// the draft is dated, that version is true from when the inferred
+    /// one was, and the inferred one is closed so that it is true at no
+    /// time. An inferred write never closes an asserted value.
+    ///
+    /// Text values are trimmed, and an empty one is
+    /// [`StoreError::EmptyText`]. A value for a single-valued pair with no
+    /// current value may not start (`valid_from`) before the earlier
+    /// values of the pair stopped being true
+    /// ([`StoreError::ChangeBeforeValid`]): the two would overlap in a
+    /// read of that time. Corrected and redacted versions were never true
+    /// and do not count. A value closed with a date in the future counts
+    /// until that date, so until then the pair takes only values dated
+    /// from it on.
     pub fn remember(&self, request: Remember) -> Result<Remembered, StoreError> {
         self.write(|p| p.remember(request))
     }
@@ -434,6 +468,10 @@ impl Memory {
     }
 
     /// Every version of a fact, oldest first.
+    ///
+    /// This is the way to walk a chain: it follows `prev` from the latest
+    /// version. [`Fact::next`] does not reach across a gap, where a fact
+    /// was closed without a successor and written again later.
     pub fn history(&self, lineage: Lineage) -> Vec<Fact> {
         let state = self.state();
         let mut versions = Vec::new();
@@ -520,7 +558,15 @@ impl Memory {
         known: Option<(&str, &Quantized)>,
         plan: impl FnOnce(&mut Planner<'_>) -> Result<R, StoreError>,
     ) -> Result<R, StoreError> {
-        let mut writer = self.inner.writer.lock().map_err(|_| StoreError::Poisoned)?;
+        // A writer that panicked (in the clock, the plan or the embedder)
+        // left the lock poisoned but touched neither the log nor the
+        // state, so the lock is taken regardless. A panic that could have
+        // left them apart sets `poisoned` (see `PoisonOnDrop` below).
+        let mut writer = self
+            .inner
+            .writer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         // Checked under the writer lock: a writer that poisons the memory
         // holds it, so no later writer plans on a diverged state.
         if self.is_poisoned() {
@@ -579,10 +625,28 @@ impl Memory {
         };
         // Protocol: check not poisoned, plan, embed, append, apply. Once the
         // append succeeds the commit is durable; an apply error after it
-        // sets `poisoned` (see the invariant on `Memory`).
+        // sets `poisoned` (see the invariant on `Memory`). So does a panic
+        // anywhere from here to the end of the apply: the guard is armed
+        // before the append, because a log that panics may or may not have
+        // written the commit.
+        let mut diverged = PoisonOnDrop {
+            flag: &self.inner.poisoned,
+            armed: true,
+        };
         // The slow part — the disk — runs without the state lock: readers
         // keep reading the previous state meanwhile.
-        writer.log.append(&commit)?;
+        if let Err(e) = writer.log.append(&commit) {
+            // The log reported the failure itself, so the memory is not
+            // poisoned. That does not mean nothing reached the disk: a
+            // file journal fails like this when the write went through
+            // and the sync did not. A log in that position refuses every
+            // further append on its own until it is reopened, so no later
+            // commit can build on a state that lacks this one; the commit
+            // may then turn up on reopening, though the caller got an
+            // error.
+            diverged.armed = false;
+            return Err(e.into());
+        }
         writer.last_at = at;
 
         let mut state = self
@@ -605,9 +669,10 @@ impl Memory {
             Ok(())
         })();
         if let Err(reason) = applied {
-            self.inner.poisoned.store(true, Ordering::SeqCst);
+            // `diverged` stays armed and poisons the memory on the way out.
             return Err(StoreError::Internal(reason));
         }
+        diverged.armed = false;
         Ok(result)
     }
 
@@ -621,6 +686,21 @@ impl Memory {
             .state
             .read()
             .unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// Marks the memory poisoned when dropped while armed: by an early return
+/// or by a panic unwinding through the commit section of a write.
+struct PoisonOnDrop<'a> {
+    flag: &'a AtomicBool,
+    armed: bool,
+}
+
+impl Drop for PoisonOnDrop<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.flag.store(true, Ordering::SeqCst);
+        }
     }
 }
 
@@ -694,5 +774,64 @@ mod tests {
         assert!(memory.space_named("home").is_none());
         assert_eq!(memory.space_named("work").map(|s| s.id), Some(space));
         assert!(memory.space(space).is_some());
+    }
+
+    struct Ones;
+
+    impl Embedder for Ones {
+        fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
+            Ok(texts.iter().map(|_| vec![1.0, 1.0]).collect())
+        }
+
+        fn embed_query(&self, _: &str) -> Result<Vec<f32>, EmbedError> {
+            Ok(vec![1.0, 1.0])
+        }
+    }
+
+    /// The real path to a poisoned memory: a commit that is durable and
+    /// then does not apply. No public call gets there (that would be a
+    /// bug), so the test breaks the vector index behind the planner's back.
+    #[test]
+    fn a_durable_commit_that_fails_to_apply_poisons_the_memory() {
+        use crate::model::Origin;
+        use crate::store::{BodyDraft, FactDraft};
+
+        let clock = Arc::new(ManualClock::new(Timestamp::from_millis(1)));
+        let semantic = Semantic {
+            embedder: Arc::new(Ones),
+            dims: 2,
+            near_bonus: 0.0,
+            predicate_threshold: 1.0,
+        };
+        let memory = Memory::open_with(MemLog::<Op>::default(), clock, semantic).unwrap();
+        let key = |s: &str| Key::new(s).unwrap();
+        let space = memory
+            .create_space(key("work"), SpaceKind::LongTerm, None)
+            .unwrap();
+        let statement = |text: &str| Remember {
+            space,
+            origin: Origin::Asserted { by: key("test") },
+            episode: None,
+            facts: vec![FactDraft::new(BodyDraft::Statement {
+                text: text.to_owned(),
+                when: None,
+            })],
+        };
+        let one = memory.remember(statement("one")).unwrap().facts[0].fact;
+        let next_seq = || memory.inner.writer.lock().unwrap().log.next_seq();
+        let seq = next_seq();
+
+        // The index restarts empty, so the vector of the next fact does
+        // not fit: the fact is applied, its vector is not.
+        memory.inner.state.write().unwrap().enable_vectors(2);
+        let err = memory.remember(statement("two")).unwrap_err();
+        assert!(matches!(err, StoreError::Internal(_)), "{err}");
+        assert!(memory.is_poisoned());
+        assert_eq!(next_seq(), seq.next(), "the commit is in the log");
+
+        let err = memory.remember(statement("three")).unwrap_err();
+        assert!(matches!(err, StoreError::Corrupted), "{err}");
+        assert_eq!(next_seq(), seq.next(), "a poisoned memory appends nothing");
+        assert!(memory.fact(one).is_some(), "reads go on");
     }
 }

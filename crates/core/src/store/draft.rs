@@ -139,9 +139,28 @@ pub struct Remember {
 pub enum Outcome {
     /// A new fact lineage was started.
     Created,
-    /// The same value was already current; nothing was written.
+    /// The same value was already current and the write had nothing else
+    /// to settle; nothing was written.
     Unchanged,
+    /// The value was already current and was kept as it is: no new
+    /// version, [`Recorded::fact`] is the version that stays current. The
+    /// other current values of the single-valued pair, which contradicted
+    /// it, were closed with no successor. This ends a conflict between
+    /// an asserted and an inferred value, or the several values a
+    /// predicate merge left.
+    Resolved {
+        /// The closed version; if several were closed, the one recorded
+        /// last.
+        closed: FactId,
+        /// How many more versions were closed. More than one value is
+        /// closed only after a predicate merge.
+        others: u32,
+    },
     /// A new version replaced `previous`.
+    ///
+    /// The new version repeats the value of `previous` when an asserted
+    /// write confirms a value that was current only as inferred (see
+    /// [`Memory::remember`](super::Memory::remember)).
     Superseded {
         /// The replaced version.
         previous: FactId,
@@ -161,8 +180,8 @@ pub enum Outcome {
 /// The result for one fact of a write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Recorded {
-    /// The resulting version: new, or the existing one if unchanged or
-    /// closed.
+    /// The resulting version: new, or the existing one if unchanged,
+    /// kept ([`Outcome::Resolved`]) or closed.
     pub fact: FactId,
     /// What happened.
     pub outcome: Outcome,

@@ -313,6 +313,10 @@ impl Tessar {
                     ),
                 ),
                 Outcome::Unchanged => ("unchanged (already known)".to_owned(), String::new()),
+                Outcome::Resolved { closed, others } => (
+                    "kept (already known)".to_owned(),
+                    self.resolved_note(closed, others),
+                ),
                 Outcome::Closed => ("closed".to_owned(), String::new()),
                 Outcome::Superseded { previous } => {
                     let was = self.mem.fact(previous).map_or_else(String::new, |p| {
@@ -693,6 +697,25 @@ impl Tessar {
 
     // ---- rendering -------------------------------------------------
 
+    /// The note for [`Outcome::Resolved`]: what the write closed.
+    fn resolved_note(&self, closed: FactId, others: u32) -> String {
+        let was = self.mem.fact(closed).map_or_else(String::new, |c| {
+            format!(
+                " (was: {}, recorded {})",
+                self.value_of(&c.body),
+                self.calendar.ymd(c.recorded_at)
+            )
+        });
+        let more = if others == 0 {
+            String::new()
+        } else {
+            format!(" and {others} more")
+        };
+        format!(
+            " (no new version; the contradicting current value {closed}{was}{more} was closed and is no longer current)"
+        )
+    }
+
     /// A value as text.
     fn value_of(&self, body: &FactBody) -> String {
         match body {
@@ -982,6 +1005,12 @@ impl Tessar {
                 };
                 format!("unchanged: {id} already says that; nothing was written.{hint}")
             }
+            // Only a `remember` keeps a value and closes the others; said
+            // in full all the same, should an update ever do it.
+            Outcome::Resolved { closed, others } => format!(
+                "kept: {id} already says that and stays current.{}",
+                self.resolved_note(closed, others)
+            ),
             // An update replaces or closes the head regardless of origin,
             // so a conflict cannot happen here; report it like a new fact.
             Outcome::Created | Outcome::Conflicting { .. } => {

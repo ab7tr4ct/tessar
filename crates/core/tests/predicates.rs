@@ -850,13 +850,7 @@ fn next_write_closes_every_current_head_after_a_merge() {
     let anna = w.entity(w.person, "anna");
     assert_eq!(w.memory.values_of(anna, p2).len(), 2);
 
-    // The same value as one of the current heads is not a change.
     w.clock.set(ts(300));
-    let again = w.remember_one(set(&w, "anna", p2, "y"));
-    assert_eq!(again.outcome, Outcome::Unchanged);
-    assert_eq!(again.fact, y.fact);
-    assert_eq!(w.memory.values_of(anna, p2).len(), 2);
-
     let z = w.remember_one(set(&w, "anna", p2, "z"));
     assert_eq!(z.outcome, Outcome::Superseded { previous: y.fact });
     let now = w.memory.values_of(anna, p2);
@@ -879,4 +873,72 @@ fn next_write_closes_every_current_head_after_a_merge() {
         .map(|f| f.id)
         .collect();
     assert_eq!(history, [y.fact, z.fact]);
+}
+
+#[test]
+fn writing_one_of_the_current_values_after_a_merge_resolves_the_pair() {
+    let w = World::new();
+    let p1 = single_text(&w, "aim");
+    let p2 = single_text(&w, "target");
+    let x = w.remember_one(set(&w, "anna", p1, "x"));
+    w.clock.set(ts(300));
+    let y = w.remember_one(set(&w, "anna", p2, "y"));
+    w.memory.merge_predicates(p1, p2).unwrap();
+    let anna = w.entity(w.person, "anna");
+    assert_eq!(w.memory.values_of(anna, p2).len(), 2);
+
+    // The value of the older head: "x since 100" stays exactly as it
+    // is, with no new version, and the other value stops.
+    w.clock.set(ts(400));
+    let before = w.fact(x);
+    let chosen = w.remember_one(set(&w, "anna", p2, "x"));
+    let (closed, others) = (y.fact, 0);
+    assert_eq!(chosen.outcome, Outcome::Resolved { closed, others });
+    assert_eq!(chosen.fact, x.fact);
+    assert_eq!(w.fact(x), before);
+    assert_eq!(before.valid_from, ts(100));
+    let end = w.fact(y).end.unwrap();
+    assert_eq!(end.next, None);
+    assert_eq!(
+        end.ending,
+        tessar_core::model::Ending::Changed { valid_to: ts(400) }
+    );
+    assert_eq!(w.memory.values_of(anna, p2), [before]);
+
+    // Now the value is the only current one.
+    let commits = w.log.commits();
+    let again = w.remember_one(set(&w, "anna", p2, "x"));
+    assert_eq!(again.outcome, Outcome::Unchanged);
+    assert_eq!(again.fact, x.fact);
+    assert_eq!(w.log.commits(), commits);
+
+    // The log replays to the same state.
+    let reopened = w.reopen();
+    assert_eq!(reopened.values_of(anna, p2), w.memory.values_of(anna, p2));
+    for r in [x, y] {
+        let lineage = w.fact(r).lineage;
+        assert_eq!(reopened.fact(r.fact), w.memory.fact(r.fact));
+        assert_eq!(reopened.history(lineage), w.memory.history(lineage));
+    }
+}
+
+#[test]
+fn writing_the_value_of_the_newer_head_after_a_merge_resolves_the_pair() {
+    let w = World::new();
+    let p1 = single_text(&w, "aim");
+    let p2 = single_text(&w, "target");
+    let x = w.remember_one(set(&w, "anna", p1, "x"));
+    w.clock.set(ts(200));
+    let y = w.remember_one(set(&w, "anna", p2, "y"));
+    w.memory.merge_predicates(p1, p2).unwrap();
+    let anna = w.entity(w.person, "anna");
+
+    w.clock.set(ts(300));
+    let chosen = w.remember_one(set(&w, "anna", p2, "y"));
+    let (closed, others) = (x.fact, 0);
+    assert_eq!(chosen.outcome, Outcome::Resolved { closed, others });
+    assert_eq!(chosen.fact, y.fact);
+    assert_eq!(w.fact(x).end.unwrap().next, None);
+    assert_eq!(w.memory.values_of(anna, p2), [w.fact(y)]);
+    assert_eq!(w.reopen().values_of(anna, p2), [w.fact(y)]);
 }

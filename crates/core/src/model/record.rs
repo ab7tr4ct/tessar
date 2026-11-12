@@ -222,6 +222,10 @@ pub struct FactEnd {
     /// When memory learned that the version is closed.
     pub recorded_at: Timestamp,
     /// The next version; `None` if the fact simply stopped being true.
+    ///
+    /// It stays `None` if the fact is written again later: the end is set
+    /// once, and the version that reopens the chain links back with
+    /// [`Fact::prev`] only.
     pub next: Option<FactId>,
 }
 
@@ -239,7 +243,9 @@ pub struct Fact {
     pub lineage: Lineage,
     /// The version number within the chain, starting at 1.
     pub version: NonZeroU32,
-    /// The previous version.
+    /// The previous version. Always set past the first one, also when the
+    /// previous version was closed without a successor (see
+    /// [`FactEnd::next`]).
     pub prev: Option<FactId>,
     /// The content.
     pub body: FactBody,
@@ -269,7 +275,12 @@ impl Fact {
         self.body.is_redacted()
     }
 
-    /// The next version, if any.
+    /// The version that replaced this one, if any.
+    ///
+    /// Not a way to walk a whole chain: a version closed without a
+    /// successor has none, even if the fact was written again later and
+    /// that version names this one as its `prev`. Walk back along `prev`
+    /// instead, as the store's `Memory::history` does.
     pub fn next(&self) -> Option<FactId> {
         self.end.and_then(|end| end.next)
     }

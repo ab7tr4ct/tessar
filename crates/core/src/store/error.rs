@@ -167,12 +167,24 @@ pub enum StoreError {
     #[error("a replacement must keep the kind, subject and predicate of {0}")]
     ShapeMismatch(Lineage),
 
-    /// A change is dated before the version it replaces became true.
+    /// A change or a new value is dated too early. Two cases share this
+    /// error; in both, `valid_from` is the earliest date the write may
+    /// carry.
+    ///
+    /// 1. A change of a current version dated before that version became
+    ///    true: `valid_from` is the `valid_from` of the version.
+    /// 2. A value for a single-valued pair that has no current value,
+    ///    dated while an earlier value of the pair was still true (it
+    ///    would overlap it in a read of that time): `valid_from` is then
+    ///    not a start but the latest `valid_to` among the versions of the
+    ///    pair closed as changed. Corrected and redacted versions do not
+    ///    count. The message below describes case 1 only.
     #[error("change at {at:?} is before the version became true at {valid_from:?}")]
     ChangeBeforeValid {
-        /// The change time.
+        /// The date the write carried.
         at: Timestamp,
-        /// When the replaced version became true.
+        /// The earliest date it may carry: the start of the replaced
+        /// version (case 1) or the end of the last true value (case 2).
         valid_from: Timestamp,
     },
 
@@ -199,10 +211,6 @@ pub enum StoreError {
         "memory state diverged from the journal after an internal error; reopen it to rebuild the state from the journal"
     )]
     Corrupted,
-
-    /// A writer panicked earlier; reopen the memory.
-    #[error("a writer panicked earlier; reopen the memory")]
-    Poisoned,
 }
 
 /// Why a word of a predicate name is not universal.

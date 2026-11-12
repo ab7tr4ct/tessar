@@ -23,6 +23,8 @@ const DIMS: usize = 8;
 #[derive(Default)]
 struct Concepts {
     fail: AtomicBool,
+    /// Panic on the next call, once.
+    panic_once: AtomicBool,
     /// Return vectors of this length instead, if set.
     length: AtomicUsize,
     /// Every document text it was asked to embed.
@@ -41,6 +43,10 @@ const CONCEPTS: [&[&str]; 7] = [
 
 impl Concepts {
     fn vector(&self, text: &str) -> Result<Vec<f32>, EmbedError> {
+        assert!(
+            !self.panic_once.swap(false, Ordering::SeqCst),
+            "the embedder panicked"
+        );
         if self.fail.load(Ordering::SeqCst) {
             return Err(EmbedError("server is down".into()));
         }
@@ -226,6 +232,28 @@ fn a_write_fails_whole_if_the_embedder_fails() {
     w.remember_one(statement("Anna moved to Berlin"));
     let top = &w.memory.recall(&Recall::new("Аня переехала")).hits[0];
     assert_eq!(text(top), "Anna moved to Berlin");
+}
+
+/// The embedder runs under the writer lock, before anything reaches the
+/// log: its panic must not cost the memory its writes.
+#[test]
+fn a_panic_in_the_embedder_leaves_the_memory_writable() {
+    let (w, concepts) = world();
+    w.remember_one(statement("The journal is append-only"));
+    let commits = w.log.commits();
+
+    concepts.panic_once.store(true, Ordering::SeqCst);
+    let write = || w.try_remember(vec![statement("Anna moved to Berlin")]);
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(write));
+    assert!(panicked.is_err());
+    assert!(!w.memory.is_poisoned());
+    assert_eq!(w.log.commits(), commits, "nothing reached the log");
+
+    w.remember_one(statement("Anna moved to Berlin"));
+    assert_eq!(w.log.commits(), commits + 1);
+    let top = &w.memory.recall(&Recall::new("Аня переехала")).hits[0];
+    assert_eq!(text(top), "Anna moved to Berlin");
+    assert!(!w.memory.is_poisoned());
 }
 
 #[test]

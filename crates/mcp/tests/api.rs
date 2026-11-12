@@ -194,6 +194,65 @@ fn single_valued_write_reports_superseded() {
     assert!(hist.contains("[version 1, until 2026-11-09]"), "{hist}");
 }
 
+/// An inferred value beside the asserted one (written past the MCP layer,
+/// which only asserts): asserting the same value again keeps it and closes
+/// the inferred one, and the result says so.
+#[test]
+fn repeating_a_value_that_has_a_contradicting_one_reports_kept() {
+    use tessar_core::model::{Confidence, FactBody, Value};
+    use tessar_core::store::{EntityRef, ObjectDraft};
+
+    let f = fixture();
+    let write = || {
+        remember(
+            &f,
+            json!({"space": "user", "facts": [{
+                "kind": "attribute", "subject": user(), "predicate": "lives_in",
+                "value": "Boston", "text": "User lives in Boston"}]}),
+        )
+        .unwrap()
+    };
+    assert!(write().contains("created"));
+    let space = f.mem.space_named("user").unwrap().id;
+    let kind = f.mem.kind_named(space, "person").unwrap();
+    let who = f.mem.find_entity(space, kind, "user").unwrap().id;
+    let lives_in = f.mem.predicate_named(space, "lives_in").unwrap().id;
+    let asserted = f.mem.values_of(who, lives_in);
+    assert!(matches!(asserted[0].body, FactBody::Triple { .. }));
+    let guess = f
+        .mem
+        .remember(Remember {
+            space,
+            origin: Origin::Inferred {
+                by: Key::new("model").unwrap(),
+                confidence: Confidence::new(0.5).unwrap(),
+            },
+            episode: None,
+            facts: vec![FactDraft::new(BodyDraft::Triple {
+                subject: EntityRef::Id(who),
+                predicate: lives_in,
+                object: ObjectDraft::Value(Value::Text("Denver".into())),
+                text: None,
+                when: None,
+            })],
+        })
+        .unwrap()
+        .facts[0]
+        .fact;
+    assert_eq!(f.mem.values_of(who, lives_in).len(), 2);
+
+    f.clock.advance(DAY_MS);
+    let out = write();
+    let expected = format!("1. kept (already known): {} ", asserted[0].id);
+    assert!(out.contains(&expected), "{out}");
+    let note = format!(
+        "(no new version; the contradicting current value {guess} (was: Denver, recorded 2026-11-08) was closed and is no longer current)"
+    );
+    assert!(out.contains(&note), "{out}");
+    assert_eq!(f.mem.values_of(who, lives_in), asserted);
+    assert!(write().contains("unchanged"));
+}
+
 #[test]
 fn as_of_shows_the_older_value() {
     let f = fixture();

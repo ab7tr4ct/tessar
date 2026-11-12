@@ -28,7 +28,9 @@ pub enum Op {
     ///
     /// Merging leaves existing values untouched, so a single-valued pair
     /// can end up with several current values. The next write to that pair
-    /// closes them all (see `Memory::remember`).
+    /// closes them all, also when it repeats one of them (see
+    /// `Memory::remember`); only an inferred write leaves the asserted
+    /// ones alone.
     MergePredicate {
         /// The predicate that becomes a synonym.
         from: PredicateId,
