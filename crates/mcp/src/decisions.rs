@@ -85,6 +85,8 @@ pub struct Candidate {
     pub channels: Vec<String>,
     pub similarity: Option<f64>,
     pub lesson: bool,
+    /// A lesson printed shortened to fit its line.
+    pub cut: bool,
     /// `shown` or `held`.
     pub decision: &'static str,
     /// Why it was held: `below_threshold`, `already_shown`, `over_limit` or

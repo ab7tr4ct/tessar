@@ -61,6 +61,9 @@ const MIN_WORDS: usize = 3;
 /// that lessons, which rank below the facts the general threshold keeps, are
 /// among them.
 const RECALL_LIMIT: usize = 16;
+/// A lesson's line in the prompt hook is cut to this many characters, its
+/// head (`- lesson fNN [date]: `) included.
+const LESSON_LINE_CHARS: usize = 300;
 /// Ordinary facts are taken only from this many best hits, as before lessons
 /// had a slot of their own.
 const ORDINARY_WINDOW: usize = 8;
@@ -388,32 +391,56 @@ fn fit(lines: &[String], used: usize, budget: usize) -> Vec<String> {
 /// The text the `prompt` hook prints for `hits`, and the ids in it. Empty
 /// when nothing fits.
 pub fn render_prompt(hits: &[Hit], budget: usize) -> (String, Vec<String>) {
-    render_prompt_with_lessons(hits, &[], budget)
+    let (text, ids, _) = render_prompt_with_lessons(hits, &[], budget);
+    (text, ids)
 }
 
-/// [`render_prompt`] with `lessons` after the ordinary hits, inside the same
-/// budget. What does not fit is cut from the end, lessons first.
+/// [`render_prompt`] with `lessons`. The lessons are fitted first, each cut
+/// to [`LESSON_LINE_CHARS`] characters, so that a long ordinary fact cannot
+/// crowd them out; the ordinary lines get what is left of the budget. They
+/// are printed in the other order: ordinary lines, then lessons. Returns the
+/// text, the ids printed and the ids of lessons that were cut.
 pub fn render_prompt_with_lessons(
     hits: &[Hit],
     lessons: &[Hit],
     budget: usize,
-) -> (String, Vec<String>) {
-    let lines: Vec<String> = hits
-        .iter()
-        .map(Hit::line)
-        .chain(lessons.iter().map(Hit::lesson_line))
-        .collect();
-    let fitted = fit(&lines, PROMPT_HEADER.chars().count() + 1, budget);
-    if fitted.is_empty() {
-        return (String::new(), Vec::new());
+) -> (String, Vec<String>, Vec<String>) {
+    let head = PROMPT_HEADER.chars().count() + 1;
+    let full: Vec<String> = lessons.iter().map(Hit::lesson_line).collect();
+    let capped: Vec<String> = full.iter().map(|l| cut(l, LESSON_LINE_CHARS)).collect();
+    let lesson_lines = fit(&capped, head, budget);
+    let used = head
+        + lesson_lines
+            .iter()
+            .map(|l| l.chars().count() + 1)
+            .sum::<usize>();
+    let ordinary: Vec<String> = hits.iter().map(Hit::line).collect();
+    let ordinary_lines = fit(&ordinary, used, budget);
+    if ordinary_lines.is_empty() && lesson_lines.is_empty() {
+        return (String::new(), Vec::new(), Vec::new());
     }
-    let ids = hits
+    let mut ids: Vec<String> = hits
         .iter()
-        .chain(lessons)
-        .take(fitted.len())
+        .take(ordinary_lines.len())
         .map(|h| h.id.clone())
         .collect();
-    (format!("{PROMPT_HEADER}\n{}\n", fitted.join("\n")), ids)
+    let mut cut_ids = Vec::new();
+    for (i, h) in lessons.iter().take(lesson_lines.len()).enumerate() {
+        ids.push(h.id.clone());
+        if lesson_lines[i] != full[i] {
+            cut_ids.push(h.id.clone());
+        }
+    }
+    let lines: Vec<&str> = ordinary_lines
+        .iter()
+        .chain(&lesson_lines)
+        .map(String::as_str)
+        .collect();
+    (
+        format!("{PROMPT_HEADER}\n{}\n", lines.join("\n")),
+        ids,
+        cut_ids,
+    )
 }
 
 /// The text the `session` hook prints. `user` and `project` are the current
@@ -658,7 +685,7 @@ async fn prompt_traced(
             .collect()
     };
     let (ordinary, lessons) = (pick(Verdict::Ordinary), pick(Verdict::Lesson));
-    let (text, ids) = render_prompt_with_lessons(&ordinary, &lessons, settings.budget);
+    let (text, ids, cut_ids) = render_prompt_with_lessons(&ordinary, &lessons, settings.budget);
     if !ids.is_empty()
         && let Err(e) = append_shown(home, &input.session_id, &ids)
     {
@@ -674,6 +701,7 @@ async fn prompt_traced(
             };
             Candidate {
                 lesson: h.is_lesson(),
+                cut: cut_ids.contains(&h.id),
                 id: h.id,
                 space: h.space,
                 channels: h.channels,
@@ -1531,7 +1559,7 @@ mod tests {
     #[test]
     fn lesson_lines_start_with_the_handle_and_drop_the_prefix() {
         let l = lesson("f88", Some(0.5), "before declaring a bug, read the log");
-        let (text, ids) =
+        let (text, ids, _) =
             render_prompt_with_lessons(&[hit("f1", Some(0.9), &[], "Ordinary.")], &[l], 1500);
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines[1], "- [2026-11-08] [user] Ordinary.");
@@ -1551,14 +1579,14 @@ mod tests {
             lesson("f3", Some(0.5), "second"),
         ];
         for budget in [60, 100, 200, 400, 1500] {
-            let (text, ids) = render_prompt_with_lessons(&ordinary, &lessons, budget);
+            let (text, ids, _) = render_prompt_with_lessons(&ordinary, &lessons, budget);
             assert!(text.chars().count() <= budget, "{budget}: {text}");
-            if !ids.is_empty() {
-                assert_eq!(ids[0], "f1", "the ordinary fact goes first");
+            if ids.contains(&"f1".to_owned()) {
+                assert_eq!(ids[0], "f1", "the ordinary fact is printed first");
             }
         }
-        let (_, ids) = render_prompt_with_lessons(&ordinary, &lessons, 120);
-        assert_eq!(ids, ["f1"]);
+        let (_, ids, _) = render_prompt_with_lessons(&ordinary, &lessons, 120);
+        assert_eq!(ids, ["f2"], "the lesson is fitted first, even if cut");
     }
 
     fn lessons_n(n: usize) -> Vec<Hit> {
@@ -1608,5 +1636,87 @@ mod tests {
         let only_hint = render_lessons_block(&lessons_n(3), &[], LESSON_HINT.chars().count());
         assert_eq!(only_hint, LESSON_HINT);
         assert_eq!(render_lessons_block(&lessons_n(3), &[], 20), "");
+    }
+
+    fn words(n: usize) -> String {
+        "word ".repeat(n)
+    }
+
+    #[test]
+    fn a_top_lesson_survives_a_long_ordinary_line_that_does_not_fit() {
+        let ordinary = vec![
+            hit("f1", Some(0.9), &[], &words(100)),
+            hit("f2", Some(0.8), &[], &words(300)),
+            hit("f3", Some(0.7), &[], "Short."),
+        ];
+        let lessons = vec![lesson(
+            "f88",
+            Some(0.95),
+            "before declaring a bug, read the log",
+        )];
+        let (text, ids, cut_ids) = render_prompt_with_lessons(&ordinary, &lessons, 1500);
+        // The second ordinary line does not fit, so the rest of the ordinary
+        // lines go; the lesson stays and is printed last.
+        assert_eq!(ids, ["f1", "f88"], "{text}");
+        assert!(cut_ids.is_empty());
+        assert!(text.lines().last().unwrap().starts_with("- lesson f88 "));
+        assert!(text.chars().count() <= 1500);
+    }
+
+    #[test]
+    fn long_lessons_are_cut_to_their_line_and_ordinary_lines_get_the_rest() {
+        let lessons = vec![
+            lesson("f10", Some(0.9), &words(200)),
+            lesson("f11", Some(0.8), &words(200)),
+        ];
+        let ordinary = vec![hit("f1", Some(0.9), &[], &words(100))];
+        let (text, ids, cut_ids) = render_prompt_with_lessons(&ordinary, &lessons, 1500);
+        assert_eq!(ids, ["f1", "f10", "f11"]);
+        assert_eq!(cut_ids, ["f10", "f11"]);
+        let lines: Vec<&str> = text.lines().collect();
+        for l in &lines[2..] {
+            assert_eq!(l.chars().count(), LESSON_LINE_CHARS, "{l}");
+            assert!(l.ends_with('…'));
+        }
+        // Ordinary lines lose only what the lessons took.
+        let head = PROMPT_HEADER.chars().count() + 1;
+        let taken = 2 * (LESSON_LINE_CHARS + 1);
+        let ord = ordinary[0].line().chars().count() + 1;
+        let tight = head + taken + ord;
+        let (_, ids, _) = render_prompt_with_lessons(&ordinary, &lessons, tight);
+        assert_eq!(ids, ["f1", "f10", "f11"]);
+        // A little less: the ordinary line is cut to the room left, or, with
+        // less than MIN_CUT, dropped.
+        let (text, ids, _) = render_prompt_with_lessons(&ordinary, &lessons, tight - 1);
+        assert_eq!(ids, ["f1", "f10", "f11"]);
+        assert!(text.chars().count() < tight && text.contains('…'));
+        let (_, ids, _) = render_prompt_with_lessons(&ordinary, &lessons, head + taken + 10);
+        assert_eq!(ids, ["f10", "f11"]);
+    }
+
+    #[test]
+    fn a_multibyte_lesson_is_cut_on_a_character_boundary() {
+        let l = lesson(
+            "f5",
+            Some(0.9),
+            &"перед тем как объявить баг, прочитай лог ".repeat(20),
+        );
+        let (text, _, cut_ids) = render_prompt_with_lessons(&[], &[l], 1500);
+        assert_eq!(cut_ids, ["f5"]);
+        let line = text.lines().last().unwrap();
+        assert_eq!(line.chars().count(), LESSON_LINE_CHARS);
+        assert!(line.ends_with('…'));
+    }
+
+    #[test]
+    fn without_lessons_the_prompt_is_what_it_was() {
+        let ordinary = vec![
+            hit("f1", Some(0.9), &[], &words(100)),
+            hit("f2", Some(0.8), &[], &words(300)),
+        ];
+        let (text, ids, cut_ids) = render_prompt_with_lessons(&ordinary, &[], 1500);
+        assert_eq!((text.clone(), ids.clone()), render_prompt(&ordinary, 1500));
+        assert_eq!(ids, ["f1"]);
+        assert!(cut_ids.is_empty());
     }
 }
