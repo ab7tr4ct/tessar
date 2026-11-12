@@ -362,7 +362,7 @@ fn similar_predicate_is_a_tool_error_and_writes_no_facts() {
     .unwrap_err();
     assert!(err.contains("fact 2"), "{err}");
     assert!(
-        err.contains("predicate `lives_place` looks like `lives_in`"),
+        err.contains("predicate \"lives_place\" looks like `lives_in`"),
         "{err}"
     );
     assert!(

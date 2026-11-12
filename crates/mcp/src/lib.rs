@@ -5,6 +5,7 @@
 //! - [`api`] maps tool requests to core calls and renders the results as
 //!   text. It knows nothing about MCP and is tested over an in-memory log.
 //! - [`server`] is the thin `rmcp` handler that exposes [`api`] as tools.
+//! - [`tool_log`] writes each tool call to the decision log, from [`server`].
 //! - [`daemon`] serves that handler to many sessions over a Unix socket, one
 //!   project space per connection.
 //! - [`proxy`] is the stdio side: it forwards a session to the daemon.
@@ -41,6 +42,7 @@ pub mod project;
 pub mod proxy;
 pub mod purge;
 pub mod server;
+pub mod tool_log;
 pub mod when;
 
 /// Identifies this build: the crate version, the commit it was built from

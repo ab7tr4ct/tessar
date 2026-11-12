@@ -137,6 +137,11 @@ impl Tessar {
         self
     }
 
+    /// The project space's name.
+    pub fn project_name(&self) -> &str {
+        self.project_key.as_str()
+    }
+
     fn space_id(&self, space: Space) -> SpaceId {
         match space {
             Space::User => self.user,
@@ -511,7 +516,7 @@ impl Tessar {
     ) -> Result<PredRef, String> {
         let parsed = Name::new(name).map_err(|_| {
             format!(
-                "predicate `{name}` is not snake_case: use lowercase letters, digits and `_`, \
+                "predicate {name:?} is not snake_case: use lowercase letters, digits and `_`, \
                  for example `trip_destination`"
             )
         })?;
@@ -538,14 +543,14 @@ impl Tessar {
         {
             let Some(into) = self.find_predicate(target) else {
                 return Err(format!(
-                    "synonym_of `{target}` is not an existing predicate; call `vocabulary` for the list"
+                    "synonym_of {target:?} is not an existing predicate; call `vocabulary` for the list"
                 ));
             };
             NewHow::Alias { into: into.id }
         } else {
             if description.is_empty() {
                 return Err(format!(
-                    "predicate `{name}` is new: give `predicate_description` (one line: what it means \
+                    "predicate {name:?} is new: give `predicate_description` (one line: what it means \
                      and what its value is), and `single: true` if a new value always replaces the old one. \
                      If an existing predicate fits, use it: call `vocabulary`"
                 ));
@@ -574,7 +579,7 @@ impl Tessar {
                 .alias_predicate(self.user, new.parsed.clone(), new.description.clone(), into)
                 .map_err(|e| {
                     format!(
-                        "cannot make `{name}` a synonym: {}",
+                        "cannot make {name:?} a synonym: {}",
                         self.predicate_message(name, &e)
                     )
                 }),
@@ -609,22 +614,22 @@ impl Tessar {
                     .map(|p| (p.name.to_string(), p.description))
                     .unwrap_or_else(|| (existing.to_string(), String::new()));
                 format!(
-                    "predicate `{name}` looks like `{similar}` ({description}); reuse `{similar}`, \
+                    "predicate {name:?} looks like `{similar}` ({description}); reuse `{similar}`, \
                      or set synonym_of: \"{similar}\", or force_new_predicate: true"
                 )
             }
             StoreError::PredicateNotUniversal { word, reason, .. } => format!(
-                "predicate `{name}` is not universal: {word:?} {reason}. Name the relation, not the thing \
+                "predicate {name:?} is not universal: {word:?} {reason}. Name the relation, not the thing \
                  (`trip_destination` with value \"Japan\", not `plans_trip_to_japan`)"
             ),
             StoreError::PredicateNameTooLong { max_words, .. } => format!(
-                "predicate `{name}` has more than {max_words} words; shorten it to a general relation"
+                "predicate {name:?} has more than {max_words} words; shorten it to a general relation"
             ),
             StoreError::PredicateConflict { .. } => format!(
-                "predicate `{name}` already exists with another type or cardinality; \
+                "predicate {name:?} already exists with another type or cardinality; \
                  use it as it is (see `vocabulary`) or pick another name"
             ),
-            other => format!("predicate `{name}`: {}", self.store_message(other)),
+            other => format!("predicate {name:?}: {}", self.store_message(other)),
         }
     }
 
@@ -632,7 +637,7 @@ impl Tessar {
     fn store_message(&self, e: &StoreError) -> String {
         match e {
             StoreError::DuplicatePair { subject, predicate } => format!(
-                "the call sets two values of the single-valued predicate `{}` for `{}`; send only the last one",
+                "the call sets two values of the single-valued predicate `{}` for {:?}; send only the last one",
                 self.mem
                     .predicate(*predicate)
                     .map_or_else(|| predicate.to_string(), |p| p.name.to_string()),
@@ -656,7 +661,8 @@ impl Tessar {
                 self.calendar.ymd(*valid_from)
             ),
             StoreError::EmptyText => "a text field is empty".to_owned(),
-            StoreError::Embed(e) => format!("the embedder failed ({e}); try again"),
+            // Quoted: a provider may echo the text it was given.
+            StoreError::Embed(e) => format!("the embedder failed: {:?}; try again", e.0),
             StoreError::SpaceArchived(_) => "the space is archived and read-only".to_owned(),
             StoreError::UnknownFact(id) => format!("no fact {id}"),
             StoreError::UnknownEpisode(id) => format!("no episode {id}"),

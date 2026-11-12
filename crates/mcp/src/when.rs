@@ -163,7 +163,7 @@ fn days_in_month(y: i64, m: i64) -> i64 {
 
 /// A date part as a half-open range of day numbers `[start, end)`.
 fn parse_part(s: &str) -> Result<(i64, i64), String> {
-    let bad = || format!("`{s}` is not a date: use YYYY, YYYY-MM or YYYY-MM-DD");
+    let bad = || format!("{s:?} is not a date: use YYYY, YYYY-MM or YYYY-MM-DD");
     let num = |p: &str, len: usize| -> Result<i64, String> {
         if p.len() == len && p.bytes().all(|b| b.is_ascii_digit()) {
             p.parse().map_err(|_| bad())
@@ -180,7 +180,7 @@ fn parse_part(s: &str) -> Result<(i64, i64), String> {
         [y, m] => {
             let (y, m) = (num(y, 4)?, num(m, 2)?);
             if !(1..=12).contains(&m) {
-                return Err(format!("`{s}`: month must be 01 to 12"));
+                return Err(format!("{s:?}: month must be 01 to 12"));
             }
             let start = days_from_civil(y, m, 1);
             Ok((start, start + days_in_month(y, m)))
@@ -188,10 +188,10 @@ fn parse_part(s: &str) -> Result<(i64, i64), String> {
         [y, m, d] => {
             let (y, m, d) = (num(y, 4)?, num(m, 2)?, num(d, 2)?);
             if !(1..=12).contains(&m) {
-                return Err(format!("`{s}`: month must be 01 to 12"));
+                return Err(format!("{s:?}: month must be 01 to 12"));
             }
             if !(1..=days_in_month(y, m)).contains(&d) {
-                return Err(format!("`{s}`: no such day in that month"));
+                return Err(format!("{s:?}: no such day in that month"));
             }
             let start = days_from_civil(y, m, d);
             Ok((start, start + 1))
@@ -208,10 +208,10 @@ pub fn parse_when<Tz: TimeZone>(tz: &Tz, s: &str) -> Result<TimeSpan, String> {
     let ms = |d: i64| Timestamp::from_millis(day_start_ms(tz, d));
     let (start, end) = match s.split_once('/') {
         Some((a, _)) if a.trim().is_empty() => {
-            return Err(format!("`{s}`: missing date before `/`"));
+            return Err(format!("{s:?}: missing date before `/`"));
         }
         Some((_, b)) if b.trim().is_empty() => {
-            return Err(format!("`{s}`: missing date after `/`"));
+            return Err(format!("{s:?}: missing date after `/`"));
         }
         Some((a, b)) => {
             let (start, _) = parse_part(a)?;
@@ -222,7 +222,7 @@ pub fn parse_when<Tz: TimeZone>(tz: &Tz, s: &str) -> Result<TimeSpan, String> {
     };
     Interval::new(ms(start), ms(end))
         .map(TimeSpan::Range)
-        .map_err(|_| format!("`{s}`: the end is before the start"))
+        .map_err(|_| format!("{s:?}: the end is before the start"))
 }
 
 /// The first instant of a span, if it has one.
@@ -238,7 +238,7 @@ pub fn span_start(span: TimeSpan) -> Option<Timestamp> {
 /// that day.
 pub fn parse_as_of<Tz: TimeZone>(tz: &Tz, s: &str) -> Result<Timestamp, String> {
     if s.trim().matches('-').count() != 2 {
-        return Err(format!("`{s}` is not a date: use YYYY-MM-DD"));
+        return Err(format!("{s:?} is not a date: use YYYY-MM-DD"));
     }
     let (_, end) = parse_part(s)?;
     Ok(Timestamp::from_millis(day_start_ms(tz, end) - 1))

@@ -1,10 +1,13 @@
 //! The decision log, `<home>/decisions.jsonl`: one JSON object per line
-//! about what the hooks considered, showed and held back, so that their
-//! thresholds can be judged from evidence.
+//! about what the hooks considered, showed and held back, and which tools
+//! the agent called afterwards, so that the hooks' thresholds can be judged
+//! from evidence.
 //!
-//! The log holds the text of the user's messages (cut to
-//! [`MAX_MESSAGE_CHARS`]), grows without rotation and is removed by
-//! `tessar purge`, since a message may carry text that is redacted later.
+//! The log holds the text of the user's messages and of `recall` queries
+//! (cut to [`MAX_MESSAGE_CHARS`]) and the error text of failed tool calls,
+//! grows without rotation and is removed by `tessar purge`, since a message
+//! may carry text that is redacted later. Tool records never hold fact
+//! texts; those are in the journal.
 //!
 //! The log must never break its writer: [`append`] makes one `write` of one
 //! line and returns nothing, whatever happens. The file is opened with
@@ -21,6 +24,9 @@ use serde::Serialize;
 /// The message text kept in a record, in characters.
 pub const MAX_MESSAGE_CHARS: usize = 2000;
 
+/// The error text kept in a tool record, in characters.
+pub const MAX_ERROR_CHARS: usize = 300;
+
 /// `<home>/decisions.jsonl`.
 pub fn log_path(home: &Path) -> PathBuf {
     home.join("decisions.jsonl")
@@ -34,6 +40,11 @@ pub fn now() -> String {
 /// The first [`MAX_MESSAGE_CHARS`] characters of `text`.
 pub fn clip_message(text: &str) -> String {
     text.chars().take(MAX_MESSAGE_CHARS).collect()
+}
+
+/// The first `max` characters of `text`.
+pub fn clip(text: &str, max: usize) -> String {
+    text.chars().take(max).collect()
 }
 
 /// Appends `record` as one line to the log in `home`, with one `write`. The
@@ -62,6 +73,8 @@ pub enum Record {
     Prompt(PromptRecord),
     /// A run of the `session` hook.
     Session(SessionRecord),
+    /// A call of an MCP tool.
+    Tool(ToolRecord),
 }
 
 /// The thresholds and the budget a `prompt` run worked under.
@@ -146,6 +159,110 @@ pub struct SessionRecord {
 pub struct Block {
     pub name: &'static str,
     pub chars: usize,
+}
+
+/// A call of an MCP tool, written by the process that owns the memory after
+/// the result was produced.
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolRecord {
+    pub ts: String,
+    pub tool: String,
+    /// The project space's name.
+    pub project: String,
+    /// The space the call worked in: `user`, `project` or, for a `recall`
+    /// that was not narrowed, `all`; `None` when the call does not say.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub space: Option<String>,
+    /// The daemon's connection number (`#185` in its log); `None` in the
+    /// standalone mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conn: Option<u64>,
+    /// Claude Code's session id, as the client announced it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    /// What called: `mcp` (the agent), `hook` or `cli`; absent when the
+    /// client did not say (an older proxy).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client: Option<String>,
+    pub elapsed_ms: u64,
+    pub failed: bool,
+    /// The error text cut to [`MAX_ERROR_CHARS`], when the call failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(flatten)]
+    pub detail: ToolDetail,
+}
+
+/// What is specific to one tool; the variant is told by the field names.
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum ToolDetail {
+    /// `vocabulary`, and a call that failed before it could be read.
+    Plain {},
+    Recall {
+        /// The query cut to [`MAX_MESSAGE_CHARS`].
+        query: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        limit: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        as_of: Option<String>,
+        hits: Vec<ToolHit>,
+    },
+    About {
+        entity: ToolEntity,
+        history: bool,
+        handles: Vec<String>,
+    },
+    /// `remember` and `lesson`.
+    Write {
+        fact_count: usize,
+        facts: Vec<ToolFact>,
+    },
+    Update {
+        /// The handle addressed, when the argument is a handle.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        fact: Option<String>,
+        /// `changed`, `wrong` or `redact`, when the reason is one of them.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mode: Option<String>,
+        /// The length of a reason that is none of them; its text is not kept.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason_chars: Option<usize>,
+        /// `superseded`, `closed`, `corrected`, `unchanged`, `kept`,
+        /// `created` or `redacted`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        outcome: Option<String>,
+        /// The version the call created, if it did.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        new_handle: Option<String>,
+    },
+}
+
+/// A hit `recall` returned.
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolHit {
+    pub id: String,
+    pub space: String,
+    pub channels: Vec<String>,
+    pub similarity: Option<f64>,
+}
+
+/// The entity `about` was asked for.
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolEntity {
+    pub key: String,
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub space: Option<String>,
+}
+
+/// A fact `remember` or `lesson` reported.
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolFact {
+    pub id: Option<String>,
+    /// `created`, `superseded`, `unchanged`, `kept`, `closed`,
+    /// `conflicting`, or `unparsed` when the report was not recognised.
+    pub outcome: Option<String>,
 }
 
 #[cfg(all(test, unix))]

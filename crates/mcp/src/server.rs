@@ -4,12 +4,18 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig};
-use rmcp::{ServerHandler, tool, tool_handler, tool_router};
+use rmcp::model::{
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
+    ServerCapabilities, ServerConfig,
+};
+use rmcp::service::RequestContext;
+use rmcp::{ErrorData, RoleServer, ServerHandler, tool, tool_handler, tool_router};
 
 use crate::api::{Rendered, Tessar};
 use crate::args::{AboutArgs, LessonArgs, RecallArgs, RememberArgs, UpdateArgs};
+use crate::tool_log::ToolLog;
 
 const INSTRUCTIONS: &str = "\
 tessar is the user's long-term memory, shared across conversations and projects. \
@@ -119,6 +125,8 @@ entity it lists the general ones. `update` fixes or closes a lesson.";
 pub struct TessarServer {
     api: Arc<Tessar>,
     tool_router: ToolRouter<Self>,
+    /// Where tool calls are logged; none logs nothing.
+    log: Option<Arc<ToolLog>>,
 }
 
 impl TessarServer {
@@ -137,7 +145,18 @@ impl TessarServer {
         if let Some(route) = tool_router.map.get_mut("remember") {
             route.attr.description = Some(Cow::Owned(format!("{REMEMBER_HEAD}{summary}")));
         }
-        Self { api, tool_router }
+        Self {
+            api,
+            tool_router,
+            log: None,
+        }
+    }
+
+    /// Logs every tool call to the decision log as `log` says.
+    #[must_use]
+    pub fn with_tool_log(mut self, log: ToolLog) -> Self {
+        self.log = Some(Arc::new(log));
+        self
     }
 
     /// The text of `rendered` with its hits next to it as structured content.
@@ -206,6 +225,42 @@ impl TessarServer {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for TessarServer {
+    /// What the generated handler does, plus a record in the decision log
+    /// once the result is there. The record is written off this path (see
+    /// [`crate::tool_log`]) and never changes the result.
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        let Some(log) = &self.log else {
+            return self
+                .tool_router
+                .call(ToolCallContext::new(self, request, context))
+                .await;
+        };
+        let (name, args) = (request.name.clone(), request.arguments.clone());
+        let started = std::time::Instant::now();
+        let outcome = self
+            .tool_router
+            .call(ToolCallContext::new(self, request, context))
+            .await;
+        // The name is the caller's text unless the router knows it.
+        let logged = if self.tool_router.has_route(&name) {
+            &*name
+        } else {
+            "unknown"
+        };
+        log.record(
+            self.api.project_name(),
+            logged,
+            args.as_ref(),
+            started.elapsed(),
+            &outcome,
+        );
+        outcome
+    }
+
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("tessar", env!("CARGO_PKG_VERSION")))

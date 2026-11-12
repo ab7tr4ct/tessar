@@ -30,6 +30,7 @@ use tessar_mcp::project::project_name;
 use tessar_mcp::proxy;
 use tessar_mcp::purge;
 use tessar_mcp::server::TessarServer;
+use tessar_mcp::tool_log::ToolLog;
 use tokio::net::{UnixListener, UnixStream};
 
 /// A line on stderr that cannot panic; see [`tessar_mcp::log`].
@@ -796,7 +797,14 @@ fn run_standalone(home: &Path) -> ExitCode {
         Err(e) => return fail(&e),
     };
     let served = runtime.block_on(async {
+        let log = ToolLog::new(
+            home,
+            None,
+            tessar_mcp::tool_log::session_from_env(),
+            Some("mcp".to_owned()),
+        );
         let service = TessarServer::shared(api)
+            .with_tool_log(log)
             .serve(stdio())
             .await
             .map_err(|e| e.to_string())?;
@@ -903,7 +911,7 @@ fn run_daemon(home: &Path, idle_exit: Option<Duration>, takeover: Option<u32>) -
             tessar_mcp::BUILD_ID,
             std::process::id()
         );
-        let projects = Arc::new(Projects::new(memory, clock));
+        let projects = Arc::new(Projects::new(memory, clock).with_decision_log(home));
         daemon::run(listener, Arc::clone(&projects), idle_exit, termination()).await;
         // The socket file goes while the journal is still held, so a
         // daemon that takes the journal next never has its own socket
@@ -976,6 +984,7 @@ fn run_lifecycle(work: impl std::future::Future<Output = Result<String, String>>
 /// content from the files. Every handle is tried; the exit status is
 /// failure if any failed.
 fn run_redact(home: &Path, handles: &[String], purge: bool) -> ExitCode {
+    tessar_mcp::tool_log::set_client_role("cli");
     if let Err(e) = create_home(home) {
         return fail(&e);
     }
@@ -1017,6 +1026,7 @@ fn run_redact(home: &Path, handles: &[String], purge: bool) -> ExitCode {
 /// Writes a lesson through the daemon, as the `lesson` tool does, and prints
 /// the one-line result.
 fn run_lesson(home: &Path, text: &str, user: bool) -> ExitCode {
+    tessar_mcp::tool_log::set_client_role("cli");
     if let Err(e) = create_home(home) {
         return fail(&e);
     }
@@ -1091,6 +1101,7 @@ fn run_hook(home: &Path, kind: HookKind) -> ExitCode {
         logln!("tessar hook: cannot read stdin: {e}");
         return ExitCode::SUCCESS;
     }
+    tessar_mcp::tool_log::set_client_role("hook");
     let settings = hook::Settings::from_env(|name| std::env::var(name).ok());
     let run = runtime().map(|rt| {
         let run = rt.block_on(async {
@@ -1119,6 +1130,7 @@ fn run_hook(home: &Path, kind: HookKind) -> ExitCode {
 // ---- tessar mcp ----------------------------------------------------
 
 fn run_proxy(home: &Path, keep_daemon: bool) -> ExitCode {
+    tessar_mcp::tool_log::set_client_role("mcp");
     if let Err(e) = create_home(home) {
         return fail(&e);
     }

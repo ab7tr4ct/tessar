@@ -11,6 +11,10 @@
 //! {"tessar":1,"project":"repo","cwd":"/work/repo","build":"0.1.0+3ff4d59.1731100000"}
 //! ```
 //!
+//! A client that knows Claude Code's session id adds `"session":"<id>"`, and
+//! one that knows its role `"client":"mcp"` (or `hook`, `cli`); the daemon
+//! records both in its tool log, and an older daemon ignores the fields.
+//!
 //! The daemon answers with one line, the [`Hello`], naming itself, before
 //! any MCP traffic:
 //!
@@ -49,6 +53,7 @@ use tokio::time::Instant;
 use crate::BUILD_ID;
 use crate::api::Tessar;
 use crate::server::TessarServer;
+use crate::tool_log::ToolLog;
 
 /// The protocol version of the header line.
 pub const PROTOCOL: u32 = 1;
@@ -91,6 +96,15 @@ pub struct Header {
     /// The client's build id; empty from clients that predate it.
     #[serde(default)]
     pub build: String,
+    /// Claude Code's session id, when the client knows it; empty from
+    /// clients that predate it or run outside Claude Code. Older daemons
+    /// ignore the field.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub session: String,
+    /// What the client is: `mcp` (an agent's proxy), `hook` or `cli`; empty
+    /// from older proxies. Recorded in the tool log, ignored by older daemons.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub client: String,
     /// Ask for the daemon's state instead of opening a session.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub status: bool,
@@ -104,6 +118,8 @@ impl Header {
             project: project.to_owned(),
             cwd: cwd.display().to_string(),
             build: BUILD_ID.to_owned(),
+            session: crate::tool_log::session_from_env().unwrap_or_default(),
+            client: crate::tool_log::client_role().to_owned(),
             status: false,
         }
     }
@@ -115,6 +131,8 @@ impl Header {
             project: String::new(),
             cwd: String::new(),
             build: BUILD_ID.to_owned(),
+            session: String::new(),
+            client: String::new(),
             status: true,
         }
     }
@@ -242,6 +260,8 @@ pub struct Projects {
     mem: Memory,
     clock: Arc<dyn Clock>,
     cache: Mutex<HashMap<String, Arc<Tessar>>>,
+    /// The home whose decision log gets the tool calls; none logs nothing.
+    log_home: Option<PathBuf>,
 }
 
 impl Projects {
@@ -251,7 +271,15 @@ impl Projects {
             mem,
             clock,
             cache: Mutex::new(HashMap::new()),
+            log_home: None,
         }
+    }
+
+    /// Logs the tool calls of every connection to the decision log in `home`.
+    #[must_use]
+    pub fn with_decision_log(mut self, home: &Path) -> Self {
+        self.log_home = Some(home.to_owned());
+        self
     }
 
     /// The view for `project`. The first call for a name creates its space,
@@ -337,7 +365,17 @@ where
             .map_err(|e| format!("internal error: {e}"))?
             .map_err(|e| format!("cannot prepare project `{}`: {e}", header.project))?
     };
-    let service = TessarServer::shared(api)
+    let mut server = TessarServer::shared(api);
+    if let Some(home) = &projects.log_home {
+        let session = crate::tool_log::clean_session(&header.session);
+        server = server.with_tool_log(ToolLog::new(
+            home,
+            Some(peer),
+            session,
+            crate::tool_log::clean_client(&header.client),
+        ));
+    }
+    let service = server
         .serve((reader, writer))
         .await
         .map_err(|e| format!("handshake failed: {e}"))?;
