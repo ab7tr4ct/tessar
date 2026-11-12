@@ -228,8 +228,7 @@ pub enum ToolDetail {
         /// The length of a reason that is none of them; its text is not kept.
         #[serde(skip_serializing_if = "Option::is_none")]
         reason_chars: Option<usize>,
-        /// `superseded`, `closed`, `corrected`, `unchanged`, `kept`,
-        /// `created` or `redacted`.
+        /// one of [`crate::written::WriteOutcome`]'s words, or `unknown`.
         #[serde(skip_serializing_if = "Option::is_none")]
         outcome: Option<String>,
         /// The version the call created, if it did.
@@ -260,9 +259,21 @@ pub struct ToolEntity {
 #[derive(Debug, Clone, Serialize)]
 pub struct ToolFact {
     pub id: Option<String>,
-    /// `created`, `superseded`, `unchanged`, `kept`, `closed`,
-    /// `conflicting`, or `unparsed` when the report was not recognised.
+    /// One of [`crate::written::WriteOutcome`]'s words, or `unknown` when
+    /// the result carried no structured content.
     pub outcome: Option<String>,
+    /// `superseded`: the version replaced.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous: Option<String>,
+    /// `kept`: a contradicting value that was closed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub closed: Option<String>,
+    /// `kept`: how many more were closed; absent when none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub closed_others: Option<u32>,
+    /// `conflicting`: the asserted value it sits beside.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conflicts_with: Option<String>,
 }
 
 #[cfg(all(test, unix))]

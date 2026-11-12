@@ -1,5 +1,5 @@
-//! Every outcome the tools can report, read back by the tool log's parser
-//! from the text the real mapping layer produces.
+//! Every outcome the write tools can report: the structured content has the
+//! right handle and outcome and agrees with the text report.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -13,10 +13,11 @@ use tessar_core::model::{Confidence, Key, Origin, Timestamp, Value};
 use tessar_core::store::{
     BodyDraft, EntityRef, FactDraft, Memory, ObjectDraft, Remember, Semantic,
 };
+use tessar_mcp::api::Rendered;
 use tessar_mcp::api::Tessar;
-use tessar_mcp::args::{RememberArgs, UpdateArgs};
-use tessar_mcp::tool_log::{parse_facts, parse_update};
+use tessar_mcp::args::{LessonArgs, RememberArgs, UpdateArgs};
 use tessar_mcp::when::{Calendar, DAY_MS, days_from_civil};
+use tessar_mcp::written::WriteOutcome;
 
 const DIMS: usize = 64;
 
@@ -76,15 +77,15 @@ fn fixture() -> Fixture {
     Fixture { api, mem, clock }
 }
 
-fn remember(f: &Fixture, v: serde_json::Value) -> String {
+fn remember(f: &Fixture, v: serde_json::Value) -> Rendered {
     f.api
-        .remember(serde_json::from_value::<RememberArgs>(v).unwrap())
+        .remember_rendered(serde_json::from_value::<RememberArgs>(v).unwrap())
         .unwrap()
 }
 
-fn update(f: &Fixture, v: serde_json::Value) -> String {
+fn update(f: &Fixture, v: serde_json::Value) -> Rendered {
     f.api
-        .update(serde_json::from_value::<UpdateArgs>(v).unwrap())
+        .update_rendered(serde_json::from_value::<UpdateArgs>(v).unwrap())
         .unwrap()
 }
 
@@ -98,61 +99,101 @@ fn statement(text: &str) -> serde_json::Value {
     json!({"facts": [{"kind": "statement", "text": text}]})
 }
 
-/// The one fact a report of one fact names: handle and outcome.
-fn one(text: &str) -> (Option<String>, String) {
-    let facts = parse_facts(text, 1);
-    (facts[0].id.clone(), facts[0].outcome.clone().unwrap())
+/// The one fact of a result: its structured entry, after checking that the
+/// text report starts the same way and that no word of `secret` leaked.
+fn one(r: &Rendered, secret: &str) -> serde_json::Value {
+    let facts = r.structured["facts"].as_array().unwrap();
+    assert_eq!(facts.len(), 1, "{}", r.structured);
+    let fact = facts[0].clone();
+    let word = fact["outcome"].as_str().unwrap();
+    assert!(
+        r.text.contains(&format!("{word}: ")) || r.text.contains(&format!("{word} (")),
+        "{word} not in {}",
+        r.text
+    );
+    assert!(
+        !r.structured.to_string().contains(secret),
+        "{}",
+        r.structured
+    );
+    fact
 }
 
-fn handle(id: &str) -> Option<String> {
-    Some(id.to_owned())
+fn id(fact: &serde_json::Value) -> String {
+    fact["id"].as_str().unwrap().to_owned()
 }
 
 #[test]
-fn remember_outcomes_round_trip() {
+fn remember_outcomes() {
     let f = fixture();
-    let out = remember(&f, lives_in("Boston"));
-    let (id, outcome) = one(&out);
-    assert_eq!(outcome, "created", "{out}");
-    let created = id.unwrap();
+    let r = remember(&f, lives_in("Boston"));
+    assert_eq!(r.structured["space"], "user");
+    let created = one(&r, "Boston");
+    assert_eq!(created["outcome"], "created");
+    assert!(r.text.contains(&id(&created)));
 
-    assert_eq!(
-        one(&remember(&f, lives_in("Boston"))),
-        (handle(&created), "unchanged".into())
-    );
+    let again = one(&remember(&f, lives_in("Boston")), "Boston");
+    assert_eq!(again["outcome"], "unchanged");
+    assert_eq!(again["id"], created["id"]);
 
     f.clock.advance(DAY_MS);
-    let out = remember(&f, lives_in("Denver"));
-    let (id, outcome) = one(&out);
-    assert_eq!(outcome, "superseded", "{out}");
-    assert_ne!(id.unwrap(), created);
+    let r = remember(&f, lives_in("Denver"));
+    let next = one(&r, "Denver");
+    assert_eq!(next["outcome"], "superseded");
+    assert_eq!(next["previous"], created["id"]);
+    assert_ne!(next["id"], created["id"]);
+    assert!(r.text.contains(&id(&next)));
 
-    // Several facts in one report, each read.
-    let out = remember(
+    // Several facts in one call, in call order.
+    let r = remember(
         &f,
         json!({"facts": [
             {"kind": "statement", "text": "alpha note"},
             {"kind": "statement", "text": "beta note"}]}),
     );
-    let facts = parse_facts(&out, 2);
+    assert_eq!(r.structured["space"], "tessar");
+    let facts = r.structured["facts"].as_array().unwrap();
+    assert_eq!(facts.len(), 2);
+    let (a, b) = (id(&facts[0]), id(&facts[1]));
+    assert!(facts.iter().all(|x| x["outcome"] == "created"));
     assert!(
-        facts
-            .iter()
-            .all(|x| x.outcome.as_deref() == Some("created") && x.id.is_some())
+        r.text.find(&a).unwrap() < r.text.find(&b).unwrap(),
+        "{}",
+        r.text
     );
+    assert!(!r.structured.to_string().contains("note"));
+}
+
+#[test]
+fn a_lesson_has_the_same_shape() {
+    let f = fixture();
+    let r = f
+        .api
+        .lesson_rendered(
+            serde_json::from_value::<LessonArgs>(
+                json!({"text": "Before blaming the cache, read the log"}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(r.structured["space"], "tessar");
+    let fact = one(&r, "blaming");
+    assert_eq!(fact["outcome"], "created");
+    assert!(r.text.contains(&id(&fact)));
 }
 
 /// An inferred value beside the asserted one is written past the MCP layer;
-/// asserting the same value again keeps it ("kept").
+/// asserting the same value again keeps it ("kept") and closes the other.
 #[test]
-fn kept_round_trips() {
+fn kept_names_what_it_closed() {
     let f = fixture();
-    let (asserted, _) = one(&remember(&f, lives_in("Boston")));
+    let asserted = id(&one(&remember(&f, lives_in("Boston")), "Boston"));
     let space = f.mem.space_named("user").unwrap().id;
     let kind = f.mem.kind_named(space, "person").unwrap();
     let who = f.mem.find_entity(space, kind, "user").unwrap().id;
     let predicate = f.mem.predicate_named(space, "lives_in").unwrap().id;
-    f.mem
+    let done = f
+        .mem
         .remember(Remember {
             space,
             origin: Origin::Inferred {
@@ -169,56 +210,100 @@ fn kept_round_trips() {
             })],
         })
         .unwrap();
+    let inferred = done.facts[0].fact.to_string();
     f.clock.advance(DAY_MS);
-    assert_eq!(
-        one(&remember(&f, lives_in("Boston"))),
-        (asserted, "kept".to_owned())
-    );
+    let r = remember(&f, lives_in("Boston"));
+    let kept = one(&r, "Denver");
+    assert_eq!(kept["outcome"], "kept");
+    assert_eq!(kept["id"], asserted.as_str());
+    assert_eq!(kept["closed"], inferred.as_str());
+    assert!(kept.get("closed_others").is_none());
+    assert!(r.text.contains("kept (already known)"), "{}", r.text);
 }
 
 #[test]
-fn update_outcomes_round_trip() {
+fn update_outcomes() {
     let f = fixture();
-    let id = |out: &str| one(out).0.unwrap();
 
     // superseded
-    let a = id(&remember(&f, statement("User prefers tea")));
+    let a = id(&one(&remember(&f, statement("User prefers tea")), "tea"));
     f.clock.advance(DAY_MS);
-    let out = update(
+    let r = update(
         &f,
         json!({"fact": a, "reason": "changed", "text": "User prefers coffee"}),
     );
-    let (outcome, new) = parse_update(&out);
-    assert_eq!(outcome, "superseded", "{out}");
-    let b = new.unwrap();
+    assert_eq!(r.structured["space"], "tessar");
+    let sup = one(&r, "coffee");
+    assert_eq!(sup["outcome"], "superseded");
+    assert_eq!(sup["previous"], a.as_str());
+    let b = id(&sup);
     assert_ne!(b, a);
 
     // unchanged
-    let out = update(
+    let r = update(
         &f,
         json!({"fact": b, "reason": "changed", "text": "User prefers coffee"}),
     );
-    assert_eq!(parse_update(&out), ("unchanged".to_owned(), None), "{out}");
+    let un = one(&r, "coffee");
+    assert_eq!(
+        (un["outcome"].as_str(), un["id"].as_str()),
+        (Some("unchanged"), Some(b.as_str()))
+    );
 
     // closed
-    let out = update(&f, json!({"fact": b, "reason": "changed"}));
-    assert_eq!(parse_update(&out), ("closed".to_owned(), None), "{out}");
+    let r = update(&f, json!({"fact": b, "reason": "changed"}));
+    let closed = one(&r, "coffee");
+    assert_eq!(
+        (closed["outcome"].as_str(), closed["id"].as_str()),
+        (Some("closed"), Some(b.as_str()))
+    );
 
-    // corrected, with and without a replacement
-    let c = id(&remember(&f, statement("User owns a cat")));
-    let out = update(&f, json!({"fact": c, "reason": "wrong"}));
-    assert_eq!(parse_update(&out), ("corrected".to_owned(), None), "{out}");
-    let d = id(&remember(&f, statement("User owns a dog")));
-    let out = update(
+    // corrected, without and with a replacement
+    let c = id(&one(&remember(&f, statement("User owns a cat")), "cat"));
+    let corrected = one(&update(&f, json!({"fact": c, "reason": "wrong"})), "cat");
+    assert_eq!(corrected["outcome"], "corrected");
+    assert_eq!(corrected["id"], c.as_str());
+    assert!(corrected.get("previous").is_none());
+    let d = id(&one(&remember(&f, statement("User owns a dog")), "dog"));
+    let r = update(
         &f,
         json!({"fact": d, "reason": "wrong", "text": "User owns a fish"}),
     );
-    let (outcome, new) = parse_update(&out);
-    assert_eq!(outcome, "corrected", "{out}");
-    assert!(new.is_some_and(|h| h != d), "{out}");
+    let fixed = one(&r, "fish");
+    assert_eq!(fixed["outcome"], "corrected");
+    assert_eq!(fixed["previous"], d.as_str());
+    assert_ne!(fixed["id"], d.as_str());
+    assert!(r.text.contains(&id(&fixed)));
 
     // redacted
-    let e = id(&remember(&f, statement("The token is hunter2")));
-    let out = update(&f, json!({"fact": e, "reason": "redact"}));
-    assert_eq!(parse_update(&out), ("redacted".to_owned(), None), "{out}");
+    let e = id(&one(
+        &remember(&f, statement("The token is hunter2")),
+        "hunter2",
+    ));
+    let r = update(&f, json!({"fact": e, "reason": "redact"}));
+    let red = one(&r, "hunter2");
+    assert_eq!(
+        (red["outcome"].as_str(), red["id"].as_str()),
+        (Some("redacted"), Some(e.as_str()))
+    );
+    assert_eq!(r.structured["space"], "tessar");
+}
+
+#[test]
+fn outcome_words_are_stable() {
+    // The enum is the only place the words live; the reports use `word()`.
+    let words: Vec<&str> = WriteOutcome::ALL.iter().map(|o| o.word()).collect();
+    assert_eq!(
+        words,
+        [
+            "created",
+            "conflicting",
+            "unchanged",
+            "kept",
+            "closed",
+            "superseded",
+            "corrected",
+            "redacted"
+        ]
+    );
 }

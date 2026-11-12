@@ -10,11 +10,10 @@
 //! ([`decisions::append`]), so a daemon that outlives `tessar purge` writes
 //! to the new file. Fact texts are never recorded.
 //!
-//! Handles and outcomes of `remember`, `lesson` and `update` are read back
-//! from the report text, whose shape the tests pin down; a report that is
-//! not recognised is recorded with the outcome `unparsed` and no handle.
-//! The robust source would be structured content on those two tools (handle
-//! and outcome per fact), a public result change that is not made here.
+//! Handles and outcomes of `remember`, `lesson` and `update` come from the
+//! [`Written`] those tools hand over ([`take_written`]), never from the
+//! report text. A successful call without it (a result of another
+//! shape) is recorded with the outcome `unknown` and no handle.
 //!
 //! Free-form arguments are cut to [`MAX_ARG_CHARS`] and error texts lose the
 //! content of every quoted span, since serde errors echo the offending value.
@@ -27,6 +26,8 @@ use std::path::{Path, PathBuf};
 
 use rmcp::model::{CallToolResponse, CallToolResult, JsonObject};
 use serde_json::Value;
+
+use crate::written::{WriteOutcome, Written, WrittenFact};
 
 use crate::decisions::{
     self, MAX_ERROR_CHARS, MAX_MESSAGE_CHARS, ToolDetail, ToolEntity, ToolFact, ToolHit, ToolRecord,
@@ -107,8 +108,9 @@ impl ToolLog {
         args: Option<&JsonObject>,
         elapsed: std::time::Duration,
         outcome: &Result<CallToolResponse, rmcp::ErrorData>,
+        written: Option<&Written>,
     ) {
-        let record = self.build(project, tool, args, elapsed, outcome);
+        let record = self.build(project, tool, args, elapsed, outcome, written);
         let home = self.home.clone();
         // Not awaited: the result is on its way regardless of the disk.
         drop(tokio::task::spawn_blocking(move || {
@@ -123,6 +125,7 @@ impl ToolLog {
         args: Option<&JsonObject>,
         elapsed: std::time::Duration,
         outcome: &Result<CallToolResponse, rmcp::ErrorData>,
+        written: Option<&Written>,
     ) -> ToolRecord {
         let (failed, text, structured) = match outcome {
             Ok(CallToolResponse::Complete(result)) => (
@@ -138,7 +141,7 @@ impl ToolLog {
         let (space, detail) = if failed {
             (requested_space(tool, &args), failed_detail(tool, &args))
         } else {
-            describe(tool, &args, &text, structured)
+            describe(tool, &args, structured, written)
         };
         ToolRecord {
             ts: decisions::now(),
@@ -370,8 +373,8 @@ fn update_detail(args: &JsonObject, done: Option<(String, Option<String>)>) -> T
 fn describe(
     tool: &str,
     args: &JsonObject,
-    text: &str,
     structured: Option<&Value>,
+    written: Option<&Written>,
 ) -> (Option<String>, ToolDetail) {
     let space = requested_space(tool, args);
     let detail = match tool {
@@ -382,9 +385,9 @@ fn describe(
         ),
         "remember" | "lesson" => ToolDetail::Write {
             fact_count: fact_count(tool, args),
-            facts: parse_facts(text, fact_count(tool, args)),
+            facts: written_facts(written, fact_count(tool, args)),
         },
-        "update" => update_detail(args, Some(parse_update(text))),
+        "update" => update_detail(args, Some(written_update(written))),
         _ => ToolDetail::Plain {},
     };
     (space, detail)
@@ -414,178 +417,160 @@ fn hits_of(structured: Option<&Value>) -> Vec<ToolHit> {
         .collect()
 }
 
-/// The leading run of ASCII letters of `s`.
-fn first_word(s: &str) -> &str {
-    let end = s
-        .find(|c: char| !c.is_ascii_alphabetic())
-        .unwrap_or(s.len());
-    &s[..end]
+/// Whether `tool` hands over a [`Written`].
+fn is_write_tool(tool: &str) -> bool {
+    matches!(tool, "remember" | "lesson" | "update")
 }
 
-/// `f12` at the start of `s`, when a space or the end follows it.
-fn handle_at(s: &str) -> Option<String> {
-    let digits = s.strip_prefix('f')?;
-    let n = digits
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(digits.len());
-    let rest = &digits[n..];
-    (n > 0 && (rest.is_empty() || rest.starts_with(char::is_whitespace)))
-        .then(|| format!("f{}", &digits[..n]))
-}
-
-/// The first `fNN` that follows a `: ` in `s` and starts a fact line
-/// (`fNN [date] [space] ...`).
-fn handle_after_colon(s: &str) -> Option<String> {
-    s.match_indices(": f").find_map(|(i, _)| {
-        let tail = &s[i + 2..];
-        let handle = handle_at(tail)?;
-        tail[handle.len()..]
-            .trim_start()
-            .starts_with('[')
-            .then_some(handle)
-    })
-}
-
-/// The outcomes a `remember` report names, as its first word.
-const WRITE_OUTCOMES: [&str; 6] = [
-    "created",
-    "conflicting",
-    "unchanged",
-    "kept",
-    "closed",
-    "superseded",
-];
-
-/// The outcomes an `update` report names, as its first word.
-const UPDATE_OUTCOMES: [&str; 7] = [
-    "created",
-    "superseded",
-    "corrected",
-    "closed",
-    "unchanged",
-    "kept",
-    "redacted",
-];
-
-/// What a report line could not be read as.
-const UNPARSED: &str = "unparsed";
-
-/// The facts of a `remember` or `lesson` report, lines
-/// `N. outcome: fNN [date] ...`, for a call of `expected` facts. A line that
-/// is not recognised, or a missing one, becomes outcome `unparsed` with no
-/// handle.
-pub fn parse_facts(text: &str, expected: usize) -> Vec<ToolFact> {
-    let unparsed = || ToolFact {
-        id: None,
-        outcome: Some(UNPARSED.to_owned()),
+/// Takes the [`Written`] out of the result of a write tool, so that the
+/// client receives the text report alone: a client shows structured content
+/// instead of the text when both are present. Other tools, failures and
+/// results of another shape are left as they are.
+pub fn take_written(
+    tool: &str,
+    outcome: &mut Result<CallToolResponse, rmcp::ErrorData>,
+) -> Option<Written> {
+    if !is_write_tool(tool) {
+        return None;
+    }
+    let Ok(CallToolResponse::Complete(result)) = outcome else {
+        return None;
     };
-    let mut facts = Vec::new();
-    for n in 1..=expected {
-        let prefix = format!("{n}. ");
-        let fact = text
-            .lines()
-            .find_map(|l| l.strip_prefix(&prefix))
-            .and_then(|rest| {
-                let outcome = first_word(rest);
-                WRITE_OUTCOMES.contains(&outcome).then(|| ToolFact {
-                    id: handle_after_colon(rest),
-                    outcome: Some(outcome.to_owned()),
-                })
-            });
-        facts.push(fact.unwrap_or_else(unparsed));
-    }
-    facts
+    serde_json::from_value(result.structured_content.take()?).ok()
 }
 
-/// The outcome of an `update` report and the version it created, if any;
-/// `unparsed` when the report is not recognised.
-pub fn parse_update(text: &str) -> (String, Option<String>) {
-    let word = first_word(text);
-    let unparsed = || (UNPARSED.to_owned(), None);
-    if !UPDATE_OUTCOMES.contains(&word) || !text[word.len()..].starts_with(':') {
-        return unparsed();
+/// What a call without a [`Written`] is recorded as.
+const UNKNOWN: &str = "unknown";
+
+/// The facts of a `remember` or `lesson` result, for a call of `expected`
+/// facts. Without a [`Written`] each fact is `unknown`.
+fn written_facts(written: Option<&Written>, expected: usize) -> Vec<ToolFact> {
+    match written {
+        Some(w) => w.facts.iter().map(tool_fact).collect(),
+        None => (0..expected).map(|_| unknown_fact()).collect(),
     }
-    match word {
-        "superseded" | "created" => text[word.len()..]
-            .strip_prefix(": ")
-            .and_then(handle_at)
-            .map_or_else(unparsed, |h| (word.to_owned(), Some(h))),
-        "corrected" => (
-            word.to_owned(),
-            text.split_once("Replaced by: ")
-                .and_then(|(_, tail)| handle_at(tail)),
-        ),
-        _ => (word.to_owned(), None),
+}
+
+fn tool_fact(fact: &WrittenFact) -> ToolFact {
+    ToolFact {
+        id: fact.id.clone(),
+        outcome: Some(fact.outcome.word().to_owned()),
+        previous: fact.previous.clone(),
+        closed: fact.closed.clone(),
+        closed_others: fact.closed_others,
+        conflicts_with: fact.conflicts_with.clone(),
     }
+}
+
+fn unknown_fact() -> ToolFact {
+    ToolFact {
+        id: None,
+        outcome: Some(UNKNOWN.to_owned()),
+        previous: None,
+        closed: None,
+        closed_others: None,
+        conflicts_with: None,
+    }
+}
+
+/// The outcome of an `update` result and the version it created, if any.
+fn written_update(written: Option<&Written>) -> (String, Option<String>) {
+    let Some(fact) = written.and_then(|w| w.facts.first()) else {
+        return (UNKNOWN.to_owned(), None);
+    };
+    // A new version came out when the call replaced one or created a fact.
+    let wrote = fact.previous.is_some() || fact.outcome == WriteOutcome::Created;
+    let new = wrote.then(|| fact.id.clone()).flatten();
+    (fact.outcome.word().to_owned(), new)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn remember_reports_are_read() {
-        let text = "Remembered 3 fact(s) in space `repo`:\n\
-            1. created: f12 [2026-11-08] [repo] The build uses cmake\n\
-            2. superseded (was: Berlin, recorded 2026-11-01): f13 [2026-11-08] [user] User lives in Paris [current; earlier: Berlin (2026-11-01)]\n\
-            3. unchanged (already known): f7 [2026-11-02] [repo] Same text";
-        let got: Vec<_> = parse_facts(text, 3)
-            .iter()
-            .map(|f| (f.id.clone().unwrap(), f.outcome.clone().unwrap()))
-            .collect();
-        assert_eq!(
-            got,
-            [
-                ("f12".to_owned(), "created".to_owned()),
-                ("f13".to_owned(), "superseded".to_owned()),
-                ("f7".to_owned(), "unchanged".to_owned())
-            ]
-        );
+    fn kept() -> Written {
+        Written {
+            space: "repo".into(),
+            facts: vec![
+                WrittenFact::new(Some("f12".into()), WriteOutcome::Created),
+                WrittenFact {
+                    previous: Some("f2".into()),
+                    ..WrittenFact::new(Some("f13".into()), WriteOutcome::Superseded)
+                },
+                WrittenFact {
+                    closed: Some("f3".into()),
+                    closed_others: Some(2),
+                    ..WrittenFact::new(Some("f7".into()), WriteOutcome::Kept)
+                },
+            ],
+        }
     }
 
     #[test]
-    fn outcomes_the_mcp_tools_cannot_reach_are_read_too() {
-        let line = |verb: &str| {
-            parse_facts(
-                &format!("Remembered 1 fact(s):\n1. {verb}: f5 [2026-11-08] [repo] x"),
-                1,
-            )
+    fn write_results_are_read_from_the_written_value() {
+        let got = written_facts(Some(&kept()), 3);
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0].id.as_deref(), Some("f12"));
+        assert_eq!(got[1].previous.as_deref(), Some("f2"));
+        assert_eq!(got[2].outcome.as_deref(), Some("kept"));
+        assert_eq!(got[2].closed.as_deref(), Some("f3"));
+        assert_eq!(got[2].closed_others, Some(2));
+    }
+
+    #[test]
+    fn a_result_without_a_written_value_is_unknown() {
+        let facts = written_facts(None, 2);
+        assert_eq!(facts.len(), 2);
+        assert!(facts.iter().all(|f| f.id.is_none()));
+        assert!(
+            facts
+                .iter()
+                .all(|f| f.outcome.as_deref() == Some("unknown"))
+        );
+        assert_eq!(written_update(None), ("unknown".to_owned(), None));
+    }
+
+    #[test]
+    fn an_update_names_the_version_it_wrote() {
+        let one = |fact: WrittenFact| {
+            written_update(Some(&Written {
+                space: "repo".into(),
+                facts: vec![fact],
+            }))
         };
-        for verb in ["conflicting", "closed", "kept (already known)"] {
-            let f = &line(verb)[0];
-            assert_eq!(f.id.as_deref(), Some("f5"), "{verb}");
-            assert_eq!(f.outcome.as_deref(), Some(first_word(verb)), "{verb}");
-        }
-        assert_eq!(
-            parse_update("created: f9 [2026-11-08] [repo] x"),
-            ("created".to_owned(), Some("f9".to_owned()))
-        );
+        let sup = WrittenFact {
+            previous: Some("f4".into()),
+            ..WrittenFact::new(Some("f9".into()), WriteOutcome::Superseded)
+        };
+        assert_eq!(one(sup), ("superseded".to_owned(), Some("f9".to_owned())));
+        let created = WrittenFact::new(Some("f9".into()), WriteOutcome::Created);
+        assert_eq!(one(created), ("created".to_owned(), Some("f9".to_owned())));
+        let closed = WrittenFact::new(Some("f4".into()), WriteOutcome::Closed);
+        assert_eq!(one(closed), ("closed".to_owned(), None));
     }
 
     #[test]
-    fn reports_that_are_not_recognised_are_unparsed() {
-        for text in [
-            "",
-            "Remembered 1 fact(s):\n1. frobnicated: f1 [d] [s] x",
-            "Nothing",
-        ] {
-            let facts = parse_facts(text, 1);
-            assert_eq!(facts.len(), 1);
-            assert_eq!(facts[0].outcome.as_deref(), Some("unparsed"));
-            assert!(facts[0].id.is_none());
-        }
-        // Fewer lines than facts: the missing one is unparsed.
-        let two = parse_facts("1. created: f1 [d] [s] x", 2);
-        assert_eq!(two[0].outcome.as_deref(), Some("created"));
-        assert_eq!(two[1].outcome.as_deref(), Some("unparsed"));
-        assert_eq!(
-            parse_update("something new: f1"),
-            ("unparsed".to_owned(), None)
-        );
-        assert_eq!(
-            parse_update("superseded: nothing"),
-            ("unparsed".to_owned(), None)
-        );
+    fn taking_the_written_value_leaves_the_text_alone() {
+        let result = CallToolResult::success(vec![rmcp::model::ContentBlock::text("done")]);
+        let mut result = result;
+        result.structured_content = Some(kept().to_value());
+        let mut outcome = Ok(CallToolResponse::Complete(result));
+        assert_eq!(take_written("remember", &mut outcome), Some(kept()));
+        let Ok(CallToolResponse::Complete(result)) = &outcome else {
+            panic!("not complete");
+        };
+        assert!(result.structured_content.is_none());
+        assert_eq!(result_text(result), "done");
+
+        // Other tools keep theirs.
+        let mut hits = CallToolResult::success(vec![rmcp::model::ContentBlock::text("x")]);
+        hits.structured_content = Some(serde_json::json!({"hits": []}));
+        let mut outcome = Ok(CallToolResponse::Complete(hits));
+        assert!(take_written("recall", &mut outcome).is_none());
+        let Ok(CallToolResponse::Complete(result)) = &outcome else {
+            panic!("not complete");
+        };
+        assert!(result.structured_content.is_some());
     }
 
     #[test]

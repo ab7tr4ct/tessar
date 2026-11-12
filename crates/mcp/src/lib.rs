@@ -44,6 +44,7 @@ pub mod purge;
 pub mod server;
 pub mod tool_log;
 pub mod when;
+pub mod written;
 
 /// Identifies this build: the crate version, the commit it was built from
 /// and the unix time of the build. A daemon and a proxy with different ids

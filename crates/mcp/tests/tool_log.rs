@@ -631,3 +631,133 @@ fn text(result: &CallToolResult) -> String {
         .unwrap_or_default()
         .to_owned()
 }
+
+/// The first handle (`fNN`) in a report line `N. verb: fNN [...`.
+fn handle_of_line(report: &str, n: usize) -> String {
+    let line = report
+        .lines()
+        .find(|l| l.starts_with(&format!("{n}. ")))
+        .unwrap();
+    let rest = &line[line.find(": f").unwrap() + 2..];
+    rest.split(' ').next().unwrap().to_owned()
+}
+
+#[tokio::test]
+async fn write_tools_return_text_only_and_the_log_gets_the_structure() {
+    let home = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(home.path(), Some(home.path()));
+    let client = session(home.path(), "alpha", Some("sess-w")).await;
+
+    let r = call(
+        &client,
+        "remember",
+        json!({"facts": [
+            {"kind": "statement", "text": "The zebra ledger uses sqlite"},
+            {"kind": "statement", "text": "The zebra ledger has no cache"}]}),
+    )
+    .await;
+    assert!(r.structured_content.is_none());
+    let report = text(&r);
+    assert!(
+        report.starts_with("Remembered 2 fact(s) in space `alpha`:"),
+        "{report}"
+    );
+    let (first, second) = (handle_of_line(&report, 1), handle_of_line(&report, 2));
+
+    let attr = |city: &str| {
+        json!({"space": "user", "facts": [{
+            "kind": "attribute", "subject": {"key": "user", "kind": "person"},
+            "predicate": "lives_in", "value": city, "text": format!("User lives in {city}")}]})
+    };
+    let boston = call(&client, "remember", attr("Boston")).await;
+    assert!(boston.structured_content.is_none());
+    let boston_id = handle_of_line(&text(&boston), 1);
+    let denver = call(&client, "remember", attr("Denver")).await;
+    assert!(denver.structured_content.is_none());
+    assert!(
+        text(&denver).contains("1. superseded (was: Boston"),
+        "{}",
+        text(&denver)
+    );
+    let denver_id = handle_of_line(&text(&denver), 1);
+
+    let failed = call(&client, "remember", json!({"facts": []})).await;
+    assert_eq!(failed.is_error, Some(true));
+    assert!(failed.structured_content.is_none());
+
+    let u = call(
+        &client,
+        "update",
+        json!({"fact": first, "reason": "changed", "text": "The zebra ledger uses postgres"}),
+    )
+    .await;
+    assert!(u.structured_content.is_none());
+    assert!(text(&u).starts_with("superseded: f"), "{}", text(&u));
+    let new_handle = text(&u)["superseded: ".len()..]
+        .split(' ')
+        .next()
+        .unwrap()
+        .to_owned();
+
+    let l = call(
+        &client,
+        "lesson",
+        json!({"text": "Before blaming the cache, read the log"}),
+    )
+    .await;
+    assert!(l.structured_content.is_none());
+    assert!(text(&l).starts_with("Remembered 1 fact(s)"), "{}", text(&l));
+
+    // recall keeps its structured hits.
+    let recalled = call(&client, "recall", json!({"query": "zebra ledger"})).await;
+    assert!(recalled.structured_content.unwrap()["hits"].is_array());
+
+    // The log has handles, outcomes and the related handles.
+    let records = parse(&lines(home.path(), 7).await);
+    let writes: Vec<&Value> = records
+        .iter()
+        .filter(|r| r["tool"] == "remember" && r["failed"] == false)
+        .collect();
+    // Records are written by independent tasks: find each by its content.
+    let with_id = |id: &str| {
+        writes
+            .iter()
+            .find(|w| w["facts"].as_array().unwrap().iter().any(|f| f["id"] == id))
+            .unwrap_or_else(|| panic!("no remember record for {id}"))
+    };
+    let pair = with_id(&first);
+    assert_eq!(pair["facts"][0]["id"], first.as_str());
+    assert_eq!(pair["facts"][1]["id"], second.as_str());
+    assert_eq!(with_id(&boston_id)["facts"][0]["outcome"], "created");
+    let superseding = with_id(&denver_id);
+    assert_eq!(superseding["facts"][0]["outcome"], "superseded");
+    assert_eq!(superseding["facts"][0]["previous"], boston_id.as_str());
+    let update = only(&records, "update");
+    assert_eq!(update["outcome"], "superseded");
+    assert_eq!(update["new_handle"], new_handle.as_str());
+    let lesson = only(&records, "lesson");
+    assert_eq!(lesson["facts"][0]["outcome"], "created");
+    // The recall query is logged by design; the write records hold no text.
+    let written: Vec<&Value> = records.iter().filter(|r| r["tool"] != "recall").collect();
+    assert!(!serde_json::to_string(&written).unwrap().contains("zebra"));
+
+    drop(client);
+    daemon.shutdown().await;
+}
+
+#[tokio::test]
+async fn write_tools_return_text_only_without_a_log_too() {
+    let home = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(home.path(), None);
+    let client = session(home.path(), "alpha", None).await;
+    let r = call(
+        &client,
+        "remember",
+        json!({"facts": [{"kind": "statement", "text": "The zebra ledger uses sqlite"}]}),
+    )
+    .await;
+    assert!(r.structured_content.is_none());
+    assert!(text(&r).starts_with("Remembered 1 fact(s)"));
+    drop(client);
+    daemon.shutdown().await;
+}

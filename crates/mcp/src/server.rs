@@ -15,7 +15,7 @@ use rmcp::{ErrorData, RoleServer, ServerHandler, tool, tool_handler, tool_router
 
 use crate::api::{Rendered, Tessar};
 use crate::args::{AboutArgs, LessonArgs, RecallArgs, RememberArgs, UpdateArgs};
-use crate::tool_log::ToolLog;
+use crate::tool_log::{ToolLog, take_written};
 
 const INSTRUCTIONS: &str = "\
 tessar is the user's long-term memory, shared across conversations and projects. \
@@ -159,7 +159,7 @@ impl TessarServer {
         self
     }
 
-    /// The text of `rendered` with its hits next to it as structured content.
+    /// The text of `rendered` with its data next to it as structured content.
     fn structured(rendered: Rendered) -> CallToolResult {
         let mut result = CallToolResult::success(vec![ContentBlock::text(rendered.text)]);
         result.structured_content = Some(rendered.structured);
@@ -183,13 +183,23 @@ impl TessarServer {
 #[tool_router]
 impl TessarServer {
     #[tool(description = REMEMBER_HEAD)]
-    async fn remember(&self, Parameters(args): Parameters<RememberArgs>) -> Result<String, String> {
-        self.blocking(move |api| api.remember(args)).await
+    async fn remember(
+        &self,
+        Parameters(args): Parameters<RememberArgs>,
+    ) -> Result<CallToolResult, String> {
+        self.blocking(move |api| api.remember_rendered(args))
+            .await
+            .map(Self::structured)
     }
 
     #[tool(description = LESSON)]
-    async fn lesson(&self, Parameters(args): Parameters<LessonArgs>) -> Result<String, String> {
-        self.blocking(move |api| api.lesson(args)).await
+    async fn lesson(
+        &self,
+        Parameters(args): Parameters<LessonArgs>,
+    ) -> Result<CallToolResult, String> {
+        self.blocking(move |api| api.lesson_rendered(args))
+            .await
+            .map(Self::structured)
     }
 
     #[tool(description = RECALL)]
@@ -208,8 +218,13 @@ impl TessarServer {
     }
 
     #[tool(description = UPDATE)]
-    async fn update(&self, Parameters(args): Parameters<UpdateArgs>) -> Result<String, String> {
-        self.blocking(move |api| api.update(args)).await
+    async fn update(
+        &self,
+        Parameters(args): Parameters<UpdateArgs>,
+    ) -> Result<CallToolResult, String> {
+        self.blocking(move |api| api.update_rendered(args))
+            .await
+            .map(Self::structured)
     }
 
     #[tool(description = ABOUT)]
@@ -226,22 +241,17 @@ impl TessarServer {
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for TessarServer {
     /// What the generated handler does, plus a record in the decision log
-    /// once the result is there. The record is written off this path (see
-    /// [`crate::tool_log`]) and never changes the result.
+    /// once the result is there, and the result as `main` gives it: the write
+    /// tools' structured content goes to the log only. The record is written off this path (see
+    /// [`crate::tool_log`]) and never changes the text or an error.
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
-        let Some(log) = &self.log else {
-            return self
-                .tool_router
-                .call(ToolCallContext::new(self, request, context))
-                .await;
-        };
         let (name, args) = (request.name.clone(), request.arguments.clone());
         let started = std::time::Instant::now();
-        let outcome = self
+        let mut outcome = self
             .tool_router
             .call(ToolCallContext::new(self, request, context))
             .await;
@@ -251,13 +261,20 @@ impl ServerHandler for TessarServer {
         } else {
             "unknown"
         };
-        log.record(
-            self.api.project_name(),
-            logged,
-            args.as_ref(),
-            started.elapsed(),
-            &outcome,
-        );
+        // The write tools attach what they did as structured content for the
+        // log; it is taken out here, with or without a log, so that the
+        // client receives the text report alone.
+        let written = take_written(logged, &mut outcome);
+        if let Some(log) = &self.log {
+            log.record(
+                self.api.project_name(),
+                logged,
+                args.as_ref(),
+                started.elapsed(),
+                &outcome,
+                written.as_ref(),
+            );
+        }
         outcome
     }
 

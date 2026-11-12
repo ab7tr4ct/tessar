@@ -27,6 +27,7 @@ use crate::args::{
 };
 use crate::lesson;
 use crate::when::{Calendar, Tense};
+use crate::written::{WriteOutcome, Written, WrittenFact};
 
 /// The entity kinds defined in both spaces.
 pub const KINDS: [&str; 8] = [
@@ -49,15 +50,28 @@ const MAX_LIMIT: usize = 50;
 /// How a redacted fact reads.
 const REDACTED: &str = "[redacted]";
 
-/// A tool result: the text the agent reads, and the same hits as JSON
-/// (`{"hits": [...]}`) for programs such as the Claude Code hooks.
+/// A tool result: the text the agent reads, and the same data as JSON for
+/// programs such as the Claude Code hooks: `{"hits": [...]}` for `recall`
+/// and `about`, a [`Written`] for the write tools.
 #[derive(Debug, Clone)]
 pub struct Rendered {
     /// The text, as the tool has always returned it.
     pub text: String,
-    /// The hits: `id`, `space`, `recorded`, `text`, `kind`, `similarity`,
-    /// `channels` and `current` each.
+    /// The hits (`id`, `space`, `recorded`, `text`, `kind`, `similarity`,
+    /// `channels` and `current` each), or the written facts.
     pub structured: serde_json::Value,
+}
+
+/// The outcome word of a store outcome, as `remember` reports it.
+fn outcome_word(outcome: Outcome) -> WriteOutcome {
+    match outcome {
+        Outcome::Created => WriteOutcome::Created,
+        Outcome::Conflicting { .. } => WriteOutcome::Conflicting,
+        Outcome::Unchanged => WriteOutcome::Unchanged,
+        Outcome::Resolved { .. } => WriteOutcome::Kept,
+        Outcome::Closed => WriteOutcome::Closed,
+        Outcome::Superseded { .. } => WriteOutcome::Superseded,
+    }
 }
 
 /// The memory with its two spaces, ready to serve tools.
@@ -219,6 +233,11 @@ impl Tessar {
     /// The `lesson` tool: a statement written through [`Tessar::remember`],
     /// dated today and mentioning the `lessons` topic.
     pub fn lesson(&self, args: LessonArgs) -> Result<String, String> {
+        self.lesson_rendered(args).map(|r| r.text)
+    }
+
+    /// The `lesson` tool with the written fact as JSON too.
+    pub fn lesson_rendered(&self, args: LessonArgs) -> Result<Rendered, String> {
         let trimmed = args.text.trim();
         // An empty text goes on unchanged, so `remember` refuses it the way
         // it refuses an empty statement.
@@ -255,7 +274,7 @@ impl Tessar {
             }],
         };
         // Same checks and report as `remember`, which names itself in its errors.
-        self.remember(request)
+        self.remember_rendered(request)
             .map_err(|e| e.replace("`remember`", "`lesson`").replace("fact 1: ", ""))
     }
 
@@ -263,6 +282,11 @@ impl Tessar {
 
     /// The `remember` tool.
     pub fn remember(&self, args: RememberArgs) -> Result<String, String> {
+        self.remember_rendered(args).map(|r| r.text)
+    }
+
+    /// The `remember` tool with the written facts as JSON too.
+    pub fn remember_rendered(&self, args: RememberArgs) -> Result<Rendered, String> {
         let space = args.space.unwrap_or(Space::Project);
         if args.facts.is_empty() {
             return Err("`facts` is empty: nothing to remember".to_owned());
@@ -345,31 +369,50 @@ impl Tessar {
         })?;
 
         let now = self.clock.now();
+        let space_name = self.space_name(self.space_id(space));
         let mut out = format!(
-            "Remembered {} fact(s) in space `{}`:",
+            "Remembered {} fact(s) in space `{space_name}`:",
             done.facts.len(),
-            self.space_name(self.space_id(space))
         );
+        let mut written = Written {
+            space: space_name,
+            facts: Vec::with_capacity(done.facts.len()),
+        };
         for (i, recorded) in done.facts.iter().enumerate() {
             let line = self
                 .mem
                 .fact(recorded.fact)
                 .map_or_else(String::new, |f| self.line(&f, now, true, None));
+            let mut fact = WrittenFact::new(
+                Some(recorded.fact.to_string()),
+                outcome_word(recorded.outcome),
+            );
             let (verb, note) = match recorded.outcome {
-                Outcome::Created => ("created".to_owned(), String::new()),
-                Outcome::Conflicting { current } => (
-                    "conflicting".to_owned(),
-                    format!(
-                        " (an inferred value recorded beside the asserted current value {current}; it did not replace it)"
-                    ),
+                Outcome::Created => (fact.outcome.word().to_owned(), String::new()),
+                Outcome::Conflicting { current } => {
+                    fact.conflicts_with = Some(current.to_string());
+                    (
+                        fact.outcome.word().to_owned(),
+                        format!(
+                            " (an inferred value recorded beside the asserted current value {current}; it did not replace it)"
+                        ),
+                    )
+                }
+                Outcome::Unchanged => (
+                    format!("{} (already known)", fact.outcome.word()),
+                    String::new(),
                 ),
-                Outcome::Unchanged => ("unchanged (already known)".to_owned(), String::new()),
-                Outcome::Resolved { closed, others } => (
-                    "kept (already known)".to_owned(),
-                    self.resolved_note(closed, others),
-                ),
-                Outcome::Closed => ("closed".to_owned(), String::new()),
+                Outcome::Resolved { closed, others } => {
+                    fact.closed = Some(closed.to_string());
+                    fact.closed_others = (others > 0).then_some(others);
+                    (
+                        format!("{} (already known)", fact.outcome.word()),
+                        self.resolved_note(closed, others),
+                    )
+                }
+                Outcome::Closed => (fact.outcome.word().to_owned(), String::new()),
                 Outcome::Superseded { previous } => {
+                    fact.previous = Some(previous.to_string());
                     let was = self.mem.fact(previous).map_or_else(String::new, |p| {
                         format!(
                             " (was: {}, recorded {})",
@@ -377,12 +420,16 @@ impl Tessar {
                             self.calendar.ymd(p.recorded_at)
                         )
                     });
-                    (format!("superseded{was}"), String::new())
+                    (format!("{}{was}", fact.outcome.word()), String::new())
                 }
             };
+            written.facts.push(fact);
             let _ = write!(out, "\n{}. {verb}: {line}{note}", i + 1);
         }
-        Ok(out)
+        Ok(Rendered {
+            text: out,
+            structured: written.to_value(),
+        })
     }
 
     /// Checks one fact of the request and prepares it, or lists what is
@@ -943,6 +990,11 @@ impl Tessar {
 
     /// The `update` tool.
     pub fn update(&self, args: UpdateArgs) -> Result<String, String> {
+        self.update_rendered(args).map(|r| r.text)
+    }
+
+    /// The `update` tool with the outcome as JSON too.
+    pub fn update_rendered(&self, args: UpdateArgs) -> Result<Rendered, String> {
         let handle = args.fact.trim();
         let id = parse_handle(handle)
             .ok_or_else(|| format!("`fact` {handle:?} is not a handle: use the leading `fNN` of a line from `recall` or `about`, for example \"f12\""))?;
@@ -954,7 +1006,10 @@ impl Tessar {
                 .map(str::to_owned)
         };
         if args.reason == UpdateReason::Redact {
-            return self.redact(&fact, &args);
+            return self.redact(&fact, &args).map(|(text, written)| Rendered {
+                text,
+                structured: written.to_value(),
+            });
         }
         if fact.is_redacted() {
             return Err(format!(
@@ -1033,20 +1088,38 @@ impl Tessar {
                 .map_or_else(|| id.to_string(), |f| self.line(&f, now, true, None))
         };
         let wrong = args.reason == UpdateReason::Wrong;
-        Ok(match recorded.outcome {
-            Outcome::Superseded { previous } if wrong => format!(
-                "corrected: {previous} was never true. Replaced by: {}",
-                new_line(recorded.fact)
-            ),
+        let handle_of = FactId::to_string;
+        let mut done = WrittenFact::new(Some(id.to_string()), outcome_word(recorded.outcome));
+        let text = match recorded.outcome {
+            Outcome::Superseded { previous } if wrong => {
+                done.outcome = WriteOutcome::Corrected;
+                done.id = Some(handle_of(&recorded.fact));
+                done.previous = Some(handle_of(&previous));
+                format!(
+                    "{}: {previous} was never true. Replaced by: {}",
+                    done.outcome.word(),
+                    new_line(recorded.fact)
+                )
+            }
             Outcome::Superseded { previous } => {
+                done.id = Some(handle_of(&recorded.fact));
+                done.previous = Some(handle_of(&previous));
                 let until = self
                     .valid_to(previous)
                     .map_or_else(String::new, |d| format!(" ({previous} was true until {d})"));
-                format!("superseded: {}{until}", new_line(recorded.fact))
+                format!(
+                    "{}: {}{until}",
+                    done.outcome.word(),
+                    new_line(recorded.fact)
+                )
             }
-            Outcome::Closed if wrong => format!("corrected: {id} (was never true)"),
+            Outcome::Closed if wrong => {
+                done.outcome = WriteOutcome::Corrected;
+                format!("{}: {id} (was never true)", done.outcome.word())
+            }
             Outcome::Closed => format!(
-                "closed: {id} (true until {})",
+                "{}: {id} (true until {})",
+                done.outcome.word(),
                 self.valid_to(id).unwrap_or_else(|| self.calendar.ymd(now))
             ),
             Outcome::Unchanged => {
@@ -1055,25 +1128,43 @@ impl Tessar {
                 } else {
                     ""
                 };
-                format!("unchanged: {id} already says that; nothing was written.{hint}")
+                format!(
+                    "{}: {id} already says that; nothing was written.{hint}",
+                    done.outcome.word()
+                )
             }
             // Only a `remember` keeps a value and closes the others; said
             // in full all the same, should an update ever do it.
-            Outcome::Resolved { closed, others } => format!(
-                "kept: {id} already says that and stays current.{}",
-                self.resolved_note(closed, others)
-            ),
+            Outcome::Resolved { closed, others } => {
+                done.closed = Some(handle_of(&closed));
+                done.closed_others = (others > 0).then_some(others);
+                format!(
+                    "{}: {id} already says that and stays current.{}",
+                    done.outcome.word(),
+                    self.resolved_note(closed, others)
+                )
+            }
             // An update replaces or closes the head regardless of origin,
             // so a conflict cannot happen here; report it like a new fact.
             Outcome::Created | Outcome::Conflicting { .. } => {
-                format!("created: {}", new_line(recorded.fact))
+                done.outcome = WriteOutcome::Created;
+                done.id = Some(handle_of(&recorded.fact));
+                format!("{}: {}", done.outcome.word(), new_line(recorded.fact))
             }
+        };
+        let written = Written {
+            space: self.space_name(fact.space),
+            facts: vec![done],
+        };
+        Ok(Rendered {
+            text,
+            structured: written.to_value(),
         })
     }
 
     /// `update` with reason "redact": destroys the content of `fact`, a
     /// current or an earlier version alike.
-    fn redact(&self, fact: &Fact, args: &UpdateArgs) -> Result<String, String> {
+    fn redact(&self, fact: &Fact, args: &UpdateArgs) -> Result<(String, Written), String> {
         let given = [
             ("text", &args.text),
             ("value", &args.value),
@@ -1096,8 +1187,9 @@ impl Tessar {
             .redact(id)
             .map_err(|e| format!("Nothing was changed. {}", self.store_message(&e)))?;
         let mut out = format!(
-            "redacted: {id} (content removed from memory; run `tessar purge` to erase it from the \
-             journal file on disk)"
+            "{}: {id} (content removed from memory; run `tessar purge` to erase it from the \
+             journal file on disk)",
+            WriteOutcome::Redacted.word()
         );
         if let Some(episode) = fact.episode {
             let _ = write!(
@@ -1105,7 +1197,14 @@ impl Tessar {
                 ". The source text it was taken from ({episode}) is not removed by this call"
             );
         }
-        Ok(out)
+        let written = Written {
+            space: self.space_name(fact.space),
+            facts: vec![WrittenFact::new(
+                Some(id.to_string()),
+                WriteOutcome::Redacted,
+            )],
+        };
+        Ok((out, written))
     }
 
     /// The mentions of a replacement: the old ones, plus the entity the
