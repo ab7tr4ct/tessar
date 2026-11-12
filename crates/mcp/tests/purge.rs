@@ -183,3 +183,22 @@ fn purge_removes_the_decision_log() {
     assert!(!again.decision_log);
     assert!(!summary(&again, false).contains("decision log"));
 }
+
+#[test]
+fn purge_removes_the_hooks_stash() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(journal_path(home.path()), "").unwrap();
+    tessar_mcp::stash::put(home.path(), "s1", "scout", "a redacted fact").unwrap();
+    tessar_mcp::stash::put(home.path(), "s1", "scout", "").unwrap();
+    let hooks = home.path().join("hooks");
+    std::fs::write(hooks.join(".tmp.00000000000000000001.1-1"), "x").unwrap();
+    std::fs::write(hooks.join("s1.shown"), "f1\n").unwrap();
+    let done = purge_home(home.path()).unwrap();
+    assert_eq!(done.stash_files, 3);
+    assert!(summary(&done, false).contains("stash files removed: 3"));
+    let left: Vec<String> = std::fs::read_dir(&hooks)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(left, ["s1.shown"]);
+}

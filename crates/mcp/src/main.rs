@@ -75,9 +75,11 @@ USAGE:
     tessar purge [--home DIR]  erase redacted content from the journal file and
                                drop the vector cache. Stops the daemon first;
                                the next session starts it again
-    tessar hook prompt|session [--home DIR]
+    tessar hook prompt|session|agent|subagent [--home DIR]
                                Claude Code hooks: read the hook JSON on stdin,
-                               print context for the model on stdout
+                               print context for the model on stdout. `agent`
+                               (PreToolUse on Agent) prints nothing: it leaves
+                               the memory for `subagent` (SubagentStart)
     tessar hook config         print the hooks snippet for ~/.claude/settings.json
     tessar --version           print the build id
     tessar --help              show this text
@@ -231,6 +233,8 @@ enum Cli {
 enum HookKind {
     Prompt,
     Session,
+    Agent,
+    Subagent,
     Config,
 }
 
@@ -469,8 +473,14 @@ fn parse_hook(
     let kind = match args.first().map(String::as_str) {
         Some("prompt") => HookKind::Prompt,
         Some("session") => HookKind::Session,
+        Some("agent") => HookKind::Agent,
+        Some("subagent") => HookKind::Subagent,
         Some("config") => HookKind::Config,
-        _ => return Err(format!("`hook` wants prompt, session or config\n\n{USAGE}")),
+        _ => {
+            return Err(format!(
+                "`hook` wants prompt, session, agent, subagent or config\n\n{USAGE}"
+            ));
+        }
     };
     let mut home = None;
     let mut it = args[1..].iter();
@@ -1103,18 +1113,24 @@ fn run_hook(home: &Path, kind: HookKind) -> ExitCode {
     }
     tessar_mcp::tool_log::set_client_role("hook");
     let settings = hook::Settings::from_env(|name| std::env::var(name).ok());
-    let run = runtime().map(|rt| {
-        let run = rt.block_on(async {
-            match kind {
-                HookKind::Prompt => hook::run_prompt(home, &stdin, &settings).await,
-                _ => hook::run_session(home, &stdin, &settings).await,
-            }
-        });
-        // Do not wait for work the time limit left behind (a `git` that
-        // hangs): the process is about to exit.
-        rt.shutdown_background();
-        run
-    });
+    let run = if kind == HookKind::Subagent {
+        // Only the stash: no daemon, no runtime.
+        Ok(hook::run_subagent(home, &stdin))
+    } else {
+        runtime().map(|rt| {
+            let run = rt.block_on(async {
+                match kind {
+                    HookKind::Prompt => hook::run_prompt(home, &stdin, &settings).await,
+                    HookKind::Agent => hook::run_agent(home, &stdin, &settings).await,
+                    _ => hook::run_session(home, &stdin, &settings).await,
+                }
+            });
+            // Do not wait for work the time limit left behind (a `git` that
+            // hangs): the process is about to exit.
+            rt.shutdown_background();
+            run
+        })
+    };
     match run {
         // The output goes out first; the decision log is written after it.
         Ok(run) => run.finish(home, |text| {
@@ -1422,6 +1438,20 @@ mod tests {
             p(&["hook", "config"], &[]).unwrap(),
             Cli::Hook {
                 kind: HookKind::Config,
+                ..
+            }
+        ));
+        assert!(matches!(
+            p(&["hook", "agent"], &[("HOME", "/u")]).unwrap(),
+            Cli::Hook {
+                kind: HookKind::Agent,
+                ..
+            }
+        ));
+        assert!(matches!(
+            p(&["hook", "subagent"], &[("HOME", "/u")]).unwrap(),
+            Cli::Hook {
+                kind: HookKind::Subagent,
                 ..
             }
         ));

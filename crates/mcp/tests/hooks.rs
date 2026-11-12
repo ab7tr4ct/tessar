@@ -1097,3 +1097,529 @@ async fn a_memory_of_only_lessons_is_not_called_empty() {
     );
     daemon.shutdown().await;
 }
+
+// ---- memory for subagents: the `agent` and `subagent` hooks ---------------
+
+const LANGUAGE_BRIEF: &str = "in which language should the user be talked to";
+
+fn agent_stdin(session: &str, brief: &str, name: Option<&str>, kind: &str) -> String {
+    let mut tool_input = json!({"prompt": brief, "description": "d", "subagent_type": kind});
+    if let Some(name) = name {
+        tool_input["name"] = json!(name);
+    }
+    json!({"session_id": session, "cwd": "/work/x", "hook_event_name": "PreToolUse",
+        "tool_name": "Agent", "tool_use_id": "t1", "tool_input": tool_input})
+    .to_string()
+}
+
+fn subagent_stdin(session: &str, agent_type: &str) -> String {
+    json!({"session_id": session, "cwd": "/work/x", "hook_event_name": "SubagentStart",
+        "agent_id": "a1", "agent_type": agent_type})
+    .to_string()
+}
+
+/// Runs the `agent` hook as the binary does; returns what it printed.
+async fn agent_logged(home: &Path, stdin: &str) -> String {
+    let run = hook::run_agent_recorded(
+        home,
+        stdin,
+        &Settings::default(),
+        Duration::from_secs(20),
+        &no_spawn(),
+    )
+    .await;
+    let mut printed = None;
+    run.finish(home, |text| printed = Some(text.to_owned()));
+    printed.expect("the output was printed")
+}
+
+/// Runs the `subagent` hook the same way.
+fn subagent_logged(home: &Path, stdin: &str) -> String {
+    let mut printed = None;
+    hook::run_subagent(home, stdin).finish(home, |text| printed = Some(text.to_owned()));
+    printed.expect("the output was printed")
+}
+
+fn stash_files(home: &Path) -> Vec<String> {
+    std::fs::read_dir(home.join("hooks"))
+        .map(|r| {
+            r.flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.starts_with("stash."))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn delivered(printed: &str) -> String {
+    let v: Value = serde_json::from_str(printed).expect("valid JSON");
+    assert_eq!(v["hookSpecificOutput"]["hookEventName"], "SubagentStart");
+    v["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+#[tokio::test]
+async fn the_agent_hook_stashes_what_the_subagent_hook_delivers_once() {
+    use std::os::unix::fs::PermissionsExt;
+    let (home, daemon, _hook) = with_memory().await;
+    let printed = agent_logged(
+        home.path(),
+        &agent_stdin("s1", LANGUAGE_BRIEF, None, "Explore"),
+    )
+    .await;
+    assert_eq!(printed, "");
+    let files = stash_files(home.path());
+    assert_eq!(files.len(), 1, "{files:?}");
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&home.path().join("hooks")), 0o700);
+    assert_eq!(mode(&home.path().join("hooks").join(&files[0])), 0o600);
+
+    let printed = subagent_logged(home.path(), &subagent_stdin("s1", "Explore"));
+    let text = delivered(&printed);
+    assert!(
+        text.starts_with("Memory (tessar) relevant to this task; call `recall` for more:\n- ["),
+        "{text}"
+    );
+    assert!(
+        text.contains("User prefers to be talked to in Russian"),
+        "{text}"
+    );
+    assert!(!text.contains("JSON Lines"), "{text}");
+    assert!(text.chars().count() <= 1500);
+    assert!(stash_files(home.path()).is_empty(), "the entry is consumed");
+    // A resume or a later message gets nothing.
+    assert_eq!(
+        subagent_logged(home.path(), &subagent_stdin("s1", "Explore")),
+        ""
+    );
+    daemon.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_brief_that_matches_nothing_leaves_an_empty_entry_that_is_consumed_silently() {
+    let (home, daemon, _hook) = with_memory().await;
+    let printed = agent_logged(
+        home.path(),
+        &agent_stdin(
+            "s1",
+            "zebra quartz xylophone volcano nebula",
+            None,
+            "Explore",
+        ),
+    )
+    .await;
+    assert_eq!(printed, "");
+    assert_eq!(stash_files(home.path()).len(), 1, "a marker");
+    assert_eq!(
+        subagent_logged(home.path(), &subagent_stdin("s1", "Explore")),
+        ""
+    );
+    assert!(
+        stash_files(home.path()).is_empty(),
+        "the marker is consumed"
+    );
+    let recs = records(home.path());
+    assert_eq!(recs.len(), 2);
+    assert_eq!(recs[0]["kind"], "agent");
+    assert_eq!(
+        (recs[0]["stashed"].as_bool(), recs[0]["marker"].as_bool()),
+        (Some(false), Some(true))
+    );
+    assert_eq!(recs[1]["consumed"], true);
+    assert_eq!(recs[1]["delivered"], false);
+    // A brief too short to search leaves a marker too.
+    agent_logged(home.path(), &agent_stdin("s1", "ok", None, "Explore")).await;
+    assert_eq!(stash_files(home.path()).len(), 1);
+    assert_eq!(
+        records(home.path()).pop().unwrap()["skipped"],
+        "short_message"
+    );
+    daemon.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_orphan_does_not_shift_the_later_deliveries() {
+    let (home, daemon, _hook) = with_memory().await;
+    let h = home.path();
+    // A call whose agent never started leaves memory behind.
+    agent_logged(h, &agent_stdin("s1", LANGUAGE_BRIEF, None, "Explore")).await;
+    // The next call finds nothing; its start must not get the orphan's text.
+    agent_logged(
+        h,
+        &agent_stdin(
+            "s1",
+            "zebra quartz xylophone volcano nebula",
+            None,
+            "Explore",
+        ),
+    )
+    .await;
+    assert_eq!(subagent_logged(h, &subagent_stdin("s1", "Explore")), "");
+    // And the next pair is its own again.
+    agent_logged(
+        h,
+        &agent_stdin(
+            "s1",
+            "where does the user live and work from",
+            None,
+            "Explore",
+        ),
+    )
+    .await;
+    let text = delivered(&subagent_logged(h, &subagent_stdin("s1", "Explore")));
+    assert!(
+        text.lines().nth(1).is_some_and(|l| l.contains("Berlin")),
+        "{text}"
+    );
+    daemon.shutdown().await;
+}
+
+#[test]
+fn an_entry_lives_two_minutes() {
+    let home = tempfile::tempdir().unwrap();
+    let ago = |secs| std::time::SystemTime::now() - Duration::from_secs(secs);
+    tessar_mcp::stash::put_at(home.path(), "s1", "k", "fresh", ago(110)).unwrap();
+    assert_eq!(
+        delivered(&subagent_logged(home.path(), &subagent_stdin("s1", "k"))),
+        "fresh"
+    );
+    tessar_mcp::stash::put_at(home.path(), "s1", "k", "stale", ago(130)).unwrap();
+    assert_eq!(subagent_logged(home.path(), &subagent_stdin("s1", "k")), "");
+    assert!(stash_files(home.path()).is_empty());
+}
+
+#[tokio::test]
+async fn an_agent_call_without_name_or_type_is_keyed_general_purpose() {
+    let (home, daemon, _hook) = with_memory().await;
+    let stdin = json!({"session_id": "s1", "cwd": "/work/x", "tool_name": "Agent",
+        "tool_input": {"prompt": LANGUAGE_BRIEF}})
+    .to_string();
+    agent_logged(home.path(), &stdin).await;
+    assert_eq!(records(home.path())[0]["key"], "general-purpose");
+    let text = delivered(&subagent_logged(
+        home.path(),
+        &subagent_stdin("s1", "general-purpose"),
+    ));
+    assert!(text.contains("Russian"), "{text}");
+    daemon.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_failed_agent_run_prints_nothing_leaves_a_marker_and_is_logged() {
+    use std::sync::atomic::Ordering;
+    let home = tempfile::tempdir().unwrap();
+    let (spawn, calls) = counting_spawn();
+    let stdin = agent_stdin("s1", LANGUAGE_BRIEF, Some("scout"), "Explore");
+
+    // No daemon.
+    let run = hook::run_agent_recorded(
+        home.path(),
+        &stdin,
+        &Settings::default(),
+        Duration::from_secs(30),
+        &spawn,
+    )
+    .await;
+    let mut printed = None;
+    run.finish(home.path(), |t| printed = Some(t.to_owned()));
+    assert_eq!(printed, None, "a failed run prints nothing");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(stash_files(home.path()).len(), 1);
+    assert_eq!(
+        subagent_logged(home.path(), &subagent_stdin("s1", "scout")),
+        ""
+    );
+    assert!(stash_files(home.path()).is_empty());
+    let a = &records(home.path())[0];
+    assert_eq!(a["kind"], "agent");
+    assert!(a["error"].as_str().unwrap().contains("no daemon"), "{a}");
+    assert_eq!(
+        (a["stashed"].as_bool(), a["marker"].as_bool()),
+        (Some(false), Some(true))
+    );
+
+    // A daemon that does not answer in time.
+    let listener = UnixListener::bind(socket_path(home.path())).unwrap();
+    let silent = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
+        }
+    });
+    let started = std::time::Instant::now();
+    let run = hook::run_agent_recorded(
+        home.path(),
+        &stdin,
+        &Settings::default(),
+        Duration::from_millis(300),
+        &no_spawn(),
+    )
+    .await;
+    assert!(started.elapsed() < Duration::from_secs(3));
+    let mut printed = None;
+    run.finish(home.path(), |t| printed = Some(t.to_owned()));
+    assert_eq!(printed, None, "a failed run prints nothing");
+    assert_eq!(stash_files(home.path()).len(), 1);
+    let a = records(home.path()).pop().unwrap();
+    assert!(a["error"].as_str().unwrap().contains("no answer"), "{a}");
+    assert_eq!(a["marker"], true);
+    silent.abort();
+}
+
+#[tokio::test]
+async fn the_session_hook_removes_expired_stash_entries_after_its_output() {
+    let (home, daemon, hook) = with_memory().await;
+    let old = std::time::SystemTime::now() - Duration::from_secs(600);
+    // The stale one goes in last: a put sweeps the directory itself.
+    tessar_mcp::stash::put(home.path(), "other", "j", "fresh").unwrap();
+    tessar_mcp::stash::put_at(home.path(), "other", "k", "stale", old).unwrap();
+    let start = HookInput::parse(
+        &json!({"session_id": "s9", "cwd": "/work/x", "source": "startup"}).to_string(),
+    )
+    .unwrap();
+    let run = hook::session_recorded(
+        &hook.peer,
+        &start,
+        "alpha",
+        &Settings::default(),
+        home.path(),
+    )
+    .await
+    .unwrap();
+    let mut at_output = None;
+    run.finish(home.path(), |_| {
+        at_output = Some(stash_files(home.path()).len())
+    });
+    assert_eq!(at_output, Some(2), "nothing is swept before the output");
+    assert_eq!(stash_files(home.path()).len(), 1);
+    daemon.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_agent_hook_leaves_the_parents_no_repeat_state_alone() {
+    let (home, daemon, _hook) = with_memory().await;
+    let shown_file = home.path().join("hooks/s1.shown");
+    // The parent has seen the language fact; the agent hook must neither
+    // read that (the subagent has not) nor change it.
+    run_logged(
+        home.path(),
+        &stdin_for("s1", LANGUAGE_BRIEF),
+        &Settings::default(),
+    )
+    .await;
+    let before = std::fs::read_to_string(&shown_file).unwrap();
+    agent_logged(
+        home.path(),
+        &agent_stdin("s1", LANGUAGE_BRIEF, None, "Explore"),
+    )
+    .await;
+    let text = delivered(&subagent_logged(
+        home.path(),
+        &subagent_stdin("s1", "Explore"),
+    ));
+    assert!(
+        text.contains("Russian"),
+        "already shown to the parent: {text}"
+    );
+    assert_eq!(std::fs::read_to_string(&shown_file).unwrap(), before);
+
+    // And a fact stashed for a subagent still reaches the parent.
+    agent_logged(
+        home.path(),
+        &agent_stdin(
+            "s2",
+            "where does the user live and work from",
+            None,
+            "Explore",
+        ),
+    )
+    .await;
+    assert!(!home.path().join("hooks/s2.shown").exists());
+    let (out, _) = run_logged(
+        home.path(),
+        &stdin_for("s2", "where does the user live and work from"),
+        &Settings::default(),
+    )
+    .await;
+    assert!(out.contains("Berlin"), "{out}");
+    daemon.shutdown().await;
+}
+
+#[tokio::test]
+async fn entries_match_by_name_or_type_session_and_order() {
+    let (home, daemon, _hook) = with_memory().await;
+    let h = home.path();
+    let berlin = "where does the user live and work from";
+    // Two calls with the same name: a start takes the newest entry first.
+    agent_logged(
+        h,
+        &agent_stdin("s1", LANGUAGE_BRIEF, Some("scout"), "Explore"),
+    )
+    .await;
+    agent_logged(h, &agent_stdin("s1", berlin, Some("scout"), "Explore")).await;
+    assert_eq!(stash_files(h).len(), 2);
+    // A named agent is matched by name, not by type; another session gets
+    // nothing.
+    assert_eq!(subagent_logged(h, &subagent_stdin("s1", "Explore")), "");
+    assert_eq!(subagent_logged(h, &subagent_stdin("s2", "scout")), "");
+    assert_eq!(stash_files(h).len(), 2);
+    let first = delivered(&subagent_logged(h, &subagent_stdin("s1", "scout")));
+    assert!(first.contains("Berlin"), "{first}");
+    let second = delivered(&subagent_logged(h, &subagent_stdin("s1", "scout")));
+    assert!(second.contains("Russian"), "{second}");
+    assert_eq!(subagent_logged(h, &subagent_stdin("s1", "scout")), "");
+    // An unnamed agent is matched by its type.
+    agent_logged(h, &agent_stdin("s1", LANGUAGE_BRIEF, None, "Explore")).await;
+    assert_eq!(subagent_logged(h, &subagent_stdin("s1", "scout")), "");
+    assert!(subagent_logged(h, &subagent_stdin("s1", "Explore")).contains("Russian"));
+    daemon.shutdown().await;
+}
+
+#[test]
+fn the_subagent_hook_escapes_the_text_and_ignores_old_entries() {
+    let home = tempfile::tempdir().unwrap();
+    let text = "Memory:\n- \"quoted\" back\\slash, Привет, 日本語\n";
+    tessar_mcp::stash::put(home.path(), "s1", "k", text).unwrap();
+    let printed = subagent_logged(home.path(), &subagent_stdin("s1", "k"));
+    assert_eq!(delivered(&printed), text);
+    assert_eq!(printed.lines().count(), 1, "one line of JSON: {printed}");
+
+    let old = std::time::SystemTime::now() - Duration::from_secs(11 * 60);
+    tessar_mcp::stash::put_at(home.path(), "s1", "k", "stale", old).unwrap();
+    assert_eq!(stash_files(home.path()).len(), 1);
+    assert_eq!(subagent_logged(home.path(), &subagent_stdin("s1", "k")), "");
+    assert!(stash_files(home.path()).is_empty(), "the orphan is removed");
+}
+
+#[tokio::test]
+async fn both_hooks_are_logged() {
+    let (home, daemon, _hook) = with_memory().await;
+    agent_logged(
+        home.path(),
+        &agent_stdin("s1", LANGUAGE_BRIEF, Some("scout"), "Explore"),
+    )
+    .await;
+    subagent_logged(home.path(), &subagent_stdin("s1", "scout"));
+    subagent_logged(home.path(), &subagent_stdin("s1", "scout"));
+    let recs = records(home.path());
+    assert_eq!(recs.len(), 3);
+
+    let a = &recs[0];
+    assert_eq!(a["kind"], "agent");
+    assert_eq!(a["session"], "s1");
+    assert_eq!(a["key"], "scout");
+    assert_eq!(a["brief"], LANGUAGE_BRIEF);
+    assert_eq!(a["brief_chars"], LANGUAGE_BRIEF.chars().count());
+    assert_eq!(a["stashed"], true);
+    assert!(a["stashed_chars"].as_u64().unwrap() > 0);
+    assert_eq!(a["thresholds"]["budget"], 1500);
+    assert!(a["elapsed_ms"].is_u64() && a["project"].is_string());
+    assert!(
+        a["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["decision"] == "shown")
+    );
+
+    let d = &recs[1];
+    assert_eq!(d["kind"], "subagent");
+    assert_eq!(
+        (d["session"].as_str(), d["key"].as_str()),
+        (Some("s1"), Some("scout"))
+    );
+    assert_eq!(d["delivered"], true);
+    assert_eq!(d["chars"], a["stashed_chars"]);
+    assert!(d["age_ms"].is_u64());
+
+    let n = &recs[2];
+    assert_eq!(n["delivered"], false);
+    assert_eq!(n["chars"], 0);
+    assert!(n.get("age_ms").is_none());
+
+    // A long brief is cut.
+    let long = format!("{LANGUAGE_BRIEF} {}", "x ".repeat(2000));
+    agent_logged(home.path(), &agent_stdin("s1", &long, None, "Explore")).await;
+    let last = records(home.path()).pop().unwrap();
+    assert_eq!(last["brief"].as_str().unwrap().chars().count(), 2000);
+    assert_eq!(last["brief_chars"], long.chars().count());
+    daemon.shutdown().await;
+}
+
+/// The real binary: `hook subagent` prints the JSON and nothing else, `hook
+/// agent` prints nothing even when it fails, `hook config` has both entries
+/// and `--help` lists the subcommands.
+#[test]
+fn the_binaries_new_hooks_print_only_what_they_should() {
+    use std::io::Write;
+    let home = tempfile::tempdir().unwrap();
+    let run = |args: &[&str], stdin: &str| {
+        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_tessar"))
+            .args(args)
+            .arg("--home")
+            .arg(home.path())
+            .env("HOME", home.path())
+            .env("TESSAR_MODEL", home.path().join("no-such-model.gguf"))
+            .env_remove("TESSAR_HOME")
+            .current_dir(home.path())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(stdin.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    };
+    tessar_mcp::stash::put(home.path(), "s1", "scout", "from the stash\n").unwrap();
+    let out = run(&["hook", "subagent"], &subagent_stdin("s1", "scout"));
+    assert!(out.status.success());
+    assert_eq!(
+        delivered(&String::from_utf8_lossy(&out.stdout)),
+        "from the stash\n"
+    );
+    let out = run(&["hook", "subagent"], "not json");
+    assert!(out.status.success() && out.stdout.is_empty());
+
+    // No daemon: nothing printed, and only an empty entry is left.
+    let out = run(
+        &["hook", "agent"],
+        &agent_stdin("s1", LANGUAGE_BRIEF, Some("scout"), "Explore"),
+    );
+    assert!(out.status.success() && out.stdout.is_empty());
+    assert_eq!(stash_files(home.path()).len(), 1);
+    let out = run(&["hook", "subagent"], &subagent_stdin("s1", "scout"));
+    assert!(out.status.success() && out.stdout.is_empty());
+    assert!(stash_files(home.path()).is_empty());
+
+    let config = std::process::Command::new(env!("CARGO_BIN_EXE_tessar"))
+        .args(["hook", "config"])
+        .output()
+        .unwrap();
+    let v: Value = serde_json::from_slice(&config.stdout).unwrap();
+    assert_eq!(v["hooks"]["PreToolUse"][0]["matcher"], "Agent");
+    assert!(
+        v["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .ends_with(" hook agent")
+    );
+    assert!(
+        v["hooks"]["SubagentStart"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .ends_with(" hook subagent")
+    );
+    let help = std::process::Command::new(env!("CARGO_BIN_EXE_tessar"))
+        .arg("--help")
+        .output()
+        .unwrap();
+    let help = String::from_utf8_lossy(&help.stdout);
+    assert!(help.contains("prompt|session|agent|subagent"), "{help}");
+}

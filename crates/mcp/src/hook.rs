@@ -1,5 +1,5 @@
-//! Claude Code hooks: `tessar hook prompt`, `tessar hook session` and
-//! `tessar hook config`.
+//! Claude Code hooks: `tessar hook prompt`, `session`, `agent`, `subagent` and
+//! `config`.
 //!
 //! A hook is a command Claude Code runs on an event, with a JSON object on
 //! stdin. What it prints on stdout (exit status 0) is added to the model's
@@ -24,11 +24,15 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::daemon::socket_path;
-use crate::decisions::{self, Block, Candidate, PromptRecord, Record, SessionRecord, Thresholds};
+use crate::decisions::{
+    self, AgentRecord, Block, Candidate, PromptRecord, Record, SessionRecord, SubagentRecord,
+    Thresholds,
+};
 use crate::lesson;
 use crate::lifecycle;
 use crate::project::project_name;
 use crate::proxy;
+use crate::stash;
 
 /// A hit is kept when its similarity is at least this, unless the entity
 /// channel found it. A first guess, to be calibrated.
@@ -55,6 +59,12 @@ pub const PROMPT_WAIT: Duration = Duration::from_secs(1);
 /// The `session` hook gives up after this long: a cold daemon loads the model.
 pub const SESSION_WAIT: Duration = Duration::from_secs(60);
 
+/// The type of an Agent call that names neither a name nor a type.
+const DEFAULT_AGENT_TYPE: &str = "general-purpose";
+/// The `agent` hook's write to the stash gets this long, after the daemon's
+/// answer; it gives up silently after it.
+const STASH_WAIT: Duration = Duration::from_millis(300);
+
 /// A prompt with fewer words than this is not worth a search.
 const MIN_WORDS: usize = 3;
 /// How many facts `recall` is asked for: more than the ordinary window, so
@@ -74,6 +84,8 @@ const MAX_QUERY_CHARS: usize = 2000;
 const MIN_CUT: usize = 40;
 
 const PROMPT_HEADER: &str = "Memory (tessar) relevant to this message; call `recall` for more:";
+/// The same for a subagent, whose context starts with its task.
+const AGENT_HEADER: &str = "Memory (tessar) relevant to this task; call `recall` for more:";
 
 /// What Claude Code sends a hook on stdin. Unknown fields are ignored.
 #[derive(Debug, Default, Deserialize)]
@@ -87,9 +99,32 @@ pub struct HookInput {
     pub prompt: String,
     /// `SessionStart`: `startup`, `resume`, `clear` or `compact`.
     pub source: String,
+    /// `PreToolUse`: the tool's arguments; for `Agent`, `prompt` (the
+    /// brief), `name` and `subagent_type`.
+    pub tool_input: Value,
+    /// `SubagentStart`: the agent's name when it has one, else its type.
+    pub agent_type: String,
 }
 
 impl HookInput {
+    /// `PreToolUse` on `Agent`: the subagent's brief.
+    fn brief(&self) -> &str {
+        self.tool_input["prompt"].as_str().unwrap_or_default()
+    }
+
+    /// `PreToolUse` on `Agent`: what `SubagentStart` will call the agent
+    /// (its `agent_type`): the `name` if there is one, else `subagent_type`,
+    /// else the tool's default type. The default is taken from the Agent
+    /// tool's documentation; it was not observed in a hook input.
+    fn agent_key(&self) -> &str {
+        ["name", "subagent_type"]
+            .iter()
+            .filter_map(|k| self.tool_input[*k].as_str())
+            .map(str::trim)
+            .find(|v| !v.is_empty())
+            .unwrap_or(DEFAULT_AGENT_TYPE)
+    }
+
     /// Parses the JSON on stdin.
     pub fn parse(stdin: &str) -> Result<Self, String> {
         serde_json::from_str(stdin).map_err(|e| format!("bad hook input: {e}"))
@@ -405,7 +440,17 @@ pub fn render_prompt_with_lessons(
     lessons: &[Hit],
     budget: usize,
 ) -> (String, Vec<String>, Vec<String>) {
-    let head = PROMPT_HEADER.chars().count() + 1;
+    render_with_header(PROMPT_HEADER, hits, lessons, budget)
+}
+
+/// [`render_prompt_with_lessons`] under another `header`.
+fn render_with_header(
+    header: &str,
+    hits: &[Hit],
+    lessons: &[Hit],
+    budget: usize,
+) -> (String, Vec<String>, Vec<String>) {
+    let head = header.chars().count() + 1;
     let full: Vec<String> = lessons.iter().map(Hit::lesson_line).collect();
     let capped: Vec<String> = full.iter().map(|l| cut(l, LESSON_LINE_CHARS)).collect();
     let lesson_lines = fit(&capped, head, budget);
@@ -436,11 +481,7 @@ pub fn render_prompt_with_lessons(
         .chain(&lesson_lines)
         .map(String::as_str)
         .collect();
-    (
-        format!("{PROMPT_HEADER}\n{}\n", lines.join("\n")),
-        ids,
-        cut_ids,
-    )
+    (format!("{header}\n{}\n", lines.join("\n")), ids, cut_ids)
 }
 
 /// The text the `session` hook prints. `user` and `project` are the current
@@ -657,40 +698,41 @@ pub async fn prompt(
         .map(|(text, _)| text)
 }
 
-/// [`prompt`] and what it decided about each fact it looked at.
-async fn prompt_traced(
+/// What the selection made of one text: the rendered block and the
+/// decision for every candidate.
+struct Picked {
+    text: String,
+    ids: Vec<String>,
+    candidates: Vec<Candidate>,
+}
+
+/// Searches memory for `message` and renders what passes the rules, under
+/// `header`; `shown` is what the reader has seen already.
+async fn pick(
     peer: &Peer<RoleClient>,
-    input: &HookInput,
+    message: &str,
     settings: &Settings,
-    home: &Path,
-) -> Result<(String, Vec<Candidate>), String> {
-    if skip_prompt(&input.prompt) {
-        return Ok((String::new(), Vec::new()));
-    }
-    let query: String = input.prompt.trim().chars().take(MAX_QUERY_CHARS).collect();
+    shown: &HashSet<String>,
+    header: &str,
+) -> Result<Picked, String> {
+    let query: String = message.trim().chars().take(MAX_QUERY_CHARS).collect();
     let found = structured(
         peer,
         "recall",
         json!({ "query": query, "limit": RECALL_LIMIT }),
     )
     .await?;
-    let shown = read_shown(home, &input.session_id);
-    let mut judged = judge(parse_hits(&found), settings, &shown, true);
+    let mut judged = judge(parse_hits(&found), settings, shown, true);
     limit_ordinary(&mut judged);
-    let pick = |wanted: Verdict| -> Vec<Hit> {
+    let chosen = |wanted: Verdict| -> Vec<Hit> {
         judged
             .iter()
             .filter(|(_, v)| *v == wanted)
             .map(|(h, _)| h.clone())
             .collect()
     };
-    let (ordinary, lessons) = (pick(Verdict::Ordinary), pick(Verdict::Lesson));
-    let (text, ids, cut_ids) = render_prompt_with_lessons(&ordinary, &lessons, settings.budget);
-    if !ids.is_empty()
-        && let Err(e) = append_shown(home, &input.session_id, &ids)
-    {
-        logln!("tessar hook: cannot record shown facts: {e}");
-    }
+    let (ordinary, lessons) = (chosen(Verdict::Ordinary), chosen(Verdict::Lesson));
+    let (text, ids, cut_ids) = render_with_header(header, &ordinary, &lessons, settings.budget);
     let candidates = judged
         .into_iter()
         .map(|(h, verdict)| {
@@ -711,7 +753,31 @@ async fn prompt_traced(
             }
         })
         .collect();
-    Ok((text, candidates))
+    Ok(Picked {
+        text,
+        ids,
+        candidates,
+    })
+}
+
+/// [`prompt`] and what it decided about each fact it looked at.
+async fn prompt_traced(
+    peer: &Peer<RoleClient>,
+    input: &HookInput,
+    settings: &Settings,
+    home: &Path,
+) -> Result<(String, Vec<Candidate>), String> {
+    if skip_prompt(&input.prompt) {
+        return Ok((String::new(), Vec::new()));
+    }
+    let shown = read_shown(home, &input.session_id);
+    let picked = pick(peer, &input.prompt, settings, &shown, PROMPT_HEADER).await?;
+    if !picked.ids.is_empty()
+        && let Err(e) = append_shown(home, &input.session_id, &picked.ids)
+    {
+        logln!("tessar hook: cannot record shown facts: {e}");
+    }
+    Ok((picked.text, picked.candidates))
 }
 
 /// The `SessionStart` hook: forgets what was shown and prints a briefing of
@@ -922,7 +988,8 @@ impl HookRun {
     }
 
     /// Hands the output to `print` (nothing on a failure, which is logged to
-    /// stderr instead), then appends the record, ignoring any error of its.
+    /// stderr instead), then appends the record, ignoring any error of its,
+    /// and, for the session hook, removes expired stash entries.
     pub fn finish(self, home: &Path, print: impl FnOnce(&str)) {
         match &self.error {
             Some(e) => logln!("tessar hook: {e}"),
@@ -930,6 +997,12 @@ impl HookRun {
         }
         if let Some(record) = &self.record {
             decisions::append(home, record);
+        }
+        // Leftovers of denied Agent calls hold memory text: the session hook
+        // clears the expired ones, after its output so that a slow disk
+        // cannot delay the briefing.
+        if matches!(self.record, Some(Record::Session(_))) {
+            stash::sweep(home);
         }
     }
 
@@ -990,14 +1063,7 @@ pub async fn run_prompt_recorded(
             project,
             message_chars: input.prompt.chars().count(),
             message: decisions::clip_message(&input.prompt),
-            thresholds: Thresholds {
-                min_similarity: settings.min_similarity,
-                entity_min_similarity: settings.entity_min_similarity,
-                entity_max: settings.entity_max,
-                lesson_min_similarity: LESSON_MIN_SIMILARITY,
-                lesson_max: LESSON_MAX,
-                budget: settings.budget,
-            },
+            thresholds: thresholds(settings),
             elapsed_ms: elapsed_ms(started),
             skipped,
             error,
@@ -1013,43 +1079,12 @@ pub async fn run_prompt_recorded(
         };
     }
     let hook_input = &input;
-    let attempt = async {
-        let Ok(stream) = tokio::net::UnixStream::connect(socket_path(home)).await else {
-            return Err((None, start_for_the_next_prompt(home, spawn)));
-        };
-        // `git` runs off the runtime's threads so that the limit holds
-        // even if it hangs.
-        let named = {
-            let cwd = hook_input.cwd.clone();
-            tokio::task::spawn_blocking(move || project_and_cwd(&cwd))
-        };
-        let (project, cwd) = named
-            .await
-            .map_err(|e| (None, format!("internal error: {e}")))?;
-        let known = Some(project.clone());
-        let work = async {
-            let opened = proxy::open(stream, &project, &cwd).await?;
-            note_build(opened.hello());
-            let (server, link) = opened.serve().await?;
-            let out = prompt_traced(&server.daemon(), hook_input, settings, home).await;
-            drop(link);
-            out
-        };
-        match work.await {
-            Ok((text, candidates)) => Ok((text, candidates, project)),
-            Err(e) => Err((known, e)),
-        }
-    };
-    let result = tokio::time::timeout(cap, attempt)
-        .await
-        .unwrap_or_else(|_| {
-            Err((
-                None,
-                format!("no answer from the daemon within {} ms", cap.as_millis()),
-            ))
-        });
+    let result = quick_call(home, &input.cwd, cap, spawn, |peer| async move {
+        prompt_traced(&peer, hook_input, settings, home).await
+    })
+    .await;
     match result {
-        Ok((text, candidates, project)) => HookRun {
+        Ok(((text, candidates), project)) => HookRun {
             record: Some(record(Some(project), None, &text, candidates, None)),
             output: text,
             error: None,
@@ -1058,6 +1093,72 @@ pub async fn run_prompt_recorded(
             e.clone(),
             Some(record(project, None, "", Vec::new(), Some(e))),
         ),
+    }
+}
+
+/// What a quick hook's call failed with: the project, if it was known, and
+/// the reason.
+type QuickError = (Option<String>, String);
+
+/// Runs `work` on the running daemon within `cap`, all told. With no daemon
+/// listening it starts one through `spawn` for the next run, without
+/// waiting, and fails at once. Returns the result and the project's name.
+async fn quick_call<T, F, Fut>(
+    home: &Path,
+    cwd: &str,
+    cap: Duration,
+    spawn: &proxy::Spawn,
+    work: F,
+) -> Result<(T, String), QuickError>
+where
+    F: FnOnce(Peer<RoleClient>) -> Fut,
+    Fut: std::future::Future<Output = Result<T, String>>,
+{
+    let attempt = async {
+        let Ok(stream) = tokio::net::UnixStream::connect(socket_path(home)).await else {
+            return Err((None, start_for_the_next_prompt(home, spawn)));
+        };
+        // `git` runs off the runtime's threads so that the limit holds
+        // even if it hangs.
+        let named = {
+            let cwd = cwd.to_owned();
+            tokio::task::spawn_blocking(move || project_and_cwd(&cwd))
+        };
+        let (project, cwd) = named
+            .await
+            .map_err(|e| (None, format!("internal error: {e}")))?;
+        let known = Some(project.clone());
+        let served = async {
+            let opened = proxy::open(stream, &project, &cwd).await?;
+            note_build(opened.hello());
+            let (server, link) = opened.serve().await?;
+            let out = work(server.daemon().clone()).await;
+            drop(link);
+            out
+        };
+        match served.await {
+            Ok(out) => Ok((out, project)),
+            Err(e) => Err((known, e)),
+        }
+    };
+    tokio::time::timeout(cap, attempt)
+        .await
+        .unwrap_or_else(|_| {
+            Err((
+                None,
+                format!("no answer from the daemon within {} ms", cap.as_millis()),
+            ))
+        })
+}
+
+fn thresholds(settings: &Settings) -> Thresholds {
+    Thresholds {
+        min_similarity: settings.min_similarity,
+        entity_min_similarity: settings.entity_min_similarity,
+        entity_max: settings.entity_max,
+        lesson_min_similarity: LESSON_MIN_SIMILARITY,
+        lesson_max: LESSON_MAX,
+        budget: settings.budget,
     }
 }
 
@@ -1074,6 +1175,164 @@ fn start_for_the_next_prompt(home: &Path, spawn: &proxy::Spawn) -> String {
         // Dropping the handle leaves the daemon running.
         Ok(_) => "no daemon is listening; started one for the next prompt".to_owned(),
         Err(e) => format!("no daemon is listening, and starting one failed: {e}"),
+    }
+}
+
+/// `tessar hook agent` over the daemon in `home`: `PreToolUse` on `Agent`.
+/// It prints nothing, ever (its output would be read as a decision about the
+/// tool call); the text for the subagent goes to the stash.
+pub async fn run_agent(home: &Path, stdin: &str, settings: &Settings) -> HookRun {
+    run_agent_recorded(home, stdin, settings, PROMPT_WAIT, &proxy::own_daemon()).await
+}
+
+/// [`run_agent`] with its time limit and the way to start a daemon spelled
+/// out. The selection is the `prompt` hook's, with the brief in place of the
+/// user's message, but nothing is read from or added to the session's
+/// `.shown` file: the subagent has seen nothing, and what it is given must
+/// not hide facts from the parent later. A run that fails or times out
+/// leaves no entry.
+#[doc(hidden)]
+pub async fn run_agent_recorded(
+    home: &Path,
+    stdin: &str,
+    settings: &Settings,
+    cap: Duration,
+    spawn: &proxy::Spawn,
+) -> HookRun {
+    let started = Instant::now();
+    let input = match HookInput::parse(stdin) {
+        Ok(input) => input,
+        Err(e) => return HookRun::failed(e, None),
+    };
+    let brief = input.brief();
+    let key = input.agent_key();
+    let record = |project, skipped, entry: Entry, candidates, error: Option<String>| {
+        Record::Agent(AgentRecord {
+            ts: decisions::now(),
+            session: input.session_id.clone(),
+            project,
+            key: key.to_owned(),
+            brief_chars: brief.chars().count(),
+            brief: decisions::clip_message(brief),
+            thresholds: thresholds(settings),
+            elapsed_ms: elapsed_ms(started),
+            skipped,
+            error,
+            stashed: matches!(entry, Entry::Text(_)),
+            stashed_chars: match entry {
+                Entry::Text(t) => t.chars().count(),
+                _ => 0,
+            },
+            marker: matches!(entry, Entry::Marker),
+            candidates,
+        })
+    };
+    if input.session_id.trim().is_empty() {
+        return HookRun {
+            output: String::new(),
+            error: None,
+            record: Some(record(
+                None,
+                Some("no_session"),
+                Entry::None,
+                Vec::new(),
+                None,
+            )),
+        };
+    }
+    // Whatever happens next, this call leaves exactly one entry, empty when
+    // there is nothing to hand over, so that its subagent's start consumes
+    // its own entry and never one left by another call.
+    let skipped = skip_reason(brief);
+    let (project, candidates, text, error) = if skipped.is_some() {
+        (None, Vec::new(), String::new(), None)
+    } else {
+        let result = quick_call(home, &input.cwd, cap, spawn, |peer| async move {
+            pick(&peer, brief, settings, &HashSet::new(), AGENT_HEADER).await
+        })
+        .await;
+        match result {
+            Ok((picked, project)) => (Some(project), picked.candidates, picked.text, None),
+            Err((project, e)) => (project, Vec::new(), String::new(), Some(e)),
+        }
+    };
+    let stored = put_bounded(home, &input.session_id, key, &text).await;
+    let entry = match (&stored, text.is_empty()) {
+        (Err(_), _) => Entry::None,
+        (Ok(()), true) => Entry::Marker,
+        (Ok(()), false) => Entry::Text(&text),
+    };
+    match error.or(stored.err()) {
+        Some(e) => HookRun::failed(
+            e.clone(),
+            Some(record(project, skipped, entry, candidates, Some(e))),
+        ),
+        None => HookRun {
+            output: String::new(),
+            error: None,
+            record: Some(record(project, skipped, entry, candidates, None)),
+        },
+    }
+}
+
+/// What the `agent` hook left in the stash.
+#[derive(Clone, Copy)]
+enum Entry<'a> {
+    None,
+    Marker,
+    Text(&'a str),
+}
+
+/// [`stash::put`] off the runtime's threads, given up after [`STASH_WAIT`].
+async fn put_bounded(home: &Path, session: &str, key: &str, text: &str) -> Result<(), String> {
+    let (home, session, key, text) = (
+        home.to_owned(),
+        session.to_owned(),
+        key.to_owned(),
+        text.to_owned(),
+    );
+    let write = tokio::task::spawn_blocking(move || stash::put(&home, &session, &key, &text));
+    match tokio::time::timeout(STASH_WAIT, write).await {
+        Err(_) => Err("the stash write did not finish in time".to_owned()),
+        Ok(Err(e)) => Err(format!("internal error: {e}")),
+        Ok(Ok(written)) => written.map_err(|e| format!("cannot write the stash: {e}")),
+    }
+}
+
+/// `tessar hook subagent`: `SubagentStart`. Hands the subagent the oldest
+/// live stash entry of its parent session and `agent_type`, as
+/// `additionalContext`; prints nothing when there is none. It does not talk
+/// to the daemon.
+pub fn run_subagent(home: &Path, stdin: &str) -> HookRun {
+    let input = match HookInput::parse(stdin) {
+        Ok(input) => input,
+        Err(e) => return HookRun::failed(e, None),
+    };
+    let key = input.agent_type.trim();
+    let taken = stash::take(home, &input.session_id, key);
+    // An empty entry is consumed and says nothing.
+    let text = taken.as_ref().filter(|t| !t.text.is_empty());
+    let output = text.map_or_else(String::new, |t| {
+        let out = json!({ "hookSpecificOutput": {
+            "hookEventName": "SubagentStart",
+            "additionalContext": t.text,
+        } });
+        format!("{out}\n")
+    });
+    HookRun {
+        output,
+        error: None,
+        record: Some(Record::Subagent(SubagentRecord {
+            ts: decisions::now(),
+            session: input.session_id.clone(),
+            key: key.to_owned(),
+            consumed: taken.is_some(),
+            delivered: text.is_some(),
+            chars: text.map_or(0, |t| t.text.chars().count()),
+            age_ms: taken
+                .as_ref()
+                .map(|t| u64::try_from(t.age.as_millis()).unwrap_or(u64::MAX)),
+        })),
     }
 }
 
@@ -1168,6 +1427,21 @@ pub fn config_snippet(exe: &Path) -> String {
                     "type": "command",
                     "command": format!("{exe} hook session"),
                     "timeout": 60,
+                }],
+            }],
+            "PreToolUse": [{
+                "matcher": "Agent",
+                "hooks": [{
+                    "type": "command",
+                    "command": format!("{exe} hook agent"),
+                    "timeout": 20,
+                }],
+            }],
+            "SubagentStart": [{
+                "hooks": [{
+                    "type": "command",
+                    "command": format!("{exe} hook subagent"),
+                    "timeout": 10,
                 }],
             }],
         },
@@ -1472,7 +1746,7 @@ mod tests {
     }
 
     #[test]
-    fn config_snippet_has_both_hooks_with_the_binary() {
+    fn config_snippet_has_all_hooks_with_the_binary() {
         let snippet = config_snippet(Path::new("/opt/tessar/bin/tessar"));
         let v: Value = serde_json::from_str(&snippet).unwrap();
         let prompt = &v["hooks"]["UserPromptSubmit"][0]["hooks"][0];
@@ -1486,6 +1760,16 @@ mod tests {
             "/opt/tessar/bin/tessar hook session"
         );
         assert_eq!(start["hooks"][0]["timeout"], 60);
+        let agent = &v["hooks"]["PreToolUse"][0];
+        assert_eq!(agent["matcher"], "Agent");
+        assert_eq!(
+            agent["hooks"][0]["command"],
+            "/opt/tessar/bin/tessar hook agent"
+        );
+        assert_eq!(
+            v["hooks"]["SubagentStart"][0]["hooks"][0]["command"],
+            "/opt/tessar/bin/tessar hook subagent"
+        );
         let spaced = config_snippet(Path::new("/My Apps/it's/tessar"));
         let v: Value = serde_json::from_str(&spaced).unwrap();
         assert_eq!(

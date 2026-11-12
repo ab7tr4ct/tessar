@@ -75,6 +75,10 @@ pub enum Record {
     Session(SessionRecord),
     /// A call of an MCP tool.
     Tool(ToolRecord),
+    /// A run of the `agent` hook.
+    Agent(AgentRecord),
+    /// A run of the `subagent` hook.
+    Subagent(SubagentRecord),
 }
 
 /// The thresholds and the budget a `prompt` run worked under.
@@ -130,6 +134,59 @@ pub struct PromptRecord {
     /// The characters printed.
     pub printed_chars: usize,
     pub candidates: Vec<Candidate>,
+}
+
+/// A run of the `agent` hook: the `prompt` hook's selection for a subagent's
+/// brief, handed to the `subagent` hook through the stash.
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentRecord {
+    pub ts: String,
+    /// The parent session.
+    pub session: String,
+    /// `None` when the hook stopped before it looked the project up.
+    pub project: Option<String>,
+    /// What the two hooks share: the agent's name, else its type.
+    pub key: String,
+    pub brief_chars: usize,
+    /// The brief cut to [`MAX_MESSAGE_CHARS`].
+    pub brief: String,
+    pub thresholds: Thresholds,
+    pub elapsed_ms: u64,
+    /// Why the hook stayed silent on purpose: `short_message`,
+    /// `slash_command` or `no_session`. All but the last still leave an
+    /// empty entry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skipped: Option<&'static str>,
+    /// Why the run failed (no daemon, a timeout, the stash), when it did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Whether an entry with text was left in the stash.
+    pub stashed: bool,
+    /// The characters stashed.
+    pub stashed_chars: usize,
+    /// Whether an empty entry was left instead, so that the agent's start
+    /// has one to consume.
+    pub marker: bool,
+    pub candidates: Vec<Candidate>,
+}
+
+/// A run of the `subagent` hook.
+#[derive(Debug, Clone, Serialize)]
+pub struct SubagentRecord {
+    pub ts: String,
+    /// The parent session.
+    pub session: String,
+    /// The agent's name, else its type.
+    pub key: String,
+    /// Whether a stash entry was found and consumed (an empty one included).
+    pub consumed: bool,
+    /// Whether text was handed over.
+    pub delivered: bool,
+    /// The characters delivered.
+    pub chars: usize,
+    /// How long the delivered entry waited in the stash.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub age_ms: Option<u64>,
 }
 
 /// A run of the `session` hook.

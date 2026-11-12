@@ -3,7 +3,8 @@
 //! A redaction removes content from memory, but the journal is append-only
 //! and still holds the original text. Purging rewrites the journal without
 //! it, drops the vector cache, which may hold vectors of redacted texts, and
-//! removes the decision log, which keeps the text of the user's messages.
+//! removes the decision log, which keeps the text of the user's messages, and
+//! the hooks' stash, which holds rendered facts.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -26,6 +27,8 @@ pub struct Purged {
     pub caches: usize,
     /// Whether a decision log (`decisions.jsonl`) was removed.
     pub decision_log: bool,
+    /// Stash files (`hooks/stash.*` and leftovers) removed.
+    pub stash_files: usize,
 }
 
 /// Where the journal lives under `home`.
@@ -43,6 +46,7 @@ pub fn purge_home(home: &Path) -> Result<Purged, String> {
         return Err(format!("no journal at {}", path.display()));
     }
     let decision_log = remove_decision_log(home)?;
+    let stash_files = crate::stash::remove_all(home);
     let mut counts = None;
     let report = FileJournal::<Op>::rewrite(&path, |commits| {
         let (commits, report) = purge_with_report(commits);
@@ -58,6 +62,7 @@ pub fn purge_home(home: &Path) -> Result<Purged, String> {
         bytes_after: report.bytes_after,
         caches: drop_vector_caches(home)?,
         decision_log,
+        stash_files,
     })
 }
 
@@ -102,6 +107,11 @@ pub fn summary(p: &Purged, stopped: bool) -> String {
         "; decision log removed"
     } else {
         ""
+    };
+    let log = if p.stash_files > 0 {
+        format!("{log}; stash files removed: {}", p.stash_files)
+    } else {
+        log.to_owned()
     };
     if p.facts == 0 && p.episodes == 0 {
         return format!(
