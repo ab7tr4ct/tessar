@@ -12,6 +12,13 @@ use candle_nn::VarBuilder;
 use tessar_core::embed::{EmbedError, Embedder, Prompts};
 use tokenizers::{Tokenizer, TruncationParams};
 
+/// Raise it when a change to this crate alters the vectors it returns (the
+/// forward pass, pooling, normalization or token handling). It is part of
+/// [`CandleEmbedder::voyage_nano_gguf_settings`], so a vector cache made by
+/// an older revision is not reused. The pooling and normalization are fixed
+/// in code with no value to derive a description from; this covers them.
+pub const VECTOR_REVISION: u32 = 1;
+
 /// Where the weights run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Accel {
@@ -207,6 +214,21 @@ impl CandleEmbedder {
         })
     }
 
+    /// A stable description of what `voyage_nano_gguf` sets that shapes the
+    /// vectors: prompts, token limit, end-of-text token, pooling and
+    /// normalization. It is part of a vector cache's identity, so it must
+    /// change with any of them. Batch sizes and the device are left out: they
+    /// do not change the vectors beyond rounding.
+    pub fn voyage_nano_gguf_settings() -> String {
+        let options = Options::default();
+        let prompts = Prompts::voyage();
+        format!(
+            "revision={VECTOR_REVISION};query={:?};document={:?};context={};eos={};\
+             pooling=mean;norm=l2",
+            prompts.query, prompts.document, options.context, options.append_eos
+        )
+    }
+
     /// `voyage-4-nano` in `model_dir` with its prompts.
     pub fn voyage_nano(model_dir: impl AsRef<Path>) -> Result<Self, EmbedError> {
         Ok(Self::load(model_dir, &Options::default())?.with_prompts(Prompts::voyage()))
@@ -361,6 +383,15 @@ mod tests {
         let mut row = [3.0f32, 4.0];
         normalize(&mut row).unwrap();
         assert!((row[0] - 0.6).abs() < 1e-6 && (row[1] - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn settings_description_names_prompts_and_limits() {
+        let d = CandleEmbedder::voyage_nano_gguf_settings();
+        assert!(d.contains(&Prompts::voyage().query), "{d}");
+        assert!(d.contains(&Prompts::voyage().document), "{d}");
+        assert!(d.contains("context=8192"), "{d}");
+        assert_eq!(d, CandleEmbedder::voyage_nano_gguf_settings());
     }
 
     #[test]

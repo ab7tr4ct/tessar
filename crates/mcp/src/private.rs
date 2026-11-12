@@ -29,7 +29,7 @@ pub fn file_options() -> OpenOptions {
 
 /// Creates `dir` and its missing parents `0700`. An existing directory is
 /// left as it is.
-pub fn create_dir_all(dir: &Path) -> io::Result<()> {
+pub(crate) fn create_dir_all(dir: &Path) -> io::Result<()> {
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]
@@ -40,11 +40,15 @@ pub fn create_dir_all(dir: &Path) -> io::Result<()> {
     builder.create(dir)
 }
 
-/// Creates tessar's own subdirectory `dir` (for example `hooks/`) `0700`
-/// and tightens it if an older build made it wider.
-pub fn create_own_dir_all(dir: &Path) -> io::Result<()> {
+/// Creates tessar's own subdirectory `dir` of `home` (for example `hooks/`)
+/// `0700`. An existing one is tightened only when `home` is recognised as
+/// tessar's, by the same rule as [`create_home`]: with `--home .` in a
+/// repository that has its own `hooks/`, that directory is not ours.
+pub fn create_own_dir_all(home: &Path, dir: &Path) -> io::Result<()> {
     create_dir_all(dir)?;
-    tighten_path(dir);
+    if is_tessars(home) {
+        tighten_path(dir);
+    }
     Ok(())
 }
 
@@ -58,10 +62,19 @@ pub fn create_home(home: &Path) -> io::Result<()> {
 
 fn create_home_for(home: &Path, user_home: Option<&Path>) -> io::Result<()> {
     create_dir_all(home)?;
-    if journal_path(home).is_file() && !is_user_home(home, user_home) {
+    if is_tessars_for(home, user_home) {
         tighten_path(home);
     }
     Ok(())
+}
+
+fn is_tessars(home: &Path) -> bool {
+    let user_home = std::env::var_os("HOME").filter(|h| !h.is_empty());
+    is_tessars_for(home, user_home.as_deref().map(Path::new))
+}
+
+fn is_tessars_for(home: &Path, user_home: Option<&Path>) -> bool {
+    journal_path(home).is_file() && !is_user_home(home, user_home)
 }
 
 fn is_user_home(dir: &Path, user_home: Option<&Path>) -> bool {
@@ -170,12 +183,23 @@ mod tests {
     #[test]
     fn own_subdirectories_are_tightened() {
         let root = tempfile::tempdir().unwrap();
+        std::fs::write(journal_path(root.path()), "").unwrap();
         let dir = root.path().join("hooks");
-        create_own_dir_all(&dir).unwrap();
+        create_own_dir_all(root.path(), &dir).unwrap();
         assert_eq!(mode(&dir), 0o700);
         set(&dir, 0o755);
-        create_own_dir_all(&dir).unwrap();
+        create_own_dir_all(root.path(), &dir).unwrap();
         assert_eq!(mode(&dir), 0o700);
+    }
+
+    #[test]
+    fn own_subdirectories_of_a_foreign_home_are_left_alone() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("hooks");
+        std::fs::create_dir(&dir).unwrap();
+        set(&dir, 0o755);
+        create_own_dir_all(root.path(), &dir).unwrap();
+        assert_eq!(mode(&dir), 0o755);
     }
 
     #[test]

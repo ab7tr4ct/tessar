@@ -380,7 +380,7 @@ pub fn append_shown(home: &Path, session_id: &str, ids: &[String]) -> std::io::R
         return Ok(());
     };
     if let Some(dir) = path.parent() {
-        crate::private::create_own_dir_all(dir)?;
+        crate::private::create_own_dir_all(home, dir)?;
     }
     let mut file = crate::private::file_options()
         .create(true)
@@ -675,6 +675,7 @@ mod tests {
     fn the_hooks_directory_and_shown_files_are_private() {
         use std::os::unix::fs::PermissionsExt;
         let home = tempfile::tempdir().unwrap();
+        std::fs::write(crate::purge::journal_path(home.path()), b"").unwrap();
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         append_shown(home.path(), "s1", &["a".to_owned()]).unwrap();
         let file = shown_path(home.path(), "s1").unwrap();
@@ -687,6 +688,23 @@ mod tests {
         append_shown(home.path(), "s1", &["b".to_owned()]).unwrap();
         assert_eq!(mode(&dir), 0o700);
         assert_eq!(mode(&file), 0o600);
+    }
+
+    #[test]
+    fn a_foreign_hooks_directory_is_not_tightened() {
+        use std::os::unix::fs::PermissionsExt;
+        // A home without tessar's journal, such as a repository.
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("hooks");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        append_shown(home.path(), "s1", &["a".to_owned()]).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir), 0o755);
+        // Once the home holds the journal it is tessar's.
+        std::fs::write(crate::purge::journal_path(home.path()), b"").unwrap();
+        append_shown(home.path(), "s1", &["b".to_owned()]).unwrap();
+        assert_eq!(mode(&dir), 0o700);
     }
 
     fn hit(id: &str, similarity: Option<f64>, channels: &[&str], text: &str) -> Hit {

@@ -23,6 +23,7 @@ tessar-core.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 tessar-journal.workspace = true
 tessar-embed-cache.workspace = true
+sha2.workspace = true
 rmcp.workspace = true
 tokio.workspace = true
 serde.workspace = true

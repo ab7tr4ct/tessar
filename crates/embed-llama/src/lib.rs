@@ -84,6 +84,9 @@ mod ffi {
 #[allow(unsafe_code)]
 unsafe impl Send for ffi::Embedder {}
 
+/// Raise it when a change to this crate alters the vectors it returns.
+pub const VECTOR_REVISION: u32 = 1;
+
 /// How to load a model. Memory grows with both batch limits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Options {

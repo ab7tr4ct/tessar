@@ -11,17 +11,19 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use rmcp::ServiceExt;
 use rmcp::transport::stdio;
 use tessar_core::clock::{Clock, SystemClock};
-use tessar_core::embed::Embedder;
+use tessar_core::embed::{EmbedError, Embedder};
 use tessar_core::log::LogError;
 use tessar_core::store::{Memory, Op, Semantic};
 use tessar_embed_cache::CachedEmbedder;
 use tessar_journal::FileJournal;
 use tessar_mcp::daemon::{self, Projects, socket_path};
+use tessar_mcp::fingerprint::{Identity, cache_path, fingerprint};
 use tessar_mcp::hook;
 use tessar_mcp::lifecycle;
 use tessar_mcp::project::project_name;
@@ -89,39 +91,88 @@ const INDEX_DIMS: usize = 1024;
 /// The model file name under `<home>/models/`.
 const MODEL_FILE: &str = "voyage-4-nano-Q8_0.gguf";
 
-/// The model's name in the vector cache's key and path.
+/// The model's name in the vector cache's fingerprint and path.
 const MODEL_NAME: &str = "voyage-4-nano";
 
-/// Where the vectors of `model` are cached under `home`.
-fn vector_cache_path(home: &Path, model: &str) -> PathBuf {
-    home.join("index").join(model).join("vectors.bin")
+/// An embedder that reports the first problem of the vector cache behind it
+/// to the log, once each, and otherwise passes every call through. Looking
+/// after each call is the one place that sees every write: the memory opening,
+/// the warm-up of its index and each write through the tools all embed here.
+struct CacheWatch {
+    cache: CachedEmbedder,
+    write_logged: AtomicBool,
+    mismatch_logged: AtomicBool,
+    /// How many times the cache's state was looked at (for the tests).
+    reports: AtomicUsize,
 }
 
-/// Wraps `inner` in the on-disk vector cache. The cache is derived data,
-/// so any problem with it is reported and the plain embedder is used.
-fn cached(home: &Path, inner: Arc<dyn Embedder>) -> Arc<dyn Embedder> {
-    let path = vector_cache_path(home, MODEL_NAME);
-    let opened = path
-        .parent()
-        .map_or(Ok(()), std::fs::create_dir_all)
-        .map_err(|e| format!("cannot create the cache directory: {e}"))
-        .and_then(|()| {
-            CachedEmbedder::open(&path, MODEL_NAME, Arc::clone(&inner)).map_err(|e| e.to_string())
+impl CacheWatch {
+    fn new(cache: CachedEmbedder) -> Self {
+        Self {
+            cache,
+            write_logged: AtomicBool::new(false),
+            mismatch_logged: AtomicBool::new(false),
+            reports: AtomicUsize::new(0),
+        }
+    }
+
+    /// Never fails the call: the cache is derived data.
+    fn report(&self) {
+        self.reports.fetch_add(1, Ordering::Relaxed);
+        if let Some(e) = self.cache.write_error()
+            && !self.write_logged.swap(true, Ordering::Relaxed)
+        {
+            logln!("tessar: vector cache stopped writing to disk: {e}");
+        }
+        if let Some(e) = self.cache.length_mismatch()
+            && !self.mismatch_logged.swap(true, Ordering::Relaxed)
+        {
+            logln!("tessar: vector cache: {e}");
+        }
+    }
+}
+
+impl Embedder for CacheWatch {
+    fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
+        let out = self.cache.embed_documents(texts);
+        self.report();
+        out
+    }
+
+    fn embed_query(&self, text: &str) -> Result<Vec<f32>, EmbedError> {
+        // A query never changes the cache, and looking at it takes the lock
+        // that a batch holds while it embeds and syncs: a query must not
+        // wait for that.
+        self.cache.embed_query(text)
+    }
+}
+
+/// Wraps `inner` in the on-disk vector cache, in a file of its own for this
+/// fingerprint: directories of earlier fingerprints stay on disk until
+/// `tessar purge`. The cache is derived data, so any problem with it is
+/// reported and the plain embedder is used.
+fn cached(home: &Path, inner: Arc<dyn Embedder>, identity: &Identity<'_>) -> Arc<dyn Embedder> {
+    let opened = fingerprint(MODEL_NAME, identity)
+        .map_err(|e| format!("cannot identify the model files: {e}"))
+        .and_then(|fp| {
+            let path = cache_path(home, &fp);
+            CachedEmbedder::open(&path, &fp, Arc::clone(&inner))
+                .map(|cache| (path, cache))
+                .map_err(|e| e.to_string())
         });
     match opened {
-        Ok(cache) => {
+        Ok((path, cache)) => {
             logln!(
                 "tessar: vector cache {}: {} vectors",
                 path.display(),
                 cache.len()
             );
-            Arc::new(cache)
+            let watch = CacheWatch::new(cache);
+            watch.report();
+            Arc::new(watch)
         }
         Err(e) => {
-            logln!(
-                "tessar: vector cache {} unusable, embedding without it: {e}",
-                path.display()
-            );
+            logln!("tessar: vector cache unusable, embedding without it: {e}");
             inner
         }
     }
@@ -518,6 +569,10 @@ struct Loaded {
     embedder: Arc<dyn Embedder>,
     dims: usize,
     description: String,
+    /// What the cache's fingerprint needs besides the model file.
+    backend: &'static str,
+    tokenizer: Option<PathBuf>,
+    settings: String,
 }
 
 #[cfg(feature = "candle")]
@@ -529,6 +584,9 @@ fn load_candle(home: &Path, model: &Path) -> Result<Loaded, String> {
     Ok(Loaded {
         dims: e.dims(),
         description: format!("candle ({device})"),
+        backend: "candle",
+        tokenizer: Some(tokenizer),
+        settings: tessar_embed_candle::CandleEmbedder::voyage_nano_gguf_settings(),
         embedder: Arc::new(e),
     })
 }
@@ -545,8 +603,25 @@ fn load_llama(model: &Path) -> Result<Loaded, String> {
     Ok(Loaded {
         dims: e.dims(),
         description: "llama.cpp".to_string(),
+        backend: "llama.cpp",
+        tokenizer: None,
+        settings: llama_settings(),
         embedder: Arc::new(e),
     })
+}
+
+/// What `LlamaEmbedder::voyage_nano` sets that shapes the vectors: the Voyage
+/// prompts and the default options (context 8192, cut longer texts). The
+/// crate exposes no description of its own; change this with its defaults.
+#[cfg(feature = "llama")]
+fn llama_settings() -> String {
+    let prompts = tessar_core::embed::Prompts::voyage();
+    format!(
+        "revision={};query={:?};document={:?};context=8192;truncate=true",
+        tessar_embed_llama::VECTOR_REVISION,
+        prompts.query,
+        prompts.document
+    )
 }
 
 #[cfg(not(feature = "llama"))]
@@ -591,7 +666,13 @@ fn open_memory(
         "tessar: embedder warm-up took {} ms",
         started.elapsed().as_millis()
     );
-    let embedder = cached(home, loaded.embedder);
+    let identity = Identity {
+        backend: loaded.backend,
+        model: &model,
+        tokenizer: loaded.tokenizer.as_deref(),
+        settings: &loaded.settings,
+    };
+    let embedder = cached(home, loaded.embedder, &identity);
     Memory::open_with(
         journal,
         clock,
@@ -988,11 +1069,23 @@ fn run_proxy(home: &Path, keep_daemon: bool) -> ExitCode {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn vector_cache_lives_under_the_model_in_the_home() {
-        assert_eq!(
-            vector_cache_path(Path::new("/h/.tessar"), "voyage-4-nano"),
-            Path::new("/h/.tessar/index/voyage-4-nano/vectors.bin")
-        );
+    fn only_documents_consult_the_cache_state() {
+        struct One;
+        impl Embedder for One {
+            fn embed_documents(&self, t: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
+                Ok(t.iter().map(|_| vec![1.0]).collect())
+            }
+            fn embed_query(&self, _: &str) -> Result<Vec<f32>, EmbedError> {
+                Ok(vec![1.0])
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let cache = CachedEmbedder::open(dir.path().join("v.bin"), "fp", Arc::new(One)).unwrap();
+        let watch = CacheWatch::new(cache);
+        watch.embed_query("q").unwrap();
+        assert_eq!(watch.reports.load(Ordering::Relaxed), 0);
+        watch.embed_documents(&["d".to_owned()]).unwrap();
+        assert_eq!(watch.reports.load(Ordering::Relaxed), 1);
     }
 
     #[test]

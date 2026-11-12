@@ -31,7 +31,7 @@ pub fn journal_path(home: &Path) -> PathBuf {
 }
 
 /// Rewrites the journal under `home` without redacted content and deletes
-/// every vector cache (`index/<model>/vectors.bin`). Nothing may hold the
+/// every vector cache (`index/<fingerprint>/vectors.bin`). Nothing may hold the
 /// journal open: stop the daemon first. Without a journal there is nothing
 /// to do.
 pub fn purge_home(home: &Path) -> Result<Purged, String> {

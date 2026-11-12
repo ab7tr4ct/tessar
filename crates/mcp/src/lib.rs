@@ -31,6 +31,7 @@ macro_rules! logln {
 pub mod api;
 pub mod args;
 pub mod daemon;
+pub mod fingerprint;
 pub mod hook;
 pub mod lifecycle;
 pub mod private;
